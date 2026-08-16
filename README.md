@@ -104,6 +104,61 @@ Tests: `.venv/bin/pytest` (server), `npm test` and `npm run e2e` in `surfaces/gu
 | `docs/` | Design specs and decision logs |
 | `tests/` | Backend test suite |
 
+The optional production orchestration control plane is documented in
+[docs/orchestration.md](docs/orchestration.md). It adds the durable eight-stage task
+lifecycle, hierarchical Agent runtime, DAG scheduling, isolated review/testing, and
+formal acceptance without replacing the existing conversational engine.
+
+### Subscription Agent runtimes
+
+OpenWorker can run an interactive **New Session**, or delegate an orchestration DAG
+node, through an already signed-in local Agent CLI instead of consuming an API key.
+Four exact logical runtime IDs are registered:
+
+- `codex-subscription:gpt-5.6-sol@max`
+- `claude-code-subscription:claude-opus-5@high`
+- `claude-code-subscription:claude-opus-5@max`
+- `kimi-code-subscription:kimi-code/k3@max`
+
+Codex and Claude Code are executable only for a loopback OpenWorker server owned by the
+signed-in desktop user. Kimi Code's ACP transport has no true system/developer message
+priority, so prompt text cannot provide a production-grade control boundary. Its managed
+OAuth runtime is therefore limited to foreground personal interaction and is never
+eligible for a production orchestration role, scheduled delivery, or unattended DAG
+execution. Use the Kimi Platform API or a separately authorized enterprise credential
+for automation. The runtime adapters never copy CLI credentials into OpenWorker and
+scrub API/provider/model environment overrides.
+
+For foreground chat, open **New Session** and choose one of the entries labelled
+**Codex Subscription**, **Claude Code Subscription**, or **Kimi Code Subscription** in
+the model selector. Codex and Claude support foreground and eligible background roles;
+Kimi managed OAuth is foreground-only. Native Agent sessions deliberately disable
+OpenWorker attachments and slash Skills, deny built-in network tools and generic
+permission expansion, route approvals through the OpenWorker UI/Inbox, persist native
+tool activity into the transcript and Audit log, and fence a stopped vendor turn before
+another can start. Kimi native shell execution is disabled on every platform. Claude
+Code's native Bash is disabled on Windows; on macOS/Linux it remains constrained by the
+Claude SDK sandbox and OpenWorker host approval policy.
+
+The built-in default mixed configuration is
+`production-codex-led-mixed-v1`: isolated Codex Max Agents own semantic understanding,
+repository exploration, implementation planning, implementation, and integration;
+an independent Claude High session reviews; independent Claude Max sessions test and
+evaluate. OpenWorker itself remains authoritative for complexity/risk policy, final
+clarification, DAG validation, acceptance, publication, and archive. Kimi Subscription
+is not a default or fallback.
+The GUI selects this preset for new code tasks. REST clients opt in with
+`runtime_preset_id="production-codex-led-mixed-v1"`; omitting it preserves legacy API
+routing, and it cannot be combined with the uniform top-level `requested_model` field.
+
+Open **Settings → Model routing** to inspect or refresh CLI installation,
+authentication, exact vendor model, effort, protocol, and policy eligibility without a
+model call. Under **Tasks → New**, keep the default mixed runtime preset or explicitly
+select one uniform **Requested model / Subscription Agent runtime** instead. See
+[Subscription Agent Runtime setup and examples](docs/orchestration.md#subscription-agent-runtimes)
+for login commands, REST examples, per-node mixed routing, recovery guarantees, and
+operational boundaries.
+
 ## Built on aisuite
 
 OpenWorker's engine is built on [**aisuite**](https://github.com/andrewyng/aisuite), a lightweight Python library providing a unified chat-completions API across LLM providers and an agents layer with tools, toolkits, and MCP support. If you want to build your own agent harness rather than use ours, start there; this repo is a working reference for what aisuite can carry.

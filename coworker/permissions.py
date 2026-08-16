@@ -98,6 +98,11 @@ class PermissionEngine:
     # `workspace_root` is the sole writable root (back-compat). Kept by reference and re-read on
     # every check, so runtime add/remove of folders takes effect without rebuilding the engine.
     roots: Optional[list] = None
+    # A hard execution ceiling used by constrained runtimes. Keep this field last so
+    # existing positional callers retain their historical argument mapping. ``None``
+    # preserves normal interactive behavior; an empty list denies every command and
+    # one-off approvals cannot bypass this ceiling.
+    command_ceiling: Optional[list[str]] = None
 
     def __post_init__(self) -> None:
         self.workspace_root = Path(self.workspace_root).expanduser().resolve()
@@ -126,6 +131,11 @@ class PermissionEngine:
         is_write = risk is RiskClass.WRITE_LOCAL
         is_shell = risk is RiskClass.EXEC
         consequential = is_consequential(risk)
+
+        if is_shell and self.command_ceiling is not None:
+            command = str(arguments.get("command", ""))
+            if not self._command_matches(command, self.command_ceiling):
+                return Decision(False, "command exceeds the runtime ceiling")
 
         # Discuss / plan modes: read-only.
         if self.mode in READ_ONLY_MODES and consequential:
@@ -220,6 +230,10 @@ class PermissionEngine:
         # the parsed argv against each entry — the entry's own tokens must be an exact
         # prefix of the command's tokens (so `git status` matches `git status -s` but never
         # `git statusfoo` or a bare `git`).
+        return self._command_matches(command, self.allowed_commands)
+
+    @staticmethod
+    def _command_matches(command: str, allowed_commands: list[str]) -> bool:
         if _has_shell_operators(command):
             return False
         try:
@@ -228,7 +242,7 @@ class PermissionEngine:
             return False  # unbalanced quotes etc. — treat as not-allowlisted
         if not argv:
             return False
-        for allowed in self.allowed_commands:
+        for allowed in allowed_commands:
             try:
                 prefix = shlex.split(allowed)
             except ValueError:

@@ -23,7 +23,7 @@ hides the window while keeping stdio intact.
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 # SPECPATH is injected by PyInstaller and points at this file's directory
 # (<repo>/packaging). Derive everything else from it — no hardcoded paths.
@@ -41,8 +41,25 @@ hiddenimports = []
 datas = []
 binaries = []
 
-for pkg in ("coworker", "aisuite", "mcp", "ddgs", "croniter", "docstring_parser"):
+for pkg in (
+    "coworker",
+    "aisuite",
+    "mcp",
+    "ddgs",
+    "croniter",
+    "docstring_parser",
+    "claude_agent_sdk",
+    "acp",
+):
     hiddenimports += collect_submodules(pkg)
+
+# Orchestration loads migrations beside its Python module at runtime. Python package-data
+# declarations are honored by wheels but are not automatically copied by PyInstaller's
+# module graph, so the desktop sidecar must stage the SQL files explicitly.
+datas += collect_data_files(
+    "coworker",
+    includes=["orchestration/migrations/*.sql"],
+)
 
 if not INCLUDE_EXPERIMENTAL:
     hiddenimports = [

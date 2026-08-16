@@ -37,6 +37,41 @@ def test_settings_rest_roundtrip(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
     manager = SessionManager(data_dir=tmp_path / "data")
+    runtime_id = "codex-subscription:gpt-5.6-sol@max"
+    runtime_catalog = [
+        {
+            "runtime_id": runtime_id,
+            "provider": "codex-subscription",
+            "label": "Codex Subscription · GPT-5.6 Sol · Max",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "max",
+            "interactive_only": False,
+            "health": {
+                "runtime_id": runtime_id,
+                "provider": "codex-subscription",
+                "installed": True,
+                "authenticated": True,
+                "available": True,
+                "policy_eligible": True,
+                "version": "0.146.0",
+                "auth_kind": "chatgpt_subscription",
+                "executable": "codex.exe",
+                "reason": "",
+                "checked_at": 1.0,
+            },
+            "interactive_eligible": True,
+            "interactive_reason": (
+                "Subscription runtime is ready for interactive sessions"
+            ),
+            "background_eligible": True,
+            "background_reason": "",
+        }
+    ]
+    monkeypatch.setattr(
+        manager.orchestration,
+        "interactive_subscription_runtime_catalog",
+        lambda: runtime_catalog,
+    )
     client = TestClient(create_app(manager))
 
     before = client.get("/v1/settings").json()
@@ -46,6 +81,8 @@ def test_settings_rest_roundtrip(tmp_path, monkeypatch):
         and before["provider"] == "openai"
     )
     assert before["onboarded"] is False and before["model"] in before["models"]
+    assert before["subscription_runtimes"] == runtime_catalog
+    assert runtime_id not in before["models"]
 
     set_resp = client.post(
         "/v1/settings/model-key", json={"api_key": "sk-secret-xyz"}

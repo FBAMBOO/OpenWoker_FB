@@ -8,6 +8,7 @@ sessions span folders.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ from ..audit import AuditStore
 from ..config import load_config, workspace_allowed_commands
 from ..conversations import ConversationStore, title_from
 from ..engine import ApprovalOutcome, Approver, TurnEngine
+from ..interactive_subscription import InteractiveSubscriptionProvider
 from ..roots import RootDir
 from ..workspace_trust import WorkspaceTrustStore
 from ..automation import Schedule, ScheduledTask, Scheduler, TaskRun, TaskStore
@@ -119,6 +121,7 @@ class SessionManager:
         model: str = "gpt-5.6-sol",
         mode: Mode = Mode.INTERACTIVE,
         provider: Optional[ProviderClient] = None,
+        server_host: str = "127.0.0.1",
     ) -> None:
         self.default_workspace = (
             str(Path(workspace).expanduser().resolve()) if workspace else None
@@ -126,6 +129,15 @@ class SessionManager:
         self.model = model
         self.mode = mode
         self.provider = provider
+        self.server_host = str(server_host or "")
+        normalized_host = self.server_host.strip().lower().strip("[]")
+        try:
+            host_is_loopback = ipaddress.ip_address(normalized_host).is_loopback
+        except ValueError:
+            host_is_loopback = normalized_host == "localhost"
+        # Subscription CLIs reuse the desktop owner's personal login. They are never
+        # offered as a remotely hosted/shared execution backend.
+        self.subscription_local_owner_eligible = host_is_loopback
 
         if data_dir is not None:
             base = Path(data_dir).expanduser()
@@ -165,6 +177,12 @@ class SessionManager:
         self._mcp_errors: dict[str, str] = {}
         self.gateway: Optional[Gateway] = None
         self._data_base = base
+        # Hierarchical orchestration is an additive control plane with its own WAL DB,
+        # migrations, scheduler, and hidden Agent sessions.  Keeping it behind one
+        # manager-owned service is the only lifecycle seam required in upstream code.
+        from ..orchestration.service import OrchestrationService
+
+        self.orchestration = OrchestrationService(self, base / "orchestration")
         # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
         self._prefs = self._load_prefs()
         if self._prefs.get("default_model"):
@@ -399,6 +417,7 @@ class SessionManager:
                 engine.plan_approver = plan_approver
             if question_asker is not None:
                 engine.question_asker = question_asker
+            self._bind_interactive_subscription_provider(session_id, engine)
             return engine
 
         record = self.session_store.load(session_id)
@@ -434,12 +453,17 @@ class SessionManager:
                 if Path(str(r.get("path", ""))).is_dir()
             ]
             roots = [{"path": ws, "writable": True, "label": "scratch"}, *extra]
+        session_provider = InteractiveSubscriptionProvider(
+            self.provider,
+            runtime_state=(record.runtime_state if record is not None else None),
+            subscription_enabled=self.subscription_local_owner_eligible,
+        )
         engine = build_engine(
             agent=ag,
             workspace=ws,
             model=model,
             mode=mode,
-            provider=self.provider,
+            provider=session_provider,
             memory_store=self.memory_store,
             messages=messages,
             extra_tools=extra_tools,
@@ -487,11 +511,150 @@ class SessionManager:
             from ..compaction import CompactionState
 
             engine.compaction_state = CompactionState.from_dict(record.compaction)
-        engine.compaction_settings = self.compaction_settings
+        # A subscription Agent owns its own long-lived context and compaction.  Running
+        # OpenWorker's summarizer through that same complete Agent loop would create an
+        # unintended second task, so compaction is disabled only while such a runtime is
+        # selected (API models retain the existing policy).
+        engine.compaction_settings = lambda e=engine: (
+            {**self.compaction_settings(), "enabled": False}
+            if InteractiveSubscriptionProvider.is_subscription_model(e.model)
+            else self.compaction_settings()
+        )
+        engine._interrupt_hooks.append(session_provider.interrupt)
+        self._bind_interactive_subscription_provider(session_id, engine)
         self._engines[session_id] = engine
         if is_new_session:
             self._emit_session_created(session_id, agent_name)
         return engine
+
+    def _bind_interactive_subscription_provider(
+        self, session_id: str, engine: TurnEngine
+    ) -> None:
+        """Attach a per-session subscription adapter to the current host loop.
+
+        ``ProviderClient.stream`` runs in a worker thread, while approvals and live WS
+        events belong to the server's asyncio loop.  Rebinding on every reconnect keeps
+        those callbacks current without rebuilding the canonical TurnEngine.
+        """
+
+        provider = getattr(engine, "provider", None)
+        if not isinstance(provider, InteractiveSubscriptionProvider):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        executor = getattr(engine, "executor", None)
+        workspace = (
+            str(executor.cwd)
+            if executor is not None
+            else self._provision_scratch(session_id)
+        )
+
+        async def subscription_event_sink(payload: dict[str, Any]) -> None:
+            """Normalize native Agent activity into live, transcript and audit views."""
+
+            event_type = str(payload.get("type") or "")
+            data = dict(payload.get("data") or {})
+            if event_type == "_subscription_checkpoint":
+                self.save(session_id, engine)
+                return
+            if event_type == "_subscription_approval_resolved":
+                outcome = str(data.get("outcome") or "deny")
+                self.audit_store.append(
+                    {
+                        **dict(getattr(engine, "audit_context", {}) or {}),
+                        "tool": data.get("name") or "native_tool",
+                        "arguments": data.get("arguments") or {},
+                        "stage": "approval_resolved",
+                        "status": "denied" if outcome == "deny" else "approved",
+                        "approval": outcome,
+                        "reason": data.get("policy") or data.get("reason") or "",
+                    }
+                )
+                self.save(session_id, engine)
+                return
+            if event_type in {"tool_started", "tool_finished"}:
+                call_id = str(
+                    data.get("tool_call_id") or data.get("id") or "native-tool"
+                )
+                name = str(data.get("name") or "native_tool")
+                arguments = (
+                    dict(data.get("arguments") or {})
+                    if isinstance(data.get("arguments"), dict)
+                    else {}
+                )
+                status = str(
+                    data.get("status")
+                    or ("running" if event_type == "tool_started" else "completed")
+                )
+                engine.messages.append(
+                    {
+                        "role": "native_tool",
+                        "event": event_type,
+                        "name": name,
+                        "tool_call_id": call_id,
+                        "arguments": arguments,
+                        "status": status,
+                        **(
+                            {"result_preview": str(data.get("result_preview"))}
+                            if data.get("result_preview") is not None
+                            else {}
+                        ),
+                        "ts": time.time(),
+                    }
+                )
+                self.audit_store.append(
+                    {
+                        **dict(getattr(engine, "audit_context", {}) or {}),
+                        "tool": name,
+                        "arguments": arguments,
+                        "stage": "started"
+                        if event_type == "tool_started"
+                        else "finished",
+                        "status": status,
+                        "result_preview": data.get("result_preview") or "",
+                    }
+                )
+                self.save(session_id, engine)
+                if event_type == "tool_started":
+                    # Existing transcript surfaces create the card on proposed and then
+                    # update it on finished. Keep the raw started event too for protocol
+                    # consumers and the durable native_tool vocabulary.
+                    await self.broadcast_session(
+                        session_id,
+                        {
+                            "type": "tool_proposed",
+                            "data": {
+                                "name": name,
+                                "arguments": arguments,
+                                "tool_call_id": call_id,
+                                "native": True,
+                            },
+                        },
+                    )
+            elif event_type == "permission_required":
+                self.audit_store.append(
+                    {
+                        **dict(getattr(engine, "audit_context", {}) or {}),
+                        "tool": data.get("name") or "native_tool",
+                        "arguments": data.get("arguments") or {},
+                        "stage": "approval_requested",
+                        "status": "pending",
+                        "reason": data.get("reason") or "",
+                    }
+                )
+                self.save(session_id, engine)
+            await self.broadcast_session(session_id, payload)
+
+        provider.bind(
+            session_id,
+            workspace,
+            lambda: engine.permissions.mode,
+            engine.approver,
+            subscription_event_sink,
+            loop,
+        )
 
     def _emit_session_created(self, session_id: str, persona_id: str) -> None:
         """Phase 5 telemetry, fired once per brand-new session on a background thread
@@ -895,6 +1058,13 @@ class SessionManager:
         built (its MCP tools are attached). Servers that fail to connect are skipped.
         """
         if session_id in self._engines:
+            return []
+        record = self.session_store.load(session_id)
+        if record is not None and InteractiveSubscriptionProvider.is_subscription_model(
+            record.model
+        ):
+            # Subscription Agents own their native tool loop.  Attaching OpenWorker MCP
+            # callables here would advertise tools that their vendor protocol cannot call.
             return []
         from ..connectors.descriptors import get_descriptor
         from ..connectors.tool_defs import (
@@ -1833,6 +2003,12 @@ class SessionManager:
             "provider": "openai",
             "model": self.model,
             "models": selectable,
+            # Subscription-backed Agent runtimes are complete agent loops, not
+            # chat-completion model ids. Keep them in a separate picker group so an
+            # API-provider execution path cannot accidentally receive one.
+            "subscription_runtimes": (
+                self.orchestration.interactive_subscription_runtime_catalog()
+            ),
             # Curated-matrix display names ({full id → "GLM-5.2 · via Together"}) so every
             # picker shows human labels; custom models absent here render their raw id.
             "model_labels": model_labels(),
@@ -2408,7 +2584,18 @@ class SessionManager:
         durable sessions: a channel message to its subscribers, a DM to the designated DM session
         (else parked). Returns the platforms whose listeners came up."""
         self.scheduler.start()  # tick scheduler for automations (independent of connectors)
+        await self.orchestration.start()
         return await self._build_and_start_gateway()
+
+    async def start_orchestration(self) -> None:
+        """Start and integrity-check the durable control plane.
+
+        This is separate from connector startup so a corrupt audit chain fails the
+        application lifespan closed instead of being mistaken for an optional connector
+        failure. ``start_gateway`` still calls it for backwards compatibility.
+        """
+
+        await self.orchestration.start()
 
     async def refresh_gateway(self) -> list[str]:
         """Hot-reload the messaging listeners with fresh secrets — called after a connector
@@ -2585,6 +2772,7 @@ class SessionManager:
                 self.unregister_session_client(session_id, cb)
 
     async def aclose(self) -> None:
+        await self.orchestration.stop()
         await self.scheduler.stop()
         await self.stop_gateway()
         await self.mcp.aclose()
@@ -2719,10 +2907,16 @@ class SessionManager:
     def _build_task_engine(self, task, *, session_id: str) -> TurnEngine:
         ag = get_agent(task.agent)
         Path(task.workspace).mkdir(parents=True, exist_ok=True)
+        selected_model = task.model or self.model
+        if InteractiveSubscriptionProvider.is_subscription_model(selected_model):
+            raise RuntimeError(
+                "Subscription Agent runtimes cannot execute legacy scheduled automations; "
+                "use an API model or a durable orchestrated task runtime"
+            )
         engine = build_engine(
             agent=ag,
             workspace=task.workspace,
-            model=task.model or self.model,
+            model=selected_model,
             mode=Mode.INTERACTIVE,
             approver=self._scheduled_approver(task, session_id),
             provider=self.provider,
@@ -2901,6 +3095,14 @@ class SessionManager:
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
         sidecar for connector messages (framed `message` stays the model-facing text).
         """
+        record = self.session_store.load(session_id)
+        if record is not None and InteractiveSubscriptionProvider.is_subscription_model(
+            record.model
+        ):
+            raise RuntimeError(
+                "Subscription Agent sessions are foreground-only; channel delivery, "
+                "self-wake, and other unattended turns are disabled"
+            )
         engine = self.get_engine(session_id)
         if engine is None:
             return
@@ -3384,6 +3586,12 @@ class SessionManager:
     def save(self, session_id: str, engine: TurnEngine) -> None:
         executor = getattr(engine, "executor", None)
         workspace = os.path.realpath(str(executor.cwd)) if executor else ""
+        session_provider = getattr(engine, "provider", None)
+        runtime_state = (
+            dict(session_provider.runtime_state)
+            if isinstance(session_provider, InteractiveSubscriptionProvider)
+            else {}
+        )
         self.session_store.save(
             SessionRecord(
                 session_id=session_id,
@@ -3400,6 +3608,7 @@ class SessionManager:
                     if getattr(engine, "compaction_state", None)
                     else {}
                 ),
+                runtime_state=runtime_state,
             )
         )
 
@@ -3441,6 +3650,10 @@ class SessionManager:
             return
         engine = self._engines.get(session_id)
         if engine is None or session_id in self._autotitle_inflight:
+            return
+        if InteractiveSubscriptionProvider.is_subscription_model(engine.model):
+            # Auto-title uses the API ProviderRouter.  A subscription runtime is a
+            # complete Agent loop and must never receive a hidden title-generation turn.
             return
         if self.task_store.task_for_run_session(session_id) is not None:
             return  # automation runs are titled by their task

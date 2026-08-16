@@ -37,3 +37,8 @@ class SessionRecord:
     # Auto-compaction state (OPE-27): CompactionState.as_dict(), {} when never compacted.
     # Persisted so a reloaded session keeps its compacted outbound view.
     compaction: dict[str, Any] = field(default_factory=dict)
+    # Opaque state owned by a non-API interactive runtime (for example the external
+    # Codex thread id or Claude/Kimi session id).  Keeping this separate from the
+    # canonical transcript lets a subscription Agent resume without leaking its
+    # vendor protocol into ConversationStore.
+    runtime_state: dict[str, Any] = field(default_factory=dict)

@@ -147,6 +147,8 @@ def build_engine(
     approver: Optional[Approver] = None,
     provider: Optional[ProviderClient] = None,
     allowed_commands: Optional[list[str]] = None,
+    command_ceiling: Optional[list[str]] = None,
+    contain_shell_process_tree: bool = False,
     max_iterations: Optional[int] = None,
     model_settings: Optional[dict[str, Any]] = None,
     memory_store: Optional[MemoryStore] = None,
@@ -167,6 +169,15 @@ def build_engine(
     connector_filter: Optional[set[str]] = None,
     # A set (static snapshot) or a zero-arg callable (live, re-evaluated per load_skill).
     skill_filter: Optional[set[str] | Callable[[], set[str]]] = None,
+    # Orchestration and other constrained runtimes may expose only a strict subset of
+    # the tools the Agent/Persona would normally receive.  Applied after assembly so it
+    # also covers universal, connector, MCP, skill, and interactive tools.
+    tool_filter: Optional[set[str]] = None,
+    tool_guard: Optional[Callable[[Any], None]] = None,
+    # Repository-authored AGENTS.md is trusted by ordinary interactive sessions.
+    # Verification/control-plane runtimes can disable that promotion so candidate
+    # artifacts remain untrusted evidence rather than system-level instructions.
+    load_workspace_instructions: bool = True,
 ) -> TurnEngine:
     ws = Path(workspace).expanduser().resolve() if workspace else None
     if agent.needs_workspace and ws is None:
@@ -185,7 +196,9 @@ def build_engine(
     workspace_trusted = bool(ws and WorkspaceTrustStore().is_trusted(ws))
     config = load_config(ws, workspace_trusted=workspace_trusted)
     executor = (
-        LocalExecutor(cwd=ws) if (agent.needs_workspace and ws is not None) else None
+        LocalExecutor(cwd=ws, contain_process_tree=contain_shell_process_tree)
+        if (agent.needs_workspace and ws is not None)
+        else None
     )
     todo = TodoList()
     context = AgentContext(
@@ -277,9 +290,10 @@ def build_engine(
     instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
     if ws is not None:
         instructions = f"{instructions}\n\n{environment_context(ws)}"
-        conventions = load_agents_md(ws)
-        if conventions:
-            instructions = f"{instructions}\n\n{conventions}"
+        if load_workspace_instructions:
+            conventions = load_agents_md(ws)
+            if conventions:
+                instructions = f"{instructions}\n\n{conventions}"
 
     if memory_store is not None:
         registry.register_all(
@@ -321,6 +335,7 @@ def build_engine(
         allowed_commands=(
             allowed_commands if allowed_commands is not None else config.allowed_commands
         ),
+        command_ceiling=command_ceiling,
         auto_allow_tools=set(config.auto_allow),
         roots=root_list or None,
         risk_overrides=risk_overrides,
@@ -329,6 +344,8 @@ def build_engine(
     # plan mode via set_mode, and the registry is fixed at build); the engine rejects the
     # call whenever the session isn't actually in plan mode.
     registry.register(propose_plan_tool())
+    if tool_filter is not None:
+        registry = registry.subset(tool_filter)
 
     # Per-turn ephemeral context, appended to the latest user message since mid-thread system
     # messages aren't reliable across providers. Two producers: the plan-mode reminder (mode can
@@ -395,6 +412,7 @@ def build_engine(
         directory_requester=directory_requester,
         plan_approver=plan_approver,
         question_asker=question_asker,
+        tool_guard=tool_guard,
     )
     engine.executor = executor  # type: ignore[attr-defined]
     engine.todo = todo  # type: ignore[attr-defined]

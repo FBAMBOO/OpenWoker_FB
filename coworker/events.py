@@ -29,6 +29,10 @@ class EventType(str, Enum):
     TOOL_FINISHED = "tool_finished"
     ITERATION_END = "iteration_end"
     TURN_END = "turn_end"
+    # The turn intentionally stopped with one or more unanswered tool calls.  Unlike
+    # INTERRUPTED, suspension preserves those calls so a durable coordinator can rebuild
+    # the engine and call ``resume()`` after the out-of-band condition is resolved.
+    TURN_SUSPENDED = "turn_suspended"
     ERROR = "error"
     INTERRUPTED = "interrupted"
     COMPACTING = "compacting"  # compaction started — surfaces show a transient signal

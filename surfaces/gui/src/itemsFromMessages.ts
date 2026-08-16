@@ -16,12 +16,18 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
   // `_display` sidecar on a tool message = user-facing metadata the agent never saw
   // (e.g. how many hits the privacy filters hid) — surfaces on the tool card.
   const hiddenCounts: Record<string, number> = {};
+  const nativeStarted = new Set<string>();
+  const nativeFinished: Record<string, ConversationMessage> = {};
   for (const m of messages || []) {
     if (m.role === "tool" && m.tool_call_id) {
       results[m.tool_call_id] =
         typeof m.content === "string" ? m.content : JSON.stringify(m.content);
       const hidden = Number(m._display?.hidden_by_filters || 0);
       if (hidden > 0) hiddenCounts[m.tool_call_id] = hidden;
+    } else if (m.role === "native_tool") {
+      const id = String(m.tool_call_id || m.id || "");
+      if (id && m.event === "tool_started") nativeStarted.add(id);
+      if (id && m.event === "tool_finished") nativeFinished[id] = m;
     }
   }
   for (const m of messages || []) {
@@ -64,6 +70,30 @@ export function itemsFromMessages(messages: ConversationMessage[]): Item[] {
           status: "ok",
           preview,
           ...(hidden ? { hidden } : {}),
+        });
+      }
+    } else if (m.role === "native_tool") {
+      const id = String(m.tool_call_id || m.id || m.name || "native-tool");
+      const finished = nativeFinished[id];
+      if (m.event === "tool_started") {
+        items.push({
+          kind: "tool",
+          id,
+          name: String(m.name || "native_tool"),
+          args: m.arguments || {},
+          status: String(finished?.status || m.status || "running"),
+          ...(finished?.result_preview ? { preview: String(finished.result_preview) } : {}),
+        });
+      } else if (m.event === "tool_finished" && !nativeStarted.has(id)) {
+        // A runtime may only report completion (or an older transcript may have
+        // lost its start checkpoint). Still render truthful evidence on reload.
+        items.push({
+          kind: "tool",
+          id,
+          name: String(m.name || "native_tool"),
+          args: m.arguments || {},
+          status: String(m.status || "completed"),
+          ...(m.result_preview ? { preview: String(m.result_preview) } : {}),
         });
       }
     } else if (m.role === "notice") {

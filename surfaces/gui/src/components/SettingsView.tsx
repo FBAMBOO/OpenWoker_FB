@@ -43,6 +43,8 @@ import { GalleryModal } from "./GalleryModal";
 import { PersonasTab } from "./PersonasTab";
 import { SkillsTab } from "./SkillsTab";
 import { showPersonas } from "../flags";
+import { apiRequest } from "../api";
+import { AgentProfilesSettings, ModelRoutingSettings } from "../features/orchestration";
 
 // Settings, restructured (Option 2) into a full-page surface that mirrors IntegrationsView's shell:
 // a left sub-nav (Appearance · Files · Models · Personas) + centered panel, replacing the old
@@ -51,7 +53,7 @@ import { showPersonas } from "../flags";
 // Models + Personas host the existing tab components inside the page shell (field re-skin to follow).
 // "appearance" is the General tab's stable key — callers deep-link with it, so the
 // rename (UX-021) changed only the label. "files" folded into General as a card.
-type SetTab = "appearance" | "models" | "skills" | "voice" | "personas";
+type SetTab = "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing";
 
 const CARD = "rounded-xl2 border border-line bg-panel";
 const FIELD_LABEL = "text-[12.5px] font-medium text-ink";
@@ -68,14 +70,20 @@ const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" |
   { key: "skills", label: "Skills", icon: "book" },
   { key: "voice", label: "Voice input", icon: "mic" },
   { key: "personas", label: "Personas", icon: "sparkle" },
+  { key: "agent_profiles", label: "Agent profiles", icon: "sparkle" },
+  { key: "model_routing", label: "Model routing", icon: "code" },
 ];
 
 export function SettingsView({
   initialTab,
+  initialAgentProfileId,
+  initialModelPolicyId,
   onOpenPersona,
   onCreateSkill,
 }: {
   initialTab?: SetTab;
+  initialAgentProfileId?: string;
+  initialModelPolicyId?: string;
   onOpenPersona?: (id: string) => void;
   // Skills doorway (SKILLS-SPEC §5.2): start a new conversation with the description
   // prefilled — the worker builds the skill and proposes it via save_skill.
@@ -134,6 +142,10 @@ export function SettingsView({
             <SkillsTab onCreateSkill={onCreateSkill} />
           ) : tab === "voice" ? (
             <VoiceInputSection />
+          ) : tab === "agent_profiles" ? (
+            <AgentProfilesSettings apiRequest={apiRequest} initialProfileId={initialAgentProfileId} />
+          ) : tab === "model_routing" ? (
+            <ModelRoutingSettings apiRequest={apiRequest} initialPolicyId={initialModelPolicyId} />
           ) : (
             <PersonasSection onOpenPersona={onOpenPersona} />
           )}

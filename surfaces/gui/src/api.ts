@@ -30,6 +30,69 @@ const fetch = (
   return globalThis.fetch(input, { ...init, headers });
 };
 
+export class ApiRequestError extends Error {
+  status: number;
+  payload: unknown;
+
+  constructor(status: number, message: string, payload: unknown) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
+/** Authenticated JSON seam for feature modules with their own versioned API contracts. */
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const url = /^https?:\/\//.test(path) ? path : `${httpBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  const response = await fetch(url, init);
+  const text = await response.text();
+  let payload: unknown = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text };
+    }
+  }
+  if (!response.ok) {
+    const body = payload as Record<string, unknown>;
+    const message = String(body?.message || body?.error || body?.detail || `Request failed (${response.status})`);
+    throw new ApiRequestError(response.status, message, payload);
+  }
+  return payload as T;
+}
+
+/** Download an authenticated API resource without exposing the launch token in a URL. */
+export async function downloadApiResource(path: string, filename = "download"): Promise<void> {
+  const url = /^https?:\/\//.test(path) ? path : `${httpBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    const responseText = await response.text();
+    let payload: unknown = { message: responseText };
+    try {
+      payload = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      // Preserve the plain-text message for ApiRequestError below.
+    }
+    const body = payload as Record<string, unknown>;
+    const message = String(body?.message || body?.error || body?.detail || `Request failed (${response.status})`);
+    throw new ApiRequestError(response.status, message, payload);
+  }
+
+  const blobUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = (filename || "download")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .slice(0, 180);
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
+}
+
 const openWebSocket = (url: string): WebSocket => {
   const token = apiToken();
   return token
@@ -41,6 +104,28 @@ export interface Health {
   status: string;
   default_workspace: string | null;
   model: string;
+  orchestration?: {
+    ready: boolean;
+    state: string;
+    loop_alive: boolean;
+    leader?: {
+      held: boolean;
+      epoch?: number | null;
+      heartbeat_alive: boolean;
+      last_heartbeat_at?: string | null;
+    };
+    outbox?: {
+      loop_alive: boolean;
+      last_success_at?: string | null;
+      last_error?: string | null;
+      pending: number;
+      dead_letters: number;
+      oldest_pending_at?: string | null;
+      stale: boolean;
+    };
+    last_error?: string | null;
+    consecutive_failures?: number;
+  };
 }
 
 export interface RecentWorkspace {
@@ -59,7 +144,13 @@ export interface WorkspaceCommandTrust {
 
 export async function getHealth(): Promise<Health> {
   const res = await fetch(`${httpBase()}/v1/health`);
-  return res.json();
+  const payload = await res.json() as Health;
+  // The server uses 503 to say "the sidecar is reachable but orchestration is
+  // not ready". That is operational data, not a boot transport failure.
+  if (res.ok === false && !(res.status === 503 && payload.status === "not_ready" && payload.orchestration)) {
+    throw new ApiRequestError(res.status, `Health request failed (${res.status})`, payload);
+  }
+  return payload;
 }
 
 export async function getRecentWorkspaces(): Promise<RecentWorkspace[]> {
@@ -677,10 +768,42 @@ export interface SurfaceVisibility {
   code: boolean;
 }
 
+export interface SubscriptionRuntimeHealth {
+  runtime_id: string;
+  provider: string;
+  installed: boolean;
+  authenticated: boolean;
+  available: boolean; // background orchestration availability, not interactive eligibility
+  policy_eligible: boolean; // background orchestration policy
+  version: string;
+  auth_kind: string;
+  executable: string;
+  reason: string;
+  checked_at: number;
+}
+
+export interface InteractiveSubscriptionRuntime {
+  runtime_id: string;
+  provider: string;
+  label: string;
+  model: string;
+  reasoning_effort: "low" | "medium" | "high" | "xhigh" | "max";
+  context_window: number;
+  interactive_only: boolean;
+  health: SubscriptionRuntimeHealth;
+  interactive_eligible: boolean;
+  interactive_reason: string;
+  background_eligible: boolean;
+  background_reason: string;
+}
+
 export interface ModelSettings {
   provider: string;
   model: string;
   models: string[];
+  // Complete local Agent runtimes are intentionally separate from API model ids.
+  // Optional keeps the GUI compatible with older OpenWorker sidecars.
+  subscription_runtimes?: InteractiveSubscriptionRuntime[];
   has_key: boolean;
   model_ready: boolean; // can the default model's provider actually run (any provider)?
   source: "env" | "store" | null;
@@ -1596,31 +1719,54 @@ export function announceAutomationsChanged() {
 /** App-wide event stream (/ws/events): session-independent server pushes — today
  * automation_run_started (the UX-026 toast). Quietly reconnects while the app is
  * open; the returned cleanup stops it for good. */
-export function connectEvents(
-  onEvent: (msg: { type: string; data?: Record<string, unknown> }) => void
-): () => void {
-  let ws: WebSocket | null = null;
-  let timer: number | null = null;
-  let closed = false;
-  const open = () => {
-    if (closed) return;
-    ws = openWebSocket(`${wsBase()}/ws/events`);
-    ws.onmessage = (e) => {
+type AppEvent = { type: string; data?: Record<string, unknown> };
+const eventSubscribers = new Set<(msg: AppEvent) => void>();
+let eventSocket: WebSocket | null = null;
+let eventReconnectTimer: number | null = null;
+
+function openEventHub() {
+  if (eventSocket || eventReconnectTimer !== null || eventSubscribers.size === 0) return;
+  const socket = openWebSocket(`${wsBase()}/ws/events`);
+  eventSocket = socket;
+  socket.onmessage = (event) => {
+    let message: AppEvent;
+    try {
+      message = JSON.parse(event.data) as AppEvent;
+    } catch {
+      return; // malformed frame
+    }
+    for (const subscriber of [...eventSubscribers]) {
       try {
-        onEvent(JSON.parse(e.data));
+        subscriber(message);
       } catch {
-        /* malformed frame — ignore */
+        /* one bad surface must not starve the other event subscribers */
       }
-    };
-    ws.onclose = () => {
-      if (!closed) timer = window.setTimeout(open, 5000);
-    };
+    }
   };
-  open();
+  socket.onclose = () => {
+    if (eventSocket === socket) eventSocket = null;
+    if (eventSubscribers.size > 0 && eventReconnectTimer === null) {
+      eventReconnectTimer = window.setTimeout(() => {
+        eventReconnectTimer = null;
+        openEventHub();
+      }, 5000);
+    }
+  };
+}
+
+export function connectEvents(onEvent: (msg: AppEvent) => void): () => void {
+  eventSubscribers.add(onEvent);
+  openEventHub();
   return () => {
-    closed = true;
-    if (timer !== null) window.clearTimeout(timer);
-    ws?.close();
+    eventSubscribers.delete(onEvent);
+    if (eventSubscribers.size !== 0) return;
+    if (eventReconnectTimer !== null) {
+      window.clearTimeout(eventReconnectTimer);
+      eventReconnectTimer = null;
+    }
+    const socket = eventSocket;
+    eventSocket = null;
+    socket?.close();
   };
 }
 

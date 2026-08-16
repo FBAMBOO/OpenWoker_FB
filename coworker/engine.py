@@ -43,7 +43,32 @@ class PermissionRequest:
     tool_call_id: Optional[str] = None  # for durable resume (idempotent inbox item)
 
 
-Approver = Callable[[PermissionRequest], Awaitable[ApprovalOutcome]]
+@dataclass(frozen=True)
+class DeferredInteraction:
+    """A durable out-of-band wait requested by an engine callback.
+
+    Callbacks normally return their resolved value.  Returning this marker instead asks
+    the engine to leave the triggering tool call unanswered, emit ``TURN_SUSPENDED``, and
+    release the current coroutine.  A caller may then persist the conversation and later
+    rebuild the engine and invoke :meth:`TurnEngine.resume`.
+    """
+
+    interaction_id: str
+    kind: str
+    data: Optional[dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class EngineRecoveryState:
+    """Public, read-only description of how a persisted engine can continue."""
+
+    disposition: str
+    pending_tool_calls: tuple[ToolCall, ...] = ()
+
+
+Approver = Callable[
+    [PermissionRequest], Awaitable[ApprovalOutcome | DeferredInteraction]
+]
 
 
 async def _deny_all(_request: PermissionRequest) -> ApprovalOutcome:
@@ -77,6 +102,7 @@ class TurnEngine:
         # Called (thread-safe, best-effort) when the user stops the turn — e.g. the
         # executor's kill for a running shell command.
         interrupt_hooks: Optional[list[Callable[[], None]]] = None,
+        tool_guard: Optional[Callable[[ToolCall], None]] = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -124,6 +150,8 @@ class TurnEngine:
         # TOOL_FINISHED event can carry the note to the tool card (§25).
         self._standing_notes: dict[str, str] = {}
         self._interrupt_hooks: list[Callable[[], None]] = list(interrupt_hooks or [])
+        self.tool_guard = tool_guard
+        self._suspended: Optional[DeferredInteraction] = None
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
@@ -188,6 +216,7 @@ class TurnEngine:
             message["_display"] = display
         self.messages.append(message)
         self._cancel.clear()
+        self._suspended = None
         data: dict[str, Any] = {"input": user_input}
         if source is not None:
             data["source"] = source
@@ -267,6 +296,24 @@ class TurnEngine:
         async for event in self._loop():
             yield event
 
+    def mark_interrupted(self) -> None:
+        """Persist an interruption marker when an owning coroutine is canceled."""
+
+        if self.messages and self.messages[-1].get("role") == "notice" and self.messages[-1].get("kind") == "interrupted":
+            return
+        self._append_notice("interrupted")
+
+    async def continue_interrupted(self) -> AsyncIterator[Event]:
+        """Continue persisted work without appending a duplicate user request."""
+
+        if self.recovery_state().disposition != "interrupted":
+            return
+        self._cancel.clear()
+        self._suspended = None
+        yield Event(EventType.TURN_START, {"input": "(continued after restart)"})
+        async for event in self._loop():
+            yield event
+
     async def resume(self) -> AsyncIterator[Event]:
         """Continue a turn that was suspended at a prompt and persisted — durable resume after a
         restart (or engine eviction). Re-process the trailing assistant message's UNANSWERED
@@ -277,9 +324,12 @@ class TurnEngine:
         if not pending:
             return
         self._cancel.clear()
+        self._suspended = None
         yield Event(EventType.TURN_START, {"input": "(resumed)"})
         async for event in self._handle_tool_calls(pending):
             yield event
+        if self._suspended is not None:
+            return
         yield Event(EventType.ITERATION_END, {"iteration": 0})
         if not self._cancel.is_set():
             async for event in self._loop():
@@ -310,6 +360,40 @@ class TurnEngine:
                     )
                 return out
         return []
+
+    def recovery_state(self) -> EngineRecoveryState:
+        """Return a stable recovery classification without mutating conversation state."""
+        pending = tuple(self._unanswered_trailing_tool_calls())
+        if pending:
+            return EngineRecoveryState("pending_tools", pending)
+        if self._tail_is_retriable_error():
+            return EngineRecoveryState("retriable_error")
+        for message in reversed(self.messages):
+            role = message.get("role")
+            if role == "notice" and message.get("kind") == "interrupted":
+                return EngineRecoveryState("interrupted")
+            if role == "assistant" and not message.get("tool_calls"):
+                return EngineRecoveryState("completed")
+            if role in {"user", "tool", "assistant"}:
+                break
+        return EngineRecoveryState("idle")
+
+    def _defer(self, interaction: DeferredInteraction, tool_call: ToolCall) -> Event:
+        self._suspended = interaction
+        payload = {
+            "interaction_id": interaction.interaction_id,
+            "kind": interaction.kind,
+            "tool_call_id": tool_call.id,
+            **dict(interaction.data or {}),
+        }
+        self._audit(
+            tool_call,
+            stage="suspended",
+            status="waiting",
+            reason=interaction.kind,
+            interaction_id=interaction.interaction_id,
+        )
+        return Event(EventType.TURN_SUSPENDED, payload)
 
     async def _loop(self) -> AsyncIterator[Event]:
         iterations = 0
@@ -423,6 +507,9 @@ class TurnEngine:
 
             async for event in self._handle_tool_calls(turn.tool_calls):
                 yield event
+
+            if self._suspended is not None:
+                return
 
             yield Event(EventType.ITERATION_END, {"iteration": iterations})
 
@@ -604,14 +691,20 @@ class TurnEngine:
             if tool_call.name == "request_directory":
                 async for event in self._handle_directory_request(tool_call):
                     yield event
+                if self._suspended is not None:
+                    return
                 continue
             if tool_call.name == "propose_plan":
                 async for event in self._handle_plan_proposal(tool_call):
                     yield event
+                if self._suspended is not None:
+                    return
                 continue
             if tool_call.name == "ask_user":
                 async for event in self._handle_ask_user(tool_call):
                     yield event
+                if self._suspended is not None:
+                    return
                 continue
             allowed = False
             async for item in self._authorize(tool_call):
@@ -619,6 +712,8 @@ class TurnEngine:
                     yield item
                 else:
                     allowed = item
+            if self._suspended is not None:
+                return
             if allowed:
                 cleared.append(tool_call)
 
@@ -637,6 +732,9 @@ class TurnEngine:
                 *[asyncio.to_thread(self._execute_sync, tc) for tc in concurrent]
             )
             for tool_call, (result, status) in zip(concurrent, outcomes):
+                if isinstance(result, DeferredInteraction):
+                    yield self._defer(result, tool_call)
+                    return
                 yield self._record_result(tool_call, result, status)
 
         for tool_call in serial:
@@ -646,6 +744,9 @@ class TurnEngine:
             yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
             self._audit(tool_call, stage="started")
             result, status = await asyncio.to_thread(self._execute_sync, tool_call)
+            if isinstance(result, DeferredInteraction):
+                yield self._defer(result, tool_call)
+                return
             yield self._record_result(tool_call, result, status)
 
     def _interrupted_tool(self, tool_call: ToolCall) -> Event:
@@ -726,6 +827,9 @@ class TurnEngine:
                 ),
                 interrupted=ApprovalOutcome.DENY,
             )
+            if isinstance(outcome, DeferredInteraction):
+                yield self._defer(outcome, tool_call)
+                return
             if outcome is ApprovalOutcome.DENY:
                 allowed, reason = (
                     False,
@@ -781,6 +885,11 @@ class TurnEngine:
 
     def _execute_sync(self, tool_call: ToolCall) -> tuple[Any, str]:
         """Execute one authorized call (runs in a worker thread)."""
+        # A constrained runtime can fence every actual side effect at the last
+        # possible moment.  Guard failures propagate and terminate the turn; they are
+        # not ordinary tool errors that the model may work around.
+        if self.tool_guard is not None:
+            self.tool_guard(tool_call)
         try:
             return self.registry.execute(tool_call.name, tool_call.arguments), "ok"
         except Exception as exc:
@@ -883,6 +992,9 @@ class TurnEngine:
                 "approved": False,
                 "error": "no response",
             }
+            if isinstance(result, DeferredInteraction):
+                yield self._defer(result, tool_call)
+                return
 
         if result.get("approved"):
             # The approver may pick the post-plan mode ("interactive" asks per write,
@@ -947,6 +1059,9 @@ class TurnEngine:
                 "granted": False,
                 "error": "no response",
             }
+            if isinstance(result, DeferredInteraction):
+                yield self._defer(result, tool_call)
+                return
 
         status = "ok" if result.get("granted") else "denied"
         self.messages.append(_tool_result_message(tool_call, result))
@@ -991,6 +1106,9 @@ class TurnEngine:
                 "answer": "",
                 "error": "no response",
             }
+            if isinstance(result, DeferredInteraction):
+                yield self._defer(result, tool_call)
+                return
 
         status = "ok" if result.get("answer") else "denied"
         self.messages.append(_tool_result_message(tool_call, result))
@@ -1051,7 +1169,7 @@ class TurnEngine:
                 else msg
             )
             for msg in source_messages
-            if msg.get("role") != "notice"
+            if msg.get("role") not in {"notice", "native_tool"}
         ]
         # PDF attachments (stored as `file` parts) are adapted to the ACTIVE model right
         # here — never in the persisted history — so a mid-session model switch always

@@ -26,6 +26,10 @@ dependencies = [
     "websockets>=13",  # managed Slack relay client transport (relay_client.py)
     "ddgs>=9",  # keyless default web-search provider (DuckDuckGo); Tavily/Brave use httpx
     "croniter>=2",  # cron next-fire math for the automation scheduler
+    # Interactive subscription-backed Agent sessions.  These SDKs speak to the
+    # user's locally authenticated Claude Code / Kimi Code CLIs; no API key is used.
+    "claude-agent-sdk>=0.1.81,<0.2",
+    "agent-client-protocol>=0.11,<0.12",
     # PDF attachments for models without native PDF support (pdf_support.py):
     # pypdf = pure-python text extraction; pypdfium2 = page rasterization (BSD pdfium,
     # ships its own libpdfium — NOT PyMuPDF, whose AGPL license can't ride in the DMG).
@@ -57,7 +61,7 @@ where = ["."]
 include = ["coworker*"]
 
 [tool.setuptools.package-data]
-coworker = ["personas/builtin/*.md"]
+coworker = ["personas/builtin/*.md", "orchestration/migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

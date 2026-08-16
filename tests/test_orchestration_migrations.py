@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+
+import pytest
+
+from coworker.orchestration.errors import MigrationError
+from coworker.orchestration.migrations import (
+    Migration,
+    applied_migrations,
+    apply_migrations,
+    load_migrations,
+)
+
+
+def _migration(version: int, name: str, sql: str) -> Migration:
+    return Migration(
+        version=version,
+        name=name,
+        sql=sql,
+        checksum=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+    )
+
+
+def test_database_at_0001_upgrades_to_current_bundle(tmp_path) -> None:
+    bundle = load_migrations()
+    assert bundle[0].version == 1
+    connection = sqlite3.connect(tmp_path / "from-0001.db")
+    try:
+        assert apply_migrations(connection, (bundle[0],)) == (1,)
+
+        expected = tuple(migration.version for migration in bundle[1:])
+        assert apply_migrations(connection, bundle) == expected
+        assert tuple(item.version for item in applied_migrations(connection)) == tuple(
+            migration.version for migration in bundle
+        )
+        assert apply_migrations(connection, bundle) == ()
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("orch_evidence_blob_lookup",),
+        ).fetchone() == ("orch_evidence_blob_lookup",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("orch_scheduler_leader",),
+        ).fetchone() == ("orch_scheduler_leader",)
+        assert "dead_lettered_at" in {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(orch_outbox)").fetchall()
+        }
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("orch_outbox_requeue_history",),
+        ).fetchone() == ("orch_outbox_requeue_history",)
+        assert {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'trigger' AND tbl_name = 'orch_outbox_requeue_history'
+                """
+            ).fetchall()
+        } == {
+            "orch_outbox_requeue_history_no_update",
+            "orch_outbox_requeue_history_no_delete",
+        }
+        gate_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'orch_gates'"
+        ).fetchone()[0]
+        assert "'preparing'" in gate_schema
+    finally:
+        connection.close()
+
+
+def test_0006_preserves_historical_gates_and_marks_them_published(tmp_path) -> None:
+    bundle = load_migrations()
+    connection = sqlite3.connect(tmp_path / "from-0005-with-gates.db")
+    try:
+        assert apply_migrations(connection, bundle[:5]) == (1, 2, 3, 4, 5)
+        now = "2026-08-03T00:00:00.000000Z"
+        connection.execute(
+            """
+            INSERT INTO orch_tasks(
+                id, idempotency_key, creation_hash, title, objective, domain,
+                risk_tier, status, current_stage, created_at, updated_at
+            ) VALUES ('task-history', 'history', 'hash', 'History', 'Preserve gates',
+                      'knowledge', 'low', 'waiting_human', 'planning', ?, ?)
+            """,
+            (now, now),
+        )
+        for index, status in enumerate(("open", "approved", "canceled"), start=1):
+            resolved = None if status == "open" else now
+            connection.execute(
+                """
+                INSERT INTO orch_gates(
+                    id, task_id, kind, status, source_key, prompt_json,
+                    resolution_json, resolved_by, opened_at, resolved_at
+                ) VALUES (?, 'task-history', 'plan_approval', ?, ?, '{}', ?, ?, ?, ?)
+                """,
+                (
+                    f"gate-{index}",
+                    status,
+                    f"history-{status}",
+                    None if status == "open" else '{"decision":"approve"}',
+                    None if status == "open" else "owner",
+                    now,
+                    resolved,
+                ),
+            )
+        connection.commit()
+
+        assert apply_migrations(connection, bundle) == (6,)
+        rows = connection.execute(
+            """
+            SELECT id, status, opened_at, published_at
+            FROM orch_gates ORDER BY id
+            """
+        ).fetchall()
+        assert rows == [
+            ("gate-1", "open", now, now),
+            ("gate-2", "approved", now, now),
+            ("gate-3", "canceled", now, now),
+        ]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            ("orch_gates_task_status",),
+        ).fetchone() == ("orch_gates_task_status",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            ("orch_gates_task_publication",),
+        ).fetchone() == ("orch_gates_task_publication",)
+    finally:
+        connection.close()
+
+
+def test_bundle_with_migration_hole_is_rejected_before_schema_changes(tmp_path) -> None:
+    first = _migration(1, "initial", "CREATE TABLE first_table (id INTEGER);")
+    third = _migration(3, "skipped_second", "CREATE TABLE third_table (id INTEGER);")
+    connection = sqlite3.connect(tmp_path / "hole.db")
+    try:
+        with pytest.raises(MigrationError, match="contiguous and start at 0001"):
+            apply_migrations(connection, (first, third))
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'first_table'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT COUNT(*) FROM orch_schema_migrations"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_non_prefix_database_history_is_rejected_without_repairing_it(tmp_path) -> None:
+    first = _migration(1, "initial", "CREATE TABLE first_table (id INTEGER);")
+    second = _migration(2, "second", "CREATE TABLE second_table (id INTEGER);")
+    connection = sqlite3.connect(tmp_path / "non-prefix.db")
+    try:
+        assert apply_migrations(connection, (first,)) == (1,)
+        connection.execute("DELETE FROM orch_schema_migrations WHERE version = 1")
+        connection.execute(
+            """
+            INSERT INTO orch_schema_migrations(version, name, checksum, applied_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (2, second.name, second.checksum, "2026-08-03T00:00:00.000Z"),
+        )
+        connection.commit()
+
+        with pytest.raises(MigrationError, match="not an exact bundle prefix"):
+            apply_migrations(connection, (first, second))
+
+        assert connection.execute(
+            "SELECT version FROM orch_schema_migrations ORDER BY version"
+        ).fetchall() == [(2,)]
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'second_table'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_two_connections_apply_the_same_bundle_once_under_lock(tmp_path) -> None:
+    database = tmp_path / "concurrent.db"
+    bundle = (
+        _migration(1, "initial", "CREATE TABLE stable (id INTEGER PRIMARY KEY);"),
+        _migration(2, "second", "ALTER TABLE stable ADD COLUMN value TEXT;"),
+    )
+    barrier = threading.Barrier(2)
+    results: list[tuple[int, ...]] = []
+    errors: list[BaseException] = []
+
+    def migrate() -> None:
+        connection = sqlite3.connect(database, timeout=10)
+        try:
+            barrier.wait(timeout=5)
+            results.append(apply_migrations(connection, bundle))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=migrate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert sorted(results) == [(), (1, 2)]
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT version FROM orch_schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,)]
+        assert {
+            row[1] for row in connection.execute("PRAGMA table_info(stable)").fetchall()
+        } == {"id", "value"}
+    finally:
+        connection.close()
+
+
+def test_database_newer_than_bundle_fails_closed(tmp_path) -> None:
+    bundle = load_migrations()
+    future_version = bundle[-1].version + 1
+    connection = sqlite3.connect(tmp_path / "future.db")
+    try:
+        assert apply_migrations(connection, bundle) == tuple(
+            migration.version for migration in bundle
+        )
+        connection.execute(
+            """
+            INSERT INTO orch_schema_migrations(version, name, checksum, applied_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (future_version, "future", "f" * 64, "2026-08-03T00:00:00.000Z"),
+        )
+        connection.commit()
+        ledger_before = connection.execute(
+            "SELECT version, name, checksum FROM orch_schema_migrations ORDER BY version"
+        ).fetchall()
+
+        with pytest.raises(
+            MigrationError,
+            match=rf"version {future_version:04d} is newer.*downgrade",
+        ):
+            apply_migrations(connection, bundle)
+
+        assert connection.execute(
+            "SELECT version, name, checksum FROM orch_schema_migrations ORDER BY version"
+        ).fetchall() == ledger_before
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orch_tasks'"
+        ).fetchone() == ("orch_tasks",)
+    finally:
+        connection.close()
+
+
+def test_failed_migration_rolls_back_schema_and_ledger(tmp_path) -> None:
+    initial = _migration(1, "initial", "CREATE TABLE stable (id INTEGER PRIMARY KEY);")
+    broken = _migration(
+        2,
+        "broken",
+        """
+        CREATE TABLE must_rollback (id INTEGER PRIMARY KEY);
+        INSERT INTO must_rollback(id) VALUES (1);
+        THIS IS NOT VALID SQL;
+        """,
+    )
+    repaired = _migration(
+        2,
+        "broken",
+        "CREATE TABLE recovered (id INTEGER PRIMARY KEY);",
+    )
+    connection = sqlite3.connect(tmp_path / "rollback.db")
+    try:
+        assert apply_migrations(connection, (initial,)) == (1,)
+
+        with pytest.raises(MigrationError, match=r"migration 0002_broken failed"):
+            apply_migrations(connection, (initial, broken))
+
+        assert not connection.in_transaction
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'must_rollback'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT version FROM orch_schema_migrations ORDER BY version"
+        ).fetchall() == [(1,)]
+
+        assert apply_migrations(connection, (initial, repaired)) == (2,)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'recovered'"
+        ).fetchone() == ("recovered",)
+    finally:
+        connection.close()

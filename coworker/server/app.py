@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -159,6 +159,7 @@ from ..attachments import (
 )
 from ..engine import ApprovalOutcome
 from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
+from ..interactive_subscription import InteractiveSubscriptionProvider
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from .manager import SessionManager
@@ -167,6 +168,13 @@ from .manager import SessionManager
 def create_app(manager: SessionManager) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Durable state integrity is mandatory. Do this outside the optional connector
+        # recovery boundary so audit corruption prevents the API from accepting writes.
+        try:
+            await manager.start_orchestration()
+        except Exception:
+            await manager.aclose()
+            raise
         try:
             live = (
                 await manager.start_gateway()
@@ -232,15 +240,34 @@ def create_app(manager: SessionManager) -> FastAPI:
         allow_headers=["*"],
     )
     app.state.manager = manager
+    # The orchestration API is isolated in its own router so future upstream endpoint
+    # changes do not require editing this already-large control-plane module.
+    from ..orchestration.api import create_orchestration_router
+
+    app.include_router(create_orchestration_router(manager))
 
     @app.get("/v1/health")
-    def health(request: Request) -> dict[str, Any]:
+    def health(request: Request, response: Response) -> dict[str, Any]:
+        orchestration = manager.orchestration.health_snapshot()
+        if not orchestration["ready"]:
+            response.status_code = 503
+        status = "ok" if orchestration["ready"] else "not_ready"
         if api_token and not _request_authenticated(request):
-            return {"status": "ok"}
+            # Keep the tokenless probe useful without exposing paths, exception
+            # messages, model configuration, or other authenticated diagnostics.
+            return {
+                "status": status,
+                "orchestration": {
+                    "ready": orchestration["ready"],
+                    "state": orchestration["state"],
+                    "loop_alive": orchestration["loop_alive"],
+                },
+            }
         return {
-            "status": "ok",
+            "status": status,
             "default_workspace": manager.default_workspace,
             "model": manager.model,
+            "orchestration": orchestration,
         }
 
     @app.get("/v1/agents")
@@ -1826,6 +1853,16 @@ def create_app(manager: SessionManager) -> FastAPI:
             await ws.send_json({"type": "input_rejected", "data": {"error": reason}})
 
         async def claim_turn(*, retry: bool = False, content=None, display=None) -> None:
+            session_provider = getattr(engine, "provider", None)
+            if (
+                isinstance(session_provider, InteractiveSubscriptionProvider)
+                and session_provider.turn_busy
+            ):
+                await reject_input(
+                    "The previous Subscription Agent turn is still stopping. Wait for "
+                    "runtime cleanup before sending another message."
+                )
+                return
             if not manager.try_mark_running(session_id):
                 await reject_input(
                     "This session is already running a turn. Wait for it to finish or stop it."
@@ -1984,6 +2021,39 @@ def create_app(manager: SessionManager) -> FastAPI:
                     if model is not None and not isinstance(model, str):
                         await reject_input("Invalid model: expected a string.")
                         continue
+                    selected_model = model or engine.model
+                    if InteractiveSubscriptionProvider.is_subscription_model(
+                        selected_model
+                    ):
+                        # A subscription runtime is a complete native Agent loop. It
+                        # cannot consume OpenWorker's provider-only multipart payload or
+                        # execute the host's load_skill tool, so reject instead of
+                        # silently dropping an attachment / pretending a skill ran.
+                        if attachments:
+                            await reject_input(
+                                "Attachments are not supported by Subscription Agent "
+                                "runtimes; remove them or choose an API model."
+                            )
+                            continue
+                        if message.get("skill") is not None:
+                            await reject_input(
+                                "OpenWorker Skills are not supported by Subscription "
+                                "Agent runtimes; remove the Skill or choose an API model."
+                            )
+                            continue
+                        session_provider = getattr(engine, "provider", None)
+                        if (
+                            isinstance(
+                                session_provider, InteractiveSubscriptionProvider
+                            )
+                            and session_provider.recovery_required_for(selected_model)
+                        ):
+                            await reject_input(
+                                "The previous Subscription Agent prompt has an uncertain "
+                                "outcome after restart, so it will not be replayed. Start "
+                                "a new session or switch to another runtime/API model."
+                            )
+                            continue
                     # Force-run (SKILLS-SPEC §4.1 #3): the composer's `/skill` pick rides as a
                     # separate field. Validated against the session's effective menu — a muted
                     # or unknown skill is a visible error, never a silent no-op (§4.6 #15).

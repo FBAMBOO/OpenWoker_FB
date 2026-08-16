@@ -4,6 +4,41 @@
 import { describe, expect, it } from "vitest";
 import { itemsFromMessages } from "./itemsFromMessages";
 
+describe("itemsFromMessages native subscription tools", () => {
+  it("correlates durable start and finish evidence into one tool card", () => {
+    const items = itemsFromMessages([
+      {
+        role: "native_tool",
+        event: "tool_started",
+        name: "shell",
+        tool_call_id: "native-1",
+        arguments: { command: "git status" },
+        status: "running",
+      },
+      {
+        role: "native_tool",
+        event: "tool_finished",
+        name: "shell",
+        tool_call_id: "native-1",
+        arguments: { command: "git status" },
+        status: "completed",
+        result_preview: "clean",
+      },
+    ]);
+
+    expect(items).toEqual([
+      {
+        kind: "tool",
+        id: "native-1",
+        name: "shell",
+        args: { command: "git status" },
+        status: "completed",
+        preview: "clean",
+      },
+    ]);
+  });
+});
+
 describe("itemsFromMessages _display sidecar", () => {
   it("attaches hidden counts to the matching tool item", () => {
     const items = itemsFromMessages([

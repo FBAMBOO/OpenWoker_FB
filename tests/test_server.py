@@ -495,6 +495,8 @@ def test_server_sets_explicit_websocket_frame_limit(tmp_path, monkeypatch):
 
 def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
     import os
+    import subprocess
+    import sys
 
     from coworker.server import run as server_run
 
@@ -504,7 +506,16 @@ def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
         assert path == tmp_path / "coworker-state" / "sidecar-9876.token"
         assert path.read_text().strip() == os.environ["COWORKER_API_TOKEN"]
         assert len(path.read_text().strip()) == 64
-        assert (path.stat().st_mode & 0o777) == 0o600
+        if sys.platform == "win32":
+            acl = subprocess.run(
+                ["icacls", str(path)], capture_output=True, text=True
+            ).stdout
+            user = os.environ.get("USERNAME", "")
+            assert user and user in acl
+            assert "NT AUTHORITY\\SYSTEM" not in acl
+            assert "BUILTIN\\Administrators" not in acl
+        else:
+            assert (path.stat().st_mode & 0o777) == 0o600
     finally:
         path.unlink(missing_ok=True)
         os.environ.pop("COWORKER_API_TOKEN", None)
@@ -585,13 +596,46 @@ def test_sidecar_token_gates_rest_and_websockets(tmp_path, monkeypatch):
 
     monkeypatch.setenv("COWORKER_API_TOKEN", "a" * 64)
     manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    monkeypatch.setattr(
+        manager.orchestration,
+        "health_snapshot",
+        lambda: {"ready": True, "state": "healthy", "loop_alive": True},
+    )
     client = TestClient(create_app(manager))
 
-    assert client.get("/v1/health").json() == {"status": "ok"}
+    assert client.get("/v1/health").json() == {
+        "status": "ok",
+        "orchestration": {
+            "ready": True,
+            "state": "healthy",
+            "loop_alive": True,
+        },
+    }
     assert client.get("/v1/sessions").status_code == 401
     assert client.get(
         "/v1/sessions", headers={"X-OpenWorker-Token": "wrong"}
     ).status_code == 401
+
+    monkeypatch.setattr(
+        manager.orchestration,
+        "health_snapshot",
+        lambda: {"ready": False, "state": "unhealthy", "loop_alive": False},
+    )
+    unhealthy_probe = client.get("/v1/health")
+    assert unhealthy_probe.status_code == 503
+    assert unhealthy_probe.json() == {
+        "status": "not_ready",
+        "orchestration": {
+            "ready": False,
+            "state": "unhealthy",
+            "loop_alive": False,
+        },
+    }
+    monkeypatch.setattr(
+        manager.orchestration,
+        "health_snapshot",
+        lambda: {"ready": True, "state": "healthy", "loop_alive": True},
+    )
 
     headers = {"X-OpenWorker-Token": "a" * 64}
     assert client.get("/v1/health", headers=headers).json()[

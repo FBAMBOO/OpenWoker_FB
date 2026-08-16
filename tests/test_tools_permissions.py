@@ -21,6 +21,18 @@ def _registry(root: Path) -> ToolRegistry:
 # -- ToolRegistry ---------------------------------------------------------------
 
 
+def test_registry_subset_is_fail_closed_and_isolated(tmp_path):
+    reg = _registry(tmp_path)
+    names = reg.names()
+    chosen = names[:1]
+    child = reg.subset(chosen)
+
+    assert child.names() == chosen
+    assert reg.names() == names
+    with pytest.raises(KeyError, match="not registered"):
+        reg.subset(["does_not_exist"])
+
+
 def test_registry_exposes_schemas(tmp_path):
     reg = _registry(tmp_path)
     names = set(reg.names())
@@ -99,6 +111,50 @@ def test_shell_allowlist(tmp_path):
     asked = eng.evaluate("run_shell", {"command": "rm -rf /"}, None)
     assert allowed.allowed
     assert not asked.allowed and asked.needs_user
+
+
+def test_runtime_command_ceiling_cannot_be_bypassed_by_approval(tmp_path):
+    eng = PermissionEngine(
+        workspace_root=tmp_path,
+        allowed_commands=[],
+        command_ceiling=["pytest"],
+    )
+    permitted_but_interactive = eng.evaluate(
+        "run_shell", {"command": "pytest -q"}, None
+    )
+    denied = eng.evaluate("run_shell", {"command": "git status"}, None)
+    chained = eng.evaluate("run_shell", {"command": "pytest; git status"}, None)
+
+    assert not permitted_but_interactive.allowed and permitted_but_interactive.needs_user
+    assert not denied.allowed and not denied.needs_user
+    assert not chained.allowed and not chained.needs_user
+
+
+def test_permission_engine_preserves_legacy_positional_argument_order(tmp_path):
+    auto_tools = {"write_file"}
+    session_tools = {"read_file"}
+    session_commands = {"pytest -q"}
+    task_rules = {"connector": {"target"}}
+    roots = [{"path": tmp_path, "writable": True}]
+
+    engine = PermissionEngine(
+        tmp_path,
+        Mode.CUSTOM,
+        ["pytest"],
+        auto_tools,
+        session_tools,
+        session_commands,
+        task_rules,
+        None,
+        roots,
+    )
+
+    assert engine.auto_allow_tools == auto_tools
+    assert engine.session_allow_tools == session_tools
+    assert engine.session_allow_commands == session_commands
+    assert engine.task_rules == task_rules
+    assert engine.roots is roots
+    assert engine.command_ceiling is None
 
 
 def test_session_allow_tool_sticks(tmp_path):

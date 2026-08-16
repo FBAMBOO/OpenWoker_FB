@@ -27,7 +27,13 @@ export default defineConfig(({ command }) => {
   return {
     base: "./",
     plugins: [react()],
-    server: { port: 1420, strictPort: true },
+    server: {
+      port: 1420,
+      strictPort: true,
+      // Cargo frequently replaces locked .exe files under src-tauri/target on Windows.
+      // Tauri watches the Rust side itself, so Vite should not watch this tree.
+      watch: { ignored: ["**/src-tauri/**"] },
+    },
     define: { __COWORKER_DEV_TOKEN__: JSON.stringify(devToken) },
     // Tauri CLI looks for these; harmless for the browser build.
     clearScreen: false,

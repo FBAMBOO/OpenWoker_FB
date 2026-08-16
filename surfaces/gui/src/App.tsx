@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
 import {
   announceInboxUnlock,
+  apiRequest,
+  downloadApiResource,
   finalizeAutomationRun,
   getArtifacts,
   getHealth,
@@ -21,6 +23,7 @@ import {
   setSessionFlags,
   setUnattended,
   Session,
+  type Health,
   type InboxItem,
   type MessageSource,
   type Persona,
@@ -65,6 +68,8 @@ import { ApprovalCard } from "./components/ApprovalCard";
 import { DirectoryRequestCard } from "./components/DirectoryRequestCard";
 import { PlanCard } from "./components/PlanCard";
 import { WorkspaceTrustPrompt } from "./components/WorkspaceTrustPrompt";
+import { OrchestrationSurface } from "./features/orchestration";
+import { selectableModelCatalog } from "./modelCatalog";
 
 const newId = () =>
   (crypto as any).randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14);
@@ -200,6 +205,12 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [projects, setProjects] = useState<RecentWorkspace[]>([]);
   const [sessionId, setSessionId] = useState<string>(newId());
+  // Ref truth is intentional: boot restoration and Settings loading are async and
+  // can finish in one React batch. State/closure inspection there misclassified a
+  // restored conversation as fresh and replaced its persisted model.
+  const freshSessionRef = useRef(true);
+  const modelExplicitlySelectedRef = useRef(false);
+  const subscriptionOnlyDefaultRef = useRef<string | null>(null);
   // Automation-run context (§ owner ask 2026-07-04): which task an open __run__ session belongs
   // to, driving the banner + "Back to runs". Best-effort — a run session without context still
   // shows a generic banner (detected by its __run__ id).
@@ -212,10 +223,12 @@ export function App() {
   const [gateCreate, setGateCreate] = useState(false);
   // Which Settings section the full-page Settings surface opens on (§ Settings-as-page).
   const [settingsTab, setSettingsTab] = useState<
-    "appearance" | "models" | "skills" | "voice" | "personas"
+    "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing"
   >("appearance");
+  const [settingsAgentProfileId, setSettingsAgentProfileId] = useState("");
+  const [settingsModelPolicyId, setSettingsModelPolicyId] = useState("");
   const openSettings = (
-    tab: "appearance" | "models" | "skills" | "voice" | "personas" = "appearance",
+    tab: "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing" = "appearance",
   ) => {
     setSettingsTab(tab);
     setSurface("settings");
@@ -224,8 +237,9 @@ export function App() {
   // composer's "No model connected" chip. Default true so we don't flash the chip before settings
   // load; corrected by loadSettings.
   const [modelReady, setModelReady] = useState(true);
+  const [orchestrationHealth, setOrchestrationHealth] = useState<Health["orchestration"] | null>(null);
   const [surface, setSurface] = useState<
-    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings"
+    "session" | "scheduled" | "orchestration" | "integrations" | "audit" | "inbox" | "persona" | "settings"
   >("session");
   // A remembered Scheduled-detail target must not outlive the surface (see the
   // scheduledOpenId comment above): nav re-entry lands on the list, never a
@@ -409,6 +423,7 @@ export function App() {
       const ts = (s: SessionInfo) => Date.parse(s.updated_at || "") || Number(s.updated_at) || 0;
       const last = [...sess].sort((a, b) => ts(b) - ts(a))[0];
       if (last) {
+        freshSessionRef.current = false;
         setResumedExisting(true);
         if (last.agent) setAgent(last.agent);
         if (last.workspace) {
@@ -454,6 +469,7 @@ export function App() {
       getHealth()
         .then(async (h) => {
           if (cancelled) return;
+          setOrchestrationHealth(h.orchestration || null);
           setModel(h.model);
           // First-run setup wizard (desktop): show until the user completes/dismisses it.
           if (isTauri()) {
@@ -471,7 +487,7 @@ export function App() {
           // The mount-time loadSettings races the sidecar boot and swallows its failure —
           // on a cold start that left "Loading models…" stuck until the user visited
           // Settings (owner-hit 2026-07-23). Health just answered, so this one lands.
-          loadSettings();
+          await loadSettings();
           if (!cancelled) setBooting(false);
         })
         .catch(() => {
@@ -489,6 +505,26 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (booting) return;
+    let cancelled = false;
+    const refreshOrchestrationHealth = () => {
+      void getHealth()
+        .then((health) => {
+          if (!cancelled) setOrchestrationHealth(health.orchestration || null);
+        })
+        .catch(() => {
+          // Connection failures have their own UI. Retain the last orchestration
+          // snapshot instead of replacing a known durable state with a guess.
+        });
+    };
+    const timer = window.setInterval(refreshOrchestrationHealth, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [booting]);
 
   // Reveal the UI once boot has settled AND the restored session is connected (or we're showing
   // the folder gate). Latched, so later reconnects never flash the splash again.
@@ -508,11 +544,22 @@ export function App() {
   const loadSettings = () =>
     getSettings()
       .then((s) => {
-        setModels(s.models || []);
-        setModelLabels(s.model_labels || {});
-        setModelContextWindows(s.model_context_windows || {});
+        const catalog = selectableModelCatalog(s);
+        setModels(catalog.models);
+        setModelLabels(catalog.labels);
+        setModelContextWindows(catalog.contextWindows);
         setContextBar(s.context_bar === true);
-        setModelReady(s.model_ready);
+        setModelReady(catalog.modelReady);
+        subscriptionOnlyDefaultRef.current = catalog.subscriptionOnlyDefault;
+        // A ref, rather than the sessions state captured by this promise, prevents
+        // boot's restored-session state updates from being observed one render late.
+        if (
+          freshSessionRef.current &&
+          !modelExplicitlySelectedRef.current &&
+          catalog.subscriptionOnlyDefault
+        ) {
+          setModel(catalog.subscriptionOnlyDefault);
+        }
         if (s.surfaces) setSurfaces(s.surfaces);
       })
       .catch(() => {});
@@ -592,7 +639,13 @@ export function App() {
       switch (ev.type) {
         case "ready":
           setConnected(true);
-          if (d.model) setModel(d.model);
+          if (d.model && !(freshSessionRef.current && modelExplicitlySelectedRef.current)) {
+            setModel(
+              freshSessionRef.current && subscriptionOnlyDefaultRef.current
+                ? subscriptionOnlyDefaultRef.current
+                : d.model,
+            );
+          }
           if (d.mode) setMode(d.mode);
           if (d.command_trust?.required) setWorkspaceTrustRequest(d.command_trust);
           // Cowork: adopt the server-provisioned scratch dir (only when we don't already have one).
@@ -656,7 +709,13 @@ export function App() {
             setTodo(normalizeTodos(d.arguments.todos ?? d.arguments.items));
           setItems((p) => [
             ...p,
-            { kind: "tool", id: newId(), name: d.name, args: d.arguments, status: "…" },
+            {
+              kind: "tool",
+              id: String(d.tool_call_id || d.id || newId()),
+              name: d.name,
+              args: d.arguments,
+              status: "…",
+            },
           ]);
           break;
         case "permission_required":
@@ -707,6 +766,7 @@ export function App() {
               d.result_preview || d.reason,
               d.display?.hidden_by_filters,
               d.standing_rule,
+              d.tool_call_id || d.id,
             ),
           );
           // Refresh the right rail when something it shows may have changed: browser state, or a
@@ -772,12 +832,19 @@ export function App() {
       onEvent: handleEvent,
       onOpen: () => {
         setConnected(true);
+        const freshDefault = freshSessionRef.current
+          ? subscriptionOnlyDefaultRef.current
+          : null;
+        // Bind a genuinely new session before any auto-sent prompt. Manual sends
+        // also carry the visible model, but scheduled prompts use this live binding.
+        if (freshDefault) session.setModel(freshDefault);
         // Auto-send the task prompt once a "Run now" session connects.
         const p = pendingPromptRef.current;
         if (p) {
           pendingPromptRef.current = null;
           setItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
-          sessionRef.current?.userMessage(p);
+          sessionRef.current?.userMessage(p, undefined, freshDefault || undefined);
+          freshSessionRef.current = false;
         }
       },
       onClose: () => setConnected(false),
@@ -873,6 +940,7 @@ export function App() {
     setItems((p) => [...p, { kind: "user", text: shown, attachments, ts: Date.now() / 1000 }]);
     // The visible model rides along with the message (single source of truth per turn).
     sessionRef.current?.userMessage(text, attachments, model, skill);
+    freshSessionRef.current = false;
     followLatest(); // sending always re-engages stream-following, wherever the user had scrolled
   };
   // Resolving a LIVE prompt also resolves its parked Inbox mirror server-side, but the polled
@@ -917,12 +985,16 @@ export function App() {
   };
   const changeModel = (m: string) => {
     if (running) return; // the server refuses mid-turn rebinds — don't let the header lie
+    modelExplicitlySelectedRef.current = true;
     setModel(m);
     sessionRef.current?.setModel(m);
   };
 
   const startNewSession = (forAgent?: string) => {
     const target = forAgent || agent;
+    freshSessionRef.current = true;
+    modelExplicitlySelectedRef.current = false;
+    if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
     setSurface("session"); // return to the conversation view if we were on a sub-view
     setItems([]);
     setUsage(emptyUsage());
@@ -976,6 +1048,7 @@ export function App() {
 
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
   const selectSession = async (id: string, ws: string, ag: string) => {
+    freshSessionRef.current = false;
     setSurface("session"); // selecting a conversation always returns to the conversation view
     setTodo([]);
     setStreaming("");
@@ -1017,6 +1090,7 @@ export function App() {
     const inheritable = gatesWorkspace(agent) ? workspace : null;
 
     if (target) {
+      freshSessionRef.current = false;
       // Code falls back to a recent folder; Cowork resumes its scratch (target.workspace) or
       // starts orphan ("" → server provisions). Chat has no workspace.
       const targetWorkspace = gatesWorkspace(name)
@@ -1046,6 +1120,9 @@ export function App() {
     }
 
     const id = newId();
+    freshSessionRef.current = true;
+    modelExplicitlySelectedRef.current = false;
+    if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
     const fallback = gatesWorkspace(name) ? fallbackWorkspace(inheritable, knownProjects) : "";
     if (fallback && fallback !== workspace) {
       setWorkspace(fallback);
@@ -1059,6 +1136,9 @@ export function App() {
     else setShowGate(!fallback);
   };
   const chooseWorkspace = (path: string, b?: string | null) => {
+    freshSessionRef.current = true;
+    modelExplicitlySelectedRef.current = false;
+    if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
     setWorkspace(path);
     setBranch(b ?? null);
     setShowGate(false);
@@ -1075,6 +1155,9 @@ export function App() {
   // surface==="session" && gatesWorkspace(agent) guard passes even if the active session was Chat/Cowork.
   const newProject = (forAgent?: string) => {
     const target = forAgent || agent;
+    freshSessionRef.current = true;
+    modelExplicitlySelectedRef.current = false;
+    if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
     setSurface("session");
     setItems([]);
     setUsage(emptyUsage());
@@ -1101,6 +1184,9 @@ export function App() {
     refreshSessions();
     // Archiving the open chat: leave it and start fresh (it moves to the Archived section).
     if (archived && id === sessionId) {
+      freshSessionRef.current = true;
+      modelExplicitlySelectedRef.current = false;
+      if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
       setItems([]);
       setUsage(emptyUsage());
       setStreaming("");
@@ -1114,6 +1200,9 @@ export function App() {
     if (!res.ok) return;
     refreshSessions();
     if (id === sessionId) {
+      freshSessionRef.current = true;
+      modelExplicitlySelectedRef.current = false;
+      if (subscriptionOnlyDefaultRef.current) setModel(subscriptionOnlyDefaultRef.current);
       setItems([]);
       setUsage(emptyUsage());
       setStreaming("");
@@ -1226,6 +1315,33 @@ export function App() {
       )}
       {/* Desktop-only auto-update prompt (15s after boot, then every 30 min; inert in browser). */}
       <UpdateBanner />
+      {orchestrationHealth && !orchestrationHealth.ready && surface !== "orchestration" && (
+        <div
+          className="fixed bottom-3 right-3 z-[44] w-[340px] rounded-xl border border-warnInk/25 bg-warnSoft px-4 py-3 shadow-xl"
+          role="alert"
+          data-testid="orchestration-readiness-banner"
+        >
+          <div className="flex items-start gap-3">
+            <Icon name="shield" size={15} className="mt-0.5 shrink-0 text-warnInk" />
+            <div className="min-w-0 flex-1">
+              <div className="text-[12.5px] font-semibold text-warnInk">Orchestration needs attention</div>
+              <div className="mt-0.5 text-[11px] leading-relaxed text-warnInk/80">
+                {orchestrationHealth.state}
+                {orchestrationHealth.leader && !orchestrationHealth.leader.held ? " · leader lease not held" : ""}
+                {orchestrationHealth.outbox?.stale ? " · outbox stale" : ""}
+                {orchestrationHealth.outbox?.dead_letters ? ` · ${orchestrationHealth.outbox.dead_letters} dead letter${orchestrationHealth.outbox.dead_letters === 1 ? "" : "s"}` : ""}
+              </div>
+              <button
+                type="button"
+                className="mt-2 text-[11.5px] font-medium text-accent hover:underline"
+                onClick={() => setSurface("orchestration")}
+              >
+                Open orchestration recovery
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* UX-026: automation-start toast — quiet panel, neutral dot/drain, accent only
           on the action (rev 2); auto-dismisses with the 5s drain bar. */}
       {runToast && (
@@ -1291,7 +1407,10 @@ export function App() {
         <Onboarding
           onDone={(next) => {
             setOnboarding(false);
-            getHealth().then((h) => setModel(h.model)).catch(() => {});
+            getHealth().then((h) => {
+              setModel(h.model);
+              setOrchestrationHealth(h.orchestration || null);
+            }).catch(() => {});
             loadSettings(); // pick up a model connected during setup (clears the composer chip)
             if (next === "gallery") {
               // The specialists tip: land on Settings ▸ Personas, where the Gallery link lives.
@@ -1329,6 +1448,7 @@ export function App() {
         }}
         onManagePersonas={() => openSettings("personas")}
         onOpenScheduled={() => setSurface("scheduled")}
+        onOpenOrchestration={() => setSurface("orchestration")}
         onOpenAutomation={(id) => {
           setScheduledOpenId(id);
           setSurface("scheduled");
@@ -1337,6 +1457,7 @@ export function App() {
         onOpenAudit={() => setSurface("audit")}
         onOpenInbox={() => setSurface("inbox")}
         scheduledActive={surface === "scheduled"}
+        orchestrationActive={surface === "orchestration"}
         integrationsActive={surface === "integrations"}
         auditActive={surface === "audit"}
         inboxActive={surface === "inbox"}
@@ -1350,12 +1471,29 @@ export function App() {
           onRunNow={runTaskNow}
           initialOpenId={scheduledOpenId}
         />
+      ) : surface === "orchestration" ? (
+        <OrchestrationSurface
+          apiRequest={apiRequest}
+          apiDownload={downloadApiResource}
+          currentWorkspace={workspace || undefined}
+          subscribeEvents={connectEvents}
+          onOpenProfile={(profileId) => {
+            setSettingsAgentProfileId(profileId);
+            openSettings("agent_profiles");
+          }}
+          onOpenPolicy={(policyId) => {
+            setSettingsModelPolicyId(policyId);
+            openSettings("model_routing");
+          }}
+        />
       ) : surface === "integrations" ? (
         <IntegrationsView />
       ) : surface === "settings" ? (
         <SettingsView
-          key={settingsTab}
+          key={`${settingsTab}:${settingsAgentProfileId}:${settingsModelPolicyId}`}
           initialTab={settingsTab}
+          initialAgentProfileId={settingsAgentProfileId || undefined}
+          initialModelPolicyId={settingsModelPolicyId || undefined}
           onOpenPersona={(id) => openPersona(id, "settings")}
           onCreateSkill={(description) => {
             // The Skills doorway (SKILLS-SPEC §5.2): creation is a conversation. Fresh
@@ -1742,11 +1880,16 @@ function updateLastTool(
   preview?: string,
   hidden?: number,
   standingRule?: string,
+  callId?: string,
 ): Item[] {
   const copy = [...items];
   for (let i = copy.length - 1; i >= 0; i--) {
     const it = copy[i];
-    if (it.kind === "tool" && it.name === name && it.status === "…") {
+    if (
+      it.kind === "tool" &&
+      it.status === "…" &&
+      (callId ? it.id === String(callId) : it.name === name)
+    ) {
       copy[i] = {
         ...it,
         status,

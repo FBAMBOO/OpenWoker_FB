@@ -99,12 +99,18 @@ def _watch_parent_windows(parent: int) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
-def build_app(workspace: str | None, model: str, mode: str):
+def build_app(
+    workspace: str | None,
+    model: str,
+    mode: str,
+    server_host: str = "127.0.0.1",
+):
     manager = SessionManager(
         workspace=Path(workspace).expanduser().resolve() if workspace else None,
         data_dir=state_dir(),
         model=model,
         mode=Mode(mode),
+        server_host=server_host,
     )
     return create_app(manager)
 
@@ -161,7 +167,7 @@ def main(argv=None) -> None:
         import uvicorn
 
         _exit_when_orphaned()
-        app = build_app(args.cwd, args.model, args.mode)
+        app = build_app(args.cwd, args.model, args.mode, args.host)
         uvicorn.run(
             app, host=args.host, port=args.port, ws_max_size=_WS_MAX_FRAME_BYTES
         )

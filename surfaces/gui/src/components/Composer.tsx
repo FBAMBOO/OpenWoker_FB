@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import type { Attachment, SessionUsage } from "../types";
 import { isPdfFile, readFile } from "../attach";
 import { getSettings, inspectPdf, sessionSkills, type SessionSkillRow } from "../api";
+import { isSubscriptionRuntimeId } from "../modelCatalog";
 import { formatTokens, totalTokens } from "../usage";
 import { Dropdown, type Option } from "./Dropdown";
 import { Icon } from "./Icon";
@@ -94,6 +95,8 @@ interface Props {
 export function Composer(props: Props) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const subscriptionRuntime = isSubscriptionRuntimeId(props.model);
+  const kimiSubscriptionRuntime = /^kimi-code-subscription:/i.test(props.model.trim());
   // "/" force-run (SKILLS-SPEC §4.1 #3). The popup derives from the draft: it is open while
   // the text is a bare "/query" (no whitespace yet) and no skill is picked. Selecting a row
   // inserts "/name " INLINE in the box (Claude-Code style — the slash text IS the state);
@@ -109,7 +112,7 @@ export function Composer(props: Props) {
     if (pendingSkill && !prefixIntact) setPendingSkill(null);
   }, [pendingSkill, prefixIntact]);
   const slashQuery =
-    !prefixIntact && props.sessionId && text.startsWith("/") && !/\s/.test(text.slice(1))
+    !subscriptionRuntime && !prefixIntact && props.sessionId && text.startsWith("/") && !/\s/.test(text.slice(1))
       ? text.slice(1).toLowerCase()
       : null;
   const slashMatches = (slashSkills ?? []).filter((s) =>
@@ -173,6 +176,25 @@ export function Composer(props: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.resetKey]);
 
+  // A Subscription Agent runtime owns a native CLI/app-server conversation. OpenWorker's
+  // attachment envelope and forced `/skill` sidecar are API-engine features, so remove any
+  // stale selections immediately when the model changes instead of silently dropping them
+  // at send time. Preserve the user's text after a previously selected skill prefix.
+  useEffect(() => {
+    if (!subscriptionRuntime) return;
+    if (pendingSkill) {
+      const prefix = `/${pendingSkill.name}`;
+      setText((draft) => draft.startsWith(prefix) ? draft.slice(prefix.length).trimStart() : draft);
+    }
+    setPendingSkill(null);
+    setAttachments([]);
+    setAttachMenuOpen(false);
+    setSlashSkills(null);
+    setSlashIndex(0);
+    // Only the transition into/out of this capability boundary should clear selections.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subscriptionRuntime]);
+
   // Apply a prefill (text + attachments) pushed from outside, then focus the composer. Applied at
   // most once per nonce (a ref guards against StrictMode/re-render double-fires), and attachments
   // are de-duplicated so the same file never lands twice.
@@ -182,7 +204,9 @@ export function Composer(props: Props) {
     if (!p || p.nonce === appliedNonce.current) return;
     appliedNonce.current = p.nonce;
     setText(p.text);
-    if (p.attachments?.length) setAttachments((cur) => mergeAttachments(cur, p.attachments!));
+    if (!subscriptionRuntime && p.attachments?.length) {
+      setAttachments((cur) => mergeAttachments(cur, p.attachments!));
+    }
     textareaRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.prefill?.nonce]);
@@ -255,6 +279,10 @@ export function Composer(props: Props) {
   // size limit is REJECTED with a visible notice — never attached, never silently dropped.
   // The rationale is token cost: a big PDF re-rides every turn of the conversation.
   const addFiles = async (files: FileList | File[]) => {
+    if (subscriptionRuntime) {
+      showAttachNotice("Attachments are not supported by Subscription Agent runtimes.");
+      return;
+    }
     const list = Array.from(files);
     let maxPages = 20;
     let maxMb = 10;
@@ -314,8 +342,9 @@ export function Composer(props: Props) {
     if (slashQuery !== null) return;
     // The visible "/name " prefix is UI state, not message text — strip it for the send;
     // the skill rides as its own field.
-    const skill = prefixIntact ? pendingSkill!.name : undefined;
+    const skill = !subscriptionRuntime && prefixIntact ? pendingSkill!.name : undefined;
     const t = (skill ? text.slice(skill.length + 1) : text).trim();
+    const sendAttachments = subscriptionRuntime ? [] : attachments;
     if (
       (!t && attachments.length === 0 && !skill) ||
       props.running ||
@@ -328,7 +357,7 @@ export function Composer(props: Props) {
       props.onConnectModel?.();
       return;
     }
-    props.onSend(t, attachments, skill);
+    props.onSend(t, sendAttachments, skill);
     setText("");
     setAttachments([]);
     setPendingSkill(null);
@@ -371,7 +400,7 @@ export function Composer(props: Props) {
       .filter(Boolean) as File[];
     if (imgs.length) {
       e.preventDefault();
-      addFiles(imgs);
+      void addFiles(imgs);
     }
   };
 
@@ -425,7 +454,7 @@ export function Composer(props: Props) {
   // composer isn't carrying a constant blue dot.
   // A pinned /skill is sendable content on its own (tester catch 2026-07-26: the arrow
   // stayed grey after picking a skill, reading as "stuck").
-  const hasContent = text.trim().length > 0 || attachments.length > 0 || !!pendingSkill;
+  const hasContent = text.trim().length > 0 || (!subscriptionRuntime && attachments.length > 0) || (!subscriptionRuntime && !!pendingSkill);
 
   return (
     <div className="composer-wrap px-6 pb-5 pt-4">
@@ -434,6 +463,26 @@ export function Composer(props: Props) {
       {dictationError && (
         <div className="max-w-3xl mx-auto mb-2 px-1 text-[12px] text-red-600" role="alert">
           {dictationError}
+        </div>
+      )}
+
+      {kimiSubscriptionRuntime && (
+        <div
+          className="max-w-3xl mx-auto mb-1.5 rounded-lg border border-warnInk/40 bg-warnSoft px-3 py-2 text-[12px] font-medium text-warnInk"
+          data-testid="kimi-subscription-warning"
+          role="alert"
+        >
+          Kimi Code is for foreground personal use only. ACP has no protected system/developer instruction layer; production orchestration is blocked and native shell is disabled.
+        </div>
+      )}
+
+      {subscriptionRuntime && (
+        <div
+          className="max-w-3xl mx-auto mb-1.5 rounded-lg border border-line bg-paper px-3 py-1.5 text-[11.5px] text-muted"
+          data-testid="subscription-runtime-limitations"
+          role="status"
+        >
+          Subscription Agent runtime: attachments and OpenWorker slash skills are unavailable in native agent sessions.
         </div>
       )}
 
@@ -470,13 +519,13 @@ export function Composer(props: Props) {
         }
         onDragOver={(e) => {
           e.preventDefault();
-          setDragging(true);
+          if (!subscriptionRuntime) setDragging(true);
         }}
         onDragLeave={() => setDragging(false)}
         onDrop={(e) => {
           e.preventDefault();
           setDragging(false);
-          if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+          if (e.dataTransfer.files.length) void addFiles(e.dataTransfer.files);
         }}
       >
         {/* "/" force-run popup — in-flow above the textarea; rows are the session's
@@ -526,9 +575,10 @@ export function Composer(props: Props) {
           {/* + attach menu */}
           <div className="relative">
             <button
-              className={iconBtn + (attachMenuOpen ? " bg-paper text-ink" : "")}
-              title="Attach"
+              className={iconBtn + (attachMenuOpen ? " bg-paper text-ink" : "") + (subscriptionRuntime ? " cursor-not-allowed opacity-40" : "")}
+              title={subscriptionRuntime ? "Attachments are unavailable for Subscription Agent runtimes" : "Attach"}
               aria-label="Attach"
+              disabled={subscriptionRuntime}
               onClick={() => setAttachMenuOpen((v) => !v)}
             >
               <Icon name="plus" size={17} />
@@ -552,6 +602,7 @@ export function Composer(props: Props) {
             ref={fileInput}
             type="file"
             multiple
+            disabled={subscriptionRuntime}
             style={{ display: "none" }}
             onChange={(e) => {
               if (e.target.files) addFiles(e.target.files);

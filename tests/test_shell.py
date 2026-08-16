@@ -7,11 +7,17 @@ exit codes, timeout-and-recover, truncation) is identical across both.
 
 from __future__ import annotations
 
+import os
+import shlex
+import signal
+import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
+import coworker.tools.shell as shell_module
 from coworker.permissions import PermissionEngine
 from coworker.tools import ToolRegistry
 from coworker.tools.shell import LocalExecutor, shell_tools
@@ -181,3 +187,187 @@ def test_background_unknown_task_errors(executor):
     assert (
         "unknown task" in reg.execute("shell_task_kill", {"task_id": "bg-99"})["error"]
     )
+
+
+# -- constrained process-tree containment ---------------------------------------
+
+
+def _python_command(script) -> str:
+    if _WIN:
+        # PowerShell's call operator handles interpreter/workspace paths with spaces.
+        return f"& {subprocess.list2cmdline([sys.executable])} {subprocess.list2cmdline([str(script)])}"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+
+
+def _pid_is_running(pid: int) -> bool:
+    if not _WIN:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _wait_pid_stopped(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_running(pid)
+
+
+def test_contained_normal_completion_reaps_spawned_descendant(tmp_path):
+    helper = tmp_path / "spawn_then_exit.py"
+    helper.write_text(
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "print(p.pid, flush=True)\n",
+        encoding="utf-8",
+    )
+    ex = LocalExecutor(cwd=tmp_path, contain_process_tree=True, default_timeout=10)
+    try:
+        result = ex.run(_python_command(helper))
+        assert result["exit_code"] == 0
+        child_pid = int(result["output"].strip().splitlines()[-1])
+        assert _wait_pid_stopped(child_pid), "contained descendant survived command exit"
+    finally:
+        ex.close()
+
+
+def test_contained_large_output_uses_bounded_tail(tmp_path):
+    ex = LocalExecutor(
+        cwd=tmp_path,
+        max_output_chars=200,
+        default_timeout=10,
+        contain_process_tree=True,
+    )
+    try:
+        result = ex.run(PRINT_1000)
+        assert result["exit_code"] == 0
+        assert result["truncated"] is True
+        assert len(result["output"]) <= 200
+        assert "line1000" in result["output"]
+        assert "line1\n" not in result["output"]
+    finally:
+        ex.close()
+
+
+@pytest.mark.skipif(_WIN, reason="setsid is a POSIX process-session primitive")
+def test_contained_escaped_session_has_bounded_drain_and_reader_exit(tmp_path):
+    helper = tmp_path / "escape_session.py"
+    helper.write_text(
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "start_new_session=True)\n"
+        "print(p.pid, flush=True)\n",
+        encoding="utf-8",
+    )
+    ex = LocalExecutor(cwd=tmp_path, contain_process_tree=True, default_timeout=10)
+    child_pid = None
+    readers_before = {
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("coworker-contained-output-")
+    }
+    try:
+        started = time.monotonic()
+        result = ex.run(_python_command(helper))
+        elapsed = time.monotonic() - started
+        child_pid = int(result["output"].strip().splitlines()[-1])
+        assert elapsed < 5
+        assert result["cleanup_failed"] is True
+        assert ex.containment_failed is True
+        assert "bounded drain deadline" in result["error"]
+        readers_after = {
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name.startswith("coworker-contained-output-")
+        }
+        assert readers_after <= readers_before
+    finally:
+        ex.close()
+        if child_pid is not None:
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def test_contained_termination_failure_returns_within_cleanup_budget(
+    tmp_path, monkeypatch
+):
+    captured = []
+    real_terminate = shell_module._ProcessTree.terminate
+
+    def refuse_termination(tree, *, grace=0.5):
+        captured.append(tree)
+        return False
+
+    monkeypatch.setattr(shell_module._ProcessTree, "terminate", refuse_termination)
+    ex = LocalExecutor(cwd=tmp_path, contain_process_tree=True, default_timeout=10)
+    try:
+        started = time.monotonic()
+        result = ex.run(SLEEP_5, timeout=0.1)
+        elapsed = time.monotonic() - started
+        assert elapsed < 4
+        assert result["timed_out"] is True
+        assert result["cleanup_failed"] is True
+        assert ex.containment_failed is True
+        assert "bounded drain deadline" in result["error"]
+        assert captured
+        assert not any(
+            thread.name == f"coworker-contained-output-{captured[0].proc.pid}"
+            for thread in threading.enumerate()
+        )
+    finally:
+        if captured:
+            real_terminate(captured[0])
+        ex.close()
+
+
+def test_contained_close_reaps_active_command_tree_and_disables_background(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    helper = tmp_path / "spawn_then_wait.py"
+    helper.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    ex = LocalExecutor(cwd=tmp_path, contain_process_tree=True, default_timeout=120)
+    result: dict = {}
+    runner = threading.Thread(
+        target=lambda: result.update(ex.run(_python_command(helper))), daemon=True
+    )
+    runner.start()
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pid_file.exists(), "helper did not start its child"
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+    ex.close()
+    runner.join(timeout=10)
+    assert not runner.is_alive()
+    assert result.get("error") == "interrupted by user"
+    assert _wait_pid_stopped(child_pid), "contained descendant survived executor close"
+    assert "disabled" in ex.run_background("echo no")["error"]

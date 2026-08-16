@@ -47,6 +47,73 @@ afterEach(() => {
 });
 
 describe("Composer / skills popup", () => {
+  it("disables attachments and slash skills for Subscription Agent runtimes", async () => {
+    const calls = stubFetch();
+    const p = props({
+      model: "codex-subscription:gpt-5.6-sol@max",
+      prefill: {
+        text: "inspect this",
+        attachments: [{ kind: "text", name: "context.txt", text: "context" }],
+        nonce: 1,
+      },
+    });
+    render(<Composer {...p} />);
+
+    expect(screen.getByTestId("subscription-runtime-limitations").textContent).toMatch(
+      /attachments and OpenWorker slash skills are unavailable/i,
+    );
+    expect((screen.getByRole("button", { name: "Attach" }) as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => expect(screen.queryByText("context.txt")).toBeNull());
+
+    fireEvent.change(box(), { target: { value: "/" } });
+    expect(screen.queryByTestId("skill-popup")).toBeNull();
+    expect(calls.some((call) => call.url.includes("/skills"))).toBe(false);
+
+    fireEvent.change(box(), { target: { value: "plain request" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    await waitFor(() => expect(p.onSend).toHaveBeenCalledWith("plain request", [], undefined));
+  });
+
+  it("shows the Kimi ACP security boundary only for the Kimi subscription runtime", () => {
+    stubFetch();
+    const p = props({ model: "kimi-code-subscription:kimi-code/k3@max" });
+    const { rerender } = render(<Composer {...p} />);
+    const warning = screen.getByTestId("kimi-subscription-warning");
+    expect(warning.getAttribute("role")).toBe("alert");
+    expect(warning.textContent).toMatch(/foreground personal use only/i);
+    expect(warning.textContent).toMatch(/no protected system\/developer instruction layer/i);
+    expect(warning.textContent).toMatch(/production orchestration is blocked/i);
+    expect(warning.textContent).toMatch(/native shell is disabled/i);
+
+    rerender(<Composer {...p} model="openai:gpt-5.6-sol" />);
+    expect(screen.queryByTestId("kimi-subscription-warning")).toBeNull();
+    expect(screen.queryByTestId("subscription-runtime-limitations")).toBeNull();
+  });
+
+  it("removes stale API attachment and forced-skill state when switching to a subscription runtime", async () => {
+    stubFetch();
+    const p = props({
+      prefill: {
+        text: "draft",
+        attachments: [{ kind: "text", name: "api-context.txt", text: "context" }],
+        nonce: 1,
+      },
+    });
+    const { rerender } = render(<Composer {...p} />);
+    expect(await screen.findByText("api-context.txt")).toBeTruthy();
+    fireEvent.change(box(), { target: { value: "/gr" } });
+    fireEvent.click(await screen.findByRole("option", { name: /greet/ }));
+    fireEvent.change(box(), { target: { value: "/greet keep this request" } });
+
+    rerender(<Composer {...p} model="claude-code-subscription:claude-opus-5@high" />);
+    await waitFor(() => {
+      expect(screen.queryByText("api-context.txt")).toBeNull();
+      expect((box() as HTMLTextAreaElement).value).toBe("keep this request");
+    });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    await waitFor(() => expect(p.onSend).toHaveBeenCalledWith("keep this request", [], undefined));
+  });
+
   it("opens on a leading '/' and lists only enabled skills from the effective menu", async () => {
     stubFetch();
     render(<Composer {...props()} />);

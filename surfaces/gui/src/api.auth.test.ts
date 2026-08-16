@@ -1,7 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { getHealth, Session } from "./api";
+import { downloadApiResource, getHealth, Session } from "./api";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -35,4 +36,47 @@ it("authenticates REST and session WebSocket calls with the launch token", async
   const session = new Session("s1", "/workspace", "code", { onEvent: vi.fn() });
   const socket = (session as unknown as { ws: FakeWebSocket }).ws;
   expect(socket.protocols).toEqual(["openworker", "launch-token"]);
+});
+
+it("downloads API resources with authentication and an object URL", async () => {
+  vi.stubGlobal("__COWORKER_API_TOKEN__", "launch-token");
+  const request = vi.fn(async (_url: string, init?: RequestInit) => {
+    expect(new Headers(init?.headers).get("X-OpenWorker-Token")).toBe("launch-token");
+    return { ok: true, blob: async () => new Blob(["evidence"]) } as Response;
+  });
+  vi.stubGlobal("fetch", request);
+  const createObjectURL = vi.fn(() => "blob:download-test");
+  const revokeObjectURL = vi.fn();
+  vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+  await downloadApiResource("/v1/orchestration/blobs/digest", "release/report.txt");
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+  expect(request).toHaveBeenCalledOnce();
+  expect(createObjectURL).toHaveBeenCalledOnce();
+  expect(click).toHaveBeenCalledOnce();
+  expect(revokeObjectURL).toHaveBeenCalledWith("blob:download-test");
+});
+
+it("treats a 503 orchestration readiness snapshot as reachable health data", async () => {
+  const snapshot = {
+    status: "not_ready",
+    default_workspace: null,
+    model: "openai:test",
+    orchestration: {
+      ready: false,
+      state: "unhealthy",
+      loop_alive: true,
+      leader: { held: false, heartbeat_alive: false },
+      outbox: { loop_alive: true, pending: 2, dead_letters: 1, stale: true },
+    },
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: false,
+    status: 503,
+    json: async () => snapshot,
+  }) as Response));
+
+  await expect(getHealth()).resolves.toEqual(snapshot);
 });

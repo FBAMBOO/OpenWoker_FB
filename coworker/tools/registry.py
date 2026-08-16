@@ -59,6 +59,21 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [spec.schema for spec in self._tools.values()]
 
+    def subset(self, allowed: set[str] | list[str] | tuple[str, ...]) -> "ToolRegistry":
+        """Return an isolated registry containing only explicitly allowed tools.
+
+        The ToolSpec objects are immutable-by-convention, so sharing them is safe; the
+        registry mapping is new and later registrations cannot leak across an agent's
+        capability boundary. Unknown names fail closed instead of being silently ignored.
+        """
+        names = list(dict.fromkeys(allowed))
+        unknown = [name for name in names if name not in self._tools]
+        if unknown:
+            raise KeyError(f"Tools not registered: {', '.join(sorted(unknown))}")
+        child = ToolRegistry()
+        child._tools = {name: self._tools[name] for name in names}
+        return child
+
     def execute(self, name: str, arguments: Optional[dict[str, Any]] = None) -> Any:
         spec = self._tools.get(name)
         if spec is None:
