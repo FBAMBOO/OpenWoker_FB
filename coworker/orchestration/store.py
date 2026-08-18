@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -18,8 +19,16 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 
 from .dag import validate_plan
+from .activity import (
+    MAX_RUN_ACTIVITY_ROWS,
+    RUN_ACTIVITY_KINDS,
+    RUN_ACTIVITY_STATUSES,
+    bounded_activity_text,
+    sanitize_activity_detail,
+)
 from .errors import (
     ConflictError,
     GateConflict,
@@ -30,6 +39,26 @@ from .errors import (
     VersionConflict,
 )
 from .migrations import apply_migrations
+from .handoff_models import (
+    BriefStatus,
+    ContextDeliveryMode,
+    ContextRefDraft,
+    ContextRefRecord,
+    ContextRefType,
+    ContextRequirement,
+    HandoffValidationError,
+    TaskBriefDraft,
+    TaskBriefRecord,
+    TaskCommentRecord,
+    TaskRelationRecord,
+    TaskRelationType,
+    WakeReason,
+    WakeRequestRecord,
+    WakeStatus,
+    WorkProductKind,
+    WorkProductRecord,
+    contains_secret_like,
+)
 from .models import (
     CommandRecord,
     CommandStatus,
@@ -58,6 +87,7 @@ from .models import (
     RetryPolicy,
     RiskTier,
     RunClaim,
+    RunActivityRecord,
     RunRecord,
     RunStatus,
     StageDisposition,
@@ -89,6 +119,23 @@ _TERMINAL_RUN_STATUSES = frozenset(
         RunStatus.CANCELED,
         RunStatus.LOST,
         RunStatus.SKIPPED,
+    }
+)
+_FAILED_RUN_STATUSES = frozenset(
+    {
+        RunStatus.FAILED,
+        RunStatus.TIMED_OUT,
+        RunStatus.CANCELED,
+        RunStatus.LOST,
+    }
+)
+_MENTION_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_MAX_MENTIONS_PER_COMMENT = 10
+_MAX_LIVE_MENTION_WAKES_PER_TASK = 100
+_COMPATIBILITY_RETRY_REASONS = frozenset(
+    {
+        "legacy_subscription_result_handoff",
+        "bounded_work_product_envelope_handoff",
     }
 )
 
@@ -172,6 +219,8 @@ class OrchestrationStore:
             self._uri = True
             self._anchor = self._new_connection()
             apply_migrations(self._anchor)
+            self._backfill_legacy_briefs_connection(self._anchor)
+            self._backfill_parent_relations_connection(self._anchor)
         else:
             target = Path(self.path).expanduser()
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +228,8 @@ class OrchestrationStore:
             connection = self._new_connection()
             try:
                 apply_migrations(connection)
+                self._backfill_legacy_briefs_connection(connection)
+                self._backfill_parent_relations_connection(connection)
             finally:
                 connection.close()
 
@@ -378,9 +429,395 @@ class OrchestrationStore:
             completed_at=_time(row["completed_at"]),
         )
 
+    # -- structured handoff bootstrap ------------------------------------
+    @staticmethod
+    def _legacy_brief_for_spec(spec: TaskSpec) -> TaskBriefDraft:
+        objective = (
+            "[redacted legacy objective: use the runtime secret mechanism]"
+            if contains_secret_like(spec.objective)
+            else spec.objective
+        )
+        safe_constraints = tuple(
+            "[redacted legacy constraint]" if contains_secret_like(item) else str(item)
+            for item in spec.constraints
+        )
+        criteria = tuple(
+            {
+                "id": f"AC-{index:02d}",
+                "text": (
+                    "[redacted legacy acceptance criterion]"
+                    if contains_secret_like(item)
+                    else str(item)
+                ),
+                "verification": "legacy",
+                "required": True,
+            }
+            for index, item in enumerate(spec.acceptance_criteria, 1)
+            if str(item).strip()
+        )
+        return TaskBriefDraft(
+            title=(
+                "Redacted legacy task"
+                if contains_secret_like(spec.title or spec.objective)
+                else str(spec.title or objective)[:200]
+            ),
+            objective=objective,
+            background="Synthetic compatibility contract for a legacy task.",
+            scope={
+                "whole_task": True,
+                "reason": "Legacy TaskSpec did not carry an explicit bounded scope.",
+            },
+            instructions=(objective,),
+            constraints=safe_constraints,
+            acceptance_criteria=criteria,
+            deliverables=(
+                {
+                    "id": "DEL-LEGACY-RESULT",
+                    "kind": "other",
+                    "title": "Legacy task result",
+                    "required": False,
+                },
+            ),
+            result_contract={
+                "schema_id": "legacy_result_v1",
+                "required_fields": ["summary"],
+                "allow_freeform_summary": True,
+            },
+        )
+
+    @classmethod
+    def _legacy_brief_for_row(cls, row: sqlite3.Row) -> TaskBriefDraft:
+        return cls._legacy_brief_for_spec(
+            TaskSpec(
+                idempotency_key=row["idempotency_key"],
+                title=row["title"],
+                objective=row["objective"],
+                domain=TaskDomain(row["domain"]),
+                workspace=row["workspace"],
+                constraints=tuple(_load(row["constraints_json"], [])),
+                acceptance_criteria=tuple(
+                    _load(row["acceptance_criteria_json"], [])
+                ),
+                complexity_score=row["complexity_score"],
+                complexity_level=(
+                    ComplexityLevel(row["complexity_level"])
+                    if row["complexity_level"] is not None
+                    else None
+                ),
+                risk_tier=RiskTier(row["risk_tier"]),
+                budget=_load(row["budget_json"], {}),
+                policy=_load(row["policy_json"], {}),
+                input=_load(row["input_json"], {}),
+                priority=int(row["priority"]),
+                max_parallel_runs=int(row["max_parallel_runs"]),
+                parent_task_id=row["parent_task_id"],
+                parent_node_id=row["parent_node_id"],
+            )
+        )
+
+    def _backfill_legacy_briefs_connection(
+        self, connection: sqlite3.Connection
+    ) -> int:
+        """Create one canonical synthetic published brief for every legacy task.
+
+        The hook is intentionally idempotent and runs immediately after migrations,
+        before the store becomes visible to a scheduler or API worker.
+        """
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                """
+                SELECT task.* FROM orch_tasks task
+                LEFT JOIN orch_task_briefs brief ON brief.task_id = task.id
+                WHERE brief.id IS NULL OR task.active_brief_id IS NULL
+                ORDER BY task.created_at, task.id
+                """
+            ).fetchall()
+            count = 0
+            for row in rows:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM orch_task_briefs
+                    WHERE task_id = ? AND status IN ('published', 'superseded')
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                if existing is None:
+                    brief_id = self._insert_brief_record(
+                        connection,
+                        task_id=row["id"],
+                        draft=self._legacy_brief_for_row(row),
+                        status=BriefStatus.PUBLISHED,
+                        created_by_task_id=row["parent_task_id"],
+                        created_by_run_id=None,
+                        context_refs=(),
+                        command_id=f"legacy-brief-backfill:{row['id']}",
+                    )
+                    count += 1
+                else:
+                    brief_id = existing["id"]
+                connection.execute(
+                    "UPDATE orch_tasks SET active_brief_id = ? WHERE id = ?",
+                    (brief_id, row["id"]),
+                )
+            connection.commit()
+            return count
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def backfill_legacy_briefs(self) -> int:
+        with self._write() as connection:
+            rows = connection.execute(
+                """
+                SELECT task.* FROM orch_tasks task
+                LEFT JOIN orch_task_briefs brief ON brief.task_id = task.id
+                WHERE brief.id IS NULL OR task.active_brief_id IS NULL
+                ORDER BY task.created_at, task.id
+                """
+            ).fetchall()
+            count = 0
+            for row in rows:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM orch_task_briefs
+                    WHERE task_id = ? AND status IN ('published', 'superseded')
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                if existing is None:
+                    brief_id = self._insert_brief_record(
+                        connection,
+                        task_id=row["id"],
+                        draft=self._legacy_brief_for_row(row),
+                        status=BriefStatus.PUBLISHED,
+                        created_by_task_id=row["parent_task_id"],
+                        created_by_run_id=None,
+                        context_refs=(),
+                        command_id=f"legacy-brief-backfill:{row['id']}",
+                    )
+                    count += 1
+                else:
+                    brief_id = existing["id"]
+                connection.execute(
+                    "UPDATE orch_tasks SET active_brief_id = ? WHERE id = ?",
+                    (brief_id, row["id"]),
+                )
+            return count
+
+    def _backfill_parent_relations_connection(
+        self, connection: sqlite3.Connection
+    ) -> int:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                """
+                SELECT child.id AS child_id, child.parent_task_id AS parent_id,
+                       child.parent_node_id AS parent_node_id
+                FROM orch_tasks child
+                LEFT JOIN orch_task_relations relation
+                  ON relation.from_task_id = child.parent_task_id
+                 AND relation.to_task_id = child.id
+                 AND relation.relation_type = 'parent'
+                 AND relation.removed_at IS NULL
+                WHERE child.parent_task_id IS NOT NULL AND relation.id IS NULL
+                ORDER BY child.created_at, child.id
+                """
+            ).fetchall()
+            for row in rows:
+                relation_id = _id("relation")
+                connection.execute(
+                    """
+                    INSERT INTO orch_task_relations(
+                        id, from_task_id, to_task_id, relation_type, metadata_json,
+                        created_by_task_id, created_at
+                    ) VALUES (?, ?, ?, 'parent', ?, ?, ?)
+                    """,
+                    (
+                        relation_id,
+                        row["parent_id"],
+                        row["child_id"],
+                        _json({"legacy_backfill": True, "parent_node_id": row["parent_node_id"]}),
+                        row["parent_id"],
+                        _stamp(_now()),
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id=row["child_id"],
+                    aggregate_type="task_relation",
+                    aggregate_id=relation_id,
+                    event_type="relation_added",
+                    payload={
+                        "from_task_id": row["parent_id"],
+                        "to_task_id": row["child_id"],
+                        "relation_type": "parent",
+                        "legacy_backfill": True,
+                    },
+                    command_id=f"legacy-parent-relation:{row['child_id']}",
+                )
+            connection.commit()
+            return len(rows)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def _insert_brief_record(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        draft: TaskBriefDraft,
+        status: BriefStatus,
+        created_by_task_id: Optional[str],
+        created_by_run_id: Optional[str],
+        context_refs: Sequence[ContextRefDraft],
+        command_id: Optional[str],
+    ) -> str:
+        revision = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM orch_task_briefs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        brief_id = _id("brief")
+        created_at = _stamp(_now())
+        published_at = created_at if status is BriefStatus.PUBLISHED else None
+        connection.execute(
+            """
+            INSERT INTO orch_task_briefs(
+                id, task_id, revision, status, title, objective, background,
+                scope_json, instructions_json, constraints_json, non_goals_json,
+                acceptance_criteria_json, deliverables_json, result_contract_json,
+                created_by_task_id, created_by_run_id, content_hash, created_at,
+                published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                brief_id,
+                task_id,
+                revision,
+                status.value,
+                draft.title,
+                draft.objective,
+                draft.background,
+                _json(draft.scope),
+                _json(draft.instructions),
+                _json(draft.constraints),
+                _json(draft.non_goals),
+                _json(draft.acceptance_criteria),
+                _json(draft.deliverables),
+                _json(draft.result_contract),
+                created_by_task_id,
+                created_by_run_id,
+                draft.content_hash,
+                created_at,
+                published_at,
+            ),
+        )
+        self._append_event(
+            connection,
+            task_id=task_id,
+            aggregate_type="task_brief",
+            aggregate_id=brief_id,
+            event_type="brief_draft_created",
+            payload={"revision": revision, "content_hash": draft.content_hash},
+            command_id=command_id,
+        )
+        for context_ref in context_refs:
+            self._insert_context_ref(
+                connection,
+                task_id=task_id,
+                brief_id=brief_id,
+                draft=context_ref,
+                created_by_task_id=created_by_task_id,
+                created_by_run_id=created_by_run_id,
+                command_id=command_id,
+            )
+        if status is BriefStatus.PUBLISHED:
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task_brief",
+                aggregate_id=brief_id,
+                event_type="brief_published",
+                payload={"revision": revision, "content_hash": draft.content_hash},
+                command_id=command_id,
+            )
+        return brief_id
+
+    def _insert_context_ref(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        brief_id: str,
+        draft: ContextRefDraft,
+        created_by_task_id: Optional[str],
+        created_by_run_id: Optional[str],
+        command_id: Optional[str],
+    ) -> str:
+        ref_id = _id("ctx")
+        connection.execute(
+            """
+            INSERT INTO orch_context_refs(
+                id, task_id, brief_id, requirement, ref_type, display_name,
+                summary, selection_reason, locator_json, delivery_mode, mime_type,
+                content_hash, byte_size, token_estimate, provenance_json,
+                trust_level, created_by_task_id, created_by_run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ref_id,
+                task_id,
+                brief_id,
+                ContextRequirement(draft.requirement).value,
+                ContextRefType(draft.ref_type).value,
+                draft.display_name,
+                draft.summary,
+                draft.selection_reason,
+                _json(draft.locator),
+                ContextDeliveryMode(draft.delivery_mode).value,
+                draft.mime_type,
+                draft.content_hash,
+                draft.byte_size,
+                draft.token_estimate,
+                _json(draft.provenance),
+                draft.trust_level,
+                created_by_task_id,
+                created_by_run_id,
+                _stamp(_now()),
+            ),
+        )
+        self._append_event(
+            connection,
+            task_id=task_id,
+            aggregate_type="context_ref",
+            aggregate_id=ref_id,
+            event_type="context_ref_added",
+            payload={
+                "brief_id": brief_id,
+                "ref_type": ContextRefType(draft.ref_type).value,
+                "delivery_mode": ContextDeliveryMode(draft.delivery_mode).value,
+            },
+            command_id=command_id,
+        )
+        return ref_id
+
     # -- task aggregate -----------------------------------------------------
     def create_task(
-        self, spec: TaskSpec, *, command_id: Optional[str] = None
+        self,
+        spec: TaskSpec,
+        *,
+        brief: Optional[TaskBriefDraft | Mapping[str, Any]] = None,
+        context_refs: Sequence[ContextRefDraft | Mapping[str, Any]] = (),
+        publish_brief: bool = True,
+        command_id: Optional[str] = None,
     ) -> TaskRecord:
         if not spec.idempotency_key.strip():
             raise ValueError("idempotency_key is required")
@@ -389,11 +826,38 @@ class OrchestrationStore:
         if spec.max_parallel_runs < 1:
             raise ValueError("max_parallel_runs must be >= 1")
         command_id = self._command_id(command_id)
-        creation = _jsonable(spec)
-        creation_hash = _digest(creation)
+        chosen_brief = (
+            brief
+            if isinstance(brief, TaskBriefDraft)
+            else TaskBriefDraft.from_mapping(brief)
+            if isinstance(brief, Mapping)
+            else self._legacy_brief_for_spec(spec)
+        )
+        chosen_refs = tuple(
+            item
+            if isinstance(item, ContextRefDraft)
+            else ContextRefDraft.from_mapping(item)
+            for item in context_refs
+        )
+        if publish_brief:
+            chosen_brief.validate(informational=brief is None and not spec.acceptance_criteria)
+        legacy_creation_hash = _digest(_jsonable(spec))
+        creation = {
+            "task": _jsonable(spec),
+            "brief": chosen_brief.to_dict(),
+            "context_refs": [item.to_dict() for item in chosen_refs],
+            "publish_brief": bool(publish_brief),
+        }
+        legacy_request = brief is None and not chosen_refs and publish_brief
+        creation_hash = legacy_creation_hash if legacy_request else _digest(creation)
+        command_request: Any = _jsonable(spec) if legacy_request else creation
         with self._write() as connection:
             replay = self._start_command(
-                connection, command_id, "task.create", spec.idempotency_key, creation
+                connection,
+                command_id,
+                "task.create",
+                spec.idempotency_key,
+                command_request,
             )
             if replay is not None:
                 return self._require_task(connection, replay["task_id"])
@@ -403,7 +867,10 @@ class OrchestrationStore:
                 (spec.idempotency_key,),
             ).fetchone()
             if existing is not None:
-                if existing["creation_hash"] != creation_hash:
+                compatible_hashes = {creation_hash}
+                if brief is None and not chosen_refs and publish_brief:
+                    compatible_hashes.add(legacy_creation_hash)
+                if existing["creation_hash"] not in compatible_hashes:
                     raise IdempotencyConflict(
                         f"task key {spec.idempotency_key} was reused with different input"
                     )
@@ -453,6 +920,21 @@ class OrchestrationStore:
                     now,
                 ),
             )
+            brief_id = self._insert_brief_record(
+                connection,
+                task_id=task_id,
+                draft=chosen_brief,
+                status=(BriefStatus.PUBLISHED if publish_brief else BriefStatus.DRAFT),
+                created_by_task_id=spec.parent_task_id,
+                created_by_run_id=None,
+                context_refs=chosen_refs,
+                command_id=command_id,
+            )
+            if publish_brief:
+                connection.execute(
+                    "UPDATE orch_tasks SET active_brief_id = ? WHERE id = ?",
+                    (brief_id, task_id),
+                )
             connection.execute(
                 """
                 INSERT INTO orch_stage_history(
@@ -482,8 +964,2665 @@ class OrchestrationStore:
                 },
                 command_id=command_id,
             )
+            if spec.parent_task_id:
+                # Keep the legacy projection and the first-class graph edge in the
+                # same transaction.  Older callers may still populate only
+                # ``parent_task_id``; readers must never observe a task whose graph
+                # says something different.
+                self._require_task(connection, spec.parent_task_id)
+                relation_id = _id("relation")
+                connection.execute(
+                    """
+                    INSERT INTO orch_task_relations(
+                        id, from_task_id, to_task_id, relation_type, metadata_json,
+                        created_by_task_id, created_at
+                    ) VALUES (?, ?, ?, 'parent', ?, ?, ?)
+                    """,
+                    (
+                        relation_id,
+                        spec.parent_task_id,
+                        task_id,
+                        _json({"parent_node_id": spec.parent_node_id}),
+                        spec.parent_task_id,
+                        now,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task_relation",
+                    aggregate_id=relation_id,
+                    event_type="relation_added",
+                    payload={
+                        "from_task_id": spec.parent_task_id,
+                        "to_task_id": task_id,
+                        "relation_type": "parent",
+                    },
+                    command_id=command_id,
+                )
             self._finish_command(connection, command_id, {"task_id": task_id})
             return self._require_task(connection, task_id)
+
+    def create_delegated_task(
+        self,
+        spec: TaskSpec,
+        *,
+        parent_run_id: str,
+        lease_token: str,
+        fencing_token: int,
+        brief: TaskBriefDraft | Mapping[str, Any],
+        context_refs: Sequence[ContextRefDraft | Mapping[str, Any]] = (),
+        blocked_by_task_ids: Sequence[str] = (),
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Atomically persist a complete child handoff and scheduling intent."""
+
+        if not spec.parent_task_id or not spec.parent_node_id:
+            raise ValueError("delegated tasks require parent task and node ids")
+        if not spec.idempotency_key.strip():
+            raise ValueError("delegated task idempotency key is required")
+        chosen_brief = brief if isinstance(brief, TaskBriefDraft) else TaskBriefDraft.from_mapping(brief)
+        chosen_brief.validate()
+        chosen_refs = tuple(
+            item if isinstance(item, ContextRefDraft) else ContextRefDraft.from_mapping(item)
+            for item in context_refs
+        )
+        blockers = tuple(
+            dict.fromkeys(str(item).strip() for item in blocked_by_task_ids if str(item).strip())
+        )
+        creation = {
+            "task": _jsonable(spec),
+            "parent_run_id": parent_run_id,
+            "brief": chosen_brief.to_dict(),
+            "context_refs": [item.to_dict() for item in chosen_refs],
+            "blocked_by_task_ids": list(blockers),
+        }
+        creation_hash = _digest(creation)
+        with self._write() as connection:
+            replay = self._start_command(
+                connection,
+                str(command_id),
+                "task.delegate",
+                f"{spec.parent_task_id}:{spec.idempotency_key}",
+                creation,
+            )
+            if replay is not None:
+                task = self._require_task(connection, replay["task_id"])
+                brief_record = self._require_brief(connection, replay["brief_id"])
+                return {
+                    "task": task,
+                    "brief": brief_record,
+                    "wake": (
+                        self._require_wake(connection, replay["wake_id"])
+                        if replay.get("wake_id")
+                        else None
+                    ),
+                    "replayed": True,
+                }
+            parent = self._require_task(connection, spec.parent_task_id)
+            parent_run = self._require_run(connection, parent_run_id)
+            if parent_run.task_id != parent.id or parent_run.node_id != spec.parent_node_id:
+                raise LeaseConflict("delegation run does not own the parent task/node")
+            if parent_run.status not in {RunStatus.CLAIMED, RunStatus.RUNNING}:
+                raise LeaseConflict("delegation run is no longer active")
+            self._require_lease(
+                connection, parent_run.id, lease_token, int(fencing_token)
+            )
+            existing = connection.execute(
+                "SELECT * FROM orch_tasks WHERE idempotency_key = ?",
+                (spec.idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["creation_hash"] != creation_hash:
+                    raise IdempotencyConflict(
+                        f"task key {spec.idempotency_key} was reused with different input"
+                    )
+                brief_row = connection.execute(
+                    "SELECT * FROM orch_task_briefs WHERE id = ?",
+                    (existing["active_brief_id"],),
+                ).fetchone()
+                if brief_row is None:
+                    raise IntegrityError("delegated task exists without a published brief")
+                wake_row = connection.execute(
+                    """
+                    SELECT * FROM orch_wake_requests
+                    WHERE target_task_id = ? AND reason = 'task_assigned'
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    (existing["id"],),
+                ).fetchone()
+                result = {
+                    "task_id": existing["id"],
+                    "brief_id": brief_row["id"],
+                    "wake_id": wake_row["id"] if wake_row else None,
+                }
+                self._finish_command(connection, str(command_id), result)
+                return {
+                    "task": self._task_from_row(existing),
+                    "brief": self._brief_from_row(brief_row),
+                    "wake": self._wake_from_row(wake_row) if wake_row else None,
+                    "replayed": True,
+                }
+            for blocker_id in blockers:
+                if blocker_id == spec.parent_task_id:
+                    # Parent-as-blocker is legal only if an external event can make
+                    # progress; in a strict parent/child tree it creates a wait cycle.
+                    raise ConflictError("a parent task cannot block its own child delegation")
+                self._require_task(connection, blocker_id)
+            task_id = _id("task")
+            stage_id = _id("stage")
+            now = _stamp(_now())
+            unresolved = []
+            for blocker_id in blockers:
+                blocker = self._require_task(connection, blocker_id)
+                if blocker.status is not TaskStatus.COMPLETED:
+                    archived_from = str((blocker.output or {}).get("archived_from") or "")
+                    if blocker.status is not TaskStatus.ARCHIVED or archived_from != "completed":
+                        unresolved.append(blocker_id)
+            initial_status = TaskStatus.BLOCKED if unresolved else TaskStatus.QUEUED
+            connection.execute(
+                """
+                INSERT INTO orch_tasks(
+                    id, idempotency_key, creation_hash, title, objective, domain,
+                    workspace, constraints_json, acceptance_criteria_json,
+                    complexity_score, complexity_level, risk_tier, budget_json,
+                    policy_json, input_json, status, current_stage, parent_task_id,
+                    parent_node_id, priority, max_parallel_runs, version, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    task_id,
+                    spec.idempotency_key,
+                    creation_hash,
+                    chosen_brief.title,
+                    chosen_brief.objective,
+                    TaskDomain(spec.domain).value,
+                    spec.workspace,
+                    _json(chosen_brief.constraints),
+                    _json(tuple(str(item.get("text") or "") for item in chosen_brief.acceptance_criteria)),
+                    spec.complexity_score,
+                    spec.complexity_level.value if spec.complexity_level else None,
+                    RiskTier(spec.risk_tier).value,
+                    _json(spec.budget),
+                    _json(spec.policy),
+                    _json(spec.input),
+                    initial_status.value,
+                    OrchestrationStage.INTAKE.value,
+                    spec.parent_task_id,
+                    spec.parent_node_id,
+                    spec.priority,
+                    spec.max_parallel_runs,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO orch_stage_history(
+                    id, task_id, sequence_no, stage, disposition, entered_at,
+                    detail_json, command_id
+                ) VALUES (?, ?, 1, 'intake', 'active', ?, '{}', ?)
+                """,
+                (stage_id, task_id, now, str(command_id)),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task",
+                aggregate_id=task_id,
+                event_type="task.created",
+                payload={"status": initial_status.value, "stage": "intake", "objective": chosen_brief.objective},
+                command_id=str(command_id),
+            )
+            brief_id = self._insert_brief_record(
+                connection,
+                task_id=task_id,
+                draft=chosen_brief,
+                status=BriefStatus.PUBLISHED,
+                created_by_task_id=parent.id,
+                created_by_run_id=parent_run.id,
+                context_refs=chosen_refs,
+                command_id=str(command_id),
+            )
+            connection.execute(
+                "UPDATE orch_tasks SET active_brief_id = ? WHERE id = ?",
+                (brief_id, task_id),
+            )
+            parent_relation_id = _id("relation")
+            connection.execute(
+                """
+                INSERT INTO orch_task_relations(
+                    id, from_task_id, to_task_id, relation_type, metadata_json,
+                    created_by_task_id, created_by_run_id, created_at
+                ) VALUES (?, ?, ?, 'parent', ?, ?, ?, ?)
+                """,
+                (
+                    parent_relation_id,
+                    parent.id,
+                    task_id,
+                    _json({"parent_node_id": parent_run.node_id}),
+                    parent.id,
+                    parent_run.id,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task_relation",
+                aggregate_id=parent_relation_id,
+                event_type="relation_added",
+                payload={"from_task_id": parent.id, "to_task_id": task_id, "relation_type": "parent"},
+                command_id=str(command_id),
+            )
+            for blocker_id in blockers:
+                relation_id = _id("relation")
+                connection.execute(
+                    """
+                    INSERT INTO orch_task_relations(
+                        id, from_task_id, to_task_id, relation_type, metadata_json,
+                        created_by_task_id, created_by_run_id, created_at
+                    ) VALUES (?, ?, ?, 'blocks', '{}', ?, ?, ?)
+                    """,
+                    (relation_id, blocker_id, task_id, parent.id, parent_run.id, now),
+                )
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task_relation",
+                    aggregate_id=relation_id,
+                    event_type="relation_added",
+                    payload={"from_task_id": blocker_id, "to_task_id": task_id, "relation_type": "blocks"},
+                    command_id=str(command_id),
+                )
+            delegated_event = self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task",
+                aggregate_id=task_id,
+                event_type="task_delegated",
+                payload={
+                    "parent_task_id": parent.id,
+                    "parent_run_id": parent_run.id,
+                    "brief_id": brief_id,
+                    "brief_revision": 1,
+                    "context_ref_count": len(chosen_refs),
+                    "blocked_by_task_ids": list(blockers),
+                },
+                command_id=str(command_id),
+            )
+            if bool(spec.policy.get("legacy_delegation")):
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task",
+                    aggregate_id=task_id,
+                    event_type="legacy_delegation_used",
+                    payload={
+                        "parent_task_id": parent.id,
+                        "parent_run_id": parent_run.id,
+                    },
+                    command_id=str(command_id),
+                )
+            wake = None
+            if initial_status is TaskStatus.QUEUED:
+                wake = self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=task_id,
+                    target_run_id=None,
+                    reason=WakeReason.TASK_ASSIGNED,
+                    source_task_id=parent.id,
+                    source_run_id=parent_run.id,
+                    source_event_id=delegated_event.id,
+                    payload={"brief_id": brief_id, "brief_revision": 1, "parent_task_id": parent.id},
+                    dedupe_key=f"{task_id}:current:task_assigned:{brief_id}",
+                    not_before=None,
+                    command_id=str(command_id),
+                )
+            result = {
+                "task_id": task_id,
+                "brief_id": brief_id,
+                "wake_id": wake.id if wake else None,
+            }
+            self._finish_command(connection, str(command_id), result)
+            return {
+                "task": self._require_task(connection, task_id),
+                "brief": self._require_brief(connection, brief_id),
+                "wake": wake,
+                "replayed": False,
+            }
+
+    # -- versioned task briefs and context manifests ---------------------
+    def create_brief_draft(
+        self,
+        task_id: str,
+        draft: TaskBriefDraft | Mapping[str, Any],
+        *,
+        created_by_task_id: Optional[str] = None,
+        created_by_run_id: Optional[str] = None,
+        copy_context_from_brief_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+    ) -> TaskBriefRecord:
+        command_id = self._command_id(command_id)
+        chosen = draft if isinstance(draft, TaskBriefDraft) else TaskBriefDraft.from_mapping(draft)
+        request = {
+            "task_id": task_id,
+            "brief": chosen.to_dict(),
+            "created_by_task_id": created_by_task_id,
+            "created_by_run_id": created_by_run_id,
+            "copy_context_from_brief_id": copy_context_from_brief_id,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "brief.create_draft", task_id, request
+            )
+            if replay is not None:
+                return self._require_brief(connection, replay["brief_id"])
+            self._require_task(connection, task_id)
+            refs: tuple[ContextRefDraft, ...] = ()
+            if copy_context_from_brief_id:
+                source = self._require_brief(connection, copy_context_from_brief_id)
+                if source.task_id != task_id:
+                    raise ConflictError("context may only be copied within one task")
+                rows = connection.execute(
+                    "SELECT * FROM orch_context_refs WHERE brief_id = ? ORDER BY created_at, id",
+                    (source.id,),
+                ).fetchall()
+                refs = tuple(
+                    ContextRefDraft(
+                        requirement=row["requirement"],
+                        ref_type=row["ref_type"],
+                        display_name=row["display_name"],
+                        summary=row["summary"],
+                        selection_reason=row["selection_reason"],
+                        locator=_load(row["locator_json"], {}),
+                        delivery_mode=row["delivery_mode"],
+                        mime_type=row["mime_type"],
+                        content_hash=row["content_hash"],
+                        byte_size=row["byte_size"],
+                        token_estimate=row["token_estimate"],
+                        provenance=_load(row["provenance_json"], {}),
+                        trust_level=row["trust_level"],
+                    )
+                    for row in rows
+                )
+            brief_id = self._insert_brief_record(
+                connection,
+                task_id=task_id,
+                draft=chosen,
+                status=BriefStatus.DRAFT,
+                created_by_task_id=created_by_task_id,
+                created_by_run_id=created_by_run_id,
+                context_refs=refs,
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"brief_id": brief_id})
+            return self._require_brief(connection, brief_id)
+
+    def update_brief_draft(
+        self,
+        task_id: str,
+        revision: int,
+        draft: TaskBriefDraft | Mapping[str, Any],
+        *,
+        expected_hash: str,
+        command_id: Optional[str] = None,
+    ) -> TaskBriefRecord:
+        chosen = draft if isinstance(draft, TaskBriefDraft) else TaskBriefDraft.from_mapping(draft)
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "revision": int(revision),
+            "brief": chosen.to_dict(),
+            "expected_hash": expected_hash,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "brief.update_draft", task_id, request
+            )
+            if replay is not None:
+                return self._require_brief(connection, replay["brief_id"])
+            row = connection.execute(
+                "SELECT * FROM orch_task_briefs WHERE task_id = ? AND revision = ?",
+                (task_id, int(revision)),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"brief revision not found: {task_id}@{revision}")
+            if BriefStatus(row["status"]) is not BriefStatus.DRAFT:
+                raise ConflictError("published task briefs are immutable; create a new revision")
+            if str(row["content_hash"]) != str(expected_hash):
+                raise VersionConflict("task brief draft changed since it was loaded")
+            connection.execute(
+                """
+                UPDATE orch_task_briefs SET
+                    title = ?, objective = ?, background = ?, scope_json = ?,
+                    instructions_json = ?, constraints_json = ?, non_goals_json = ?,
+                    acceptance_criteria_json = ?, deliverables_json = ?,
+                    result_contract_json = ?, content_hash = ?
+                WHERE id = ? AND status = 'draft' AND content_hash = ?
+                """,
+                (
+                    chosen.title,
+                    chosen.objective,
+                    chosen.background,
+                    _json(chosen.scope),
+                    _json(chosen.instructions),
+                    _json(chosen.constraints),
+                    _json(chosen.non_goals),
+                    _json(chosen.acceptance_criteria),
+                    _json(chosen.deliverables),
+                    _json(chosen.result_contract),
+                    chosen.content_hash,
+                    row["id"],
+                    expected_hash,
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task_brief",
+                aggregate_id=row["id"],
+                event_type="brief_draft_updated",
+                payload={"revision": int(revision), "content_hash": chosen.content_hash},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"brief_id": row["id"]})
+            return self._require_brief(connection, row["id"])
+
+    def publish_brief(
+        self,
+        task_id: str,
+        revision: int,
+        *,
+        expected_previous_revision: Optional[int] = None,
+        required_fields: Sequence[str] = (
+            "objective",
+            "scope",
+            "acceptance_criteria",
+            "deliverables",
+        ),
+        informational: bool = False,
+        command_id: Optional[str] = None,
+    ) -> TaskBriefRecord:
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "revision": int(revision),
+            "expected_previous_revision": expected_previous_revision,
+            "required_fields": list(required_fields),
+            "informational": bool(informational),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "brief.publish", task_id, request
+            )
+            if replay is not None:
+                return self._require_brief(connection, replay["brief_id"])
+            task = self._require_task(connection, task_id)
+            row = connection.execute(
+                "SELECT * FROM orch_task_briefs WHERE task_id = ? AND revision = ?",
+                (task_id, int(revision)),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"brief revision not found: {task_id}@{revision}")
+            if BriefStatus(row["status"]) is not BriefStatus.DRAFT:
+                raise ConflictError("only a draft task brief can be published")
+            current = (
+                self._require_brief(connection, task.active_brief_id)
+                if task.active_brief_id
+                else None
+            )
+            actual_previous = current.revision if current else 0
+            if (
+                expected_previous_revision is not None
+                and int(expected_previous_revision) != actual_previous
+            ):
+                raise VersionConflict(
+                    f"expected active brief revision {expected_previous_revision}, found {actual_previous}"
+                )
+            draft = self._brief_draft_from_row(row)
+            draft.validate(
+                required_fields=required_fields,
+                informational=informational,
+            )
+            now = _stamp(_now())
+            if current and current.status is BriefStatus.PUBLISHED:
+                connection.execute(
+                    "UPDATE orch_task_briefs SET status = 'superseded' WHERE id = ?",
+                    (current.id,),
+                )
+            connection.execute(
+                "UPDATE orch_task_briefs SET status = 'published', published_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            connection.execute(
+                "UPDATE orch_tasks SET active_brief_id = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (row["id"], now, task_id),
+            )
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task_brief",
+                aggregate_id=row["id"],
+                event_type="brief_published",
+                payload={"revision": int(revision), "content_hash": row["content_hash"]},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"brief_id": row["id"]})
+            return self._require_brief(connection, row["id"])
+
+    def get_active_brief(self, task_id: str) -> TaskBriefRecord:
+        with self._read() as connection:
+            task = self._require_task(connection, task_id)
+            if not task.active_brief_id:
+                raise NotFoundError(f"task {task_id} has no published brief")
+            return self._require_brief(connection, task.active_brief_id)
+
+    def get_brief_by_id(self, brief_id: str) -> TaskBriefRecord:
+        """Return an exact immutable revision by its durable identity."""
+
+        with self._read() as connection:
+            return self._require_brief(connection, brief_id)
+
+    def get_brief(self, task_id: str, revision: int) -> TaskBriefRecord:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT * FROM orch_task_briefs WHERE task_id = ? AND revision = ?",
+                (task_id, int(revision)),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"brief revision not found: {task_id}@{revision}")
+        return self._brief_from_row(row)
+
+    def list_briefs(self, task_id: str) -> tuple[TaskBriefRecord, ...]:
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            rows = connection.execute(
+                "SELECT * FROM orch_task_briefs WHERE task_id = ? ORDER BY revision",
+                (task_id,),
+            ).fetchall()
+        return tuple(self._brief_from_row(row) for row in rows)
+
+    def add_context_ref(
+        self,
+        task_id: str,
+        brief_id: str,
+        draft: ContextRefDraft | Mapping[str, Any],
+        *,
+        created_by_task_id: Optional[str] = None,
+        created_by_run_id: Optional[str] = None,
+        command_id: Optional[str] = None,
+    ) -> ContextRefRecord:
+        chosen = draft if isinstance(draft, ContextRefDraft) else ContextRefDraft.from_mapping(draft)
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "brief_id": brief_id,
+            "context_ref": chosen.to_dict(),
+            "created_by_task_id": created_by_task_id,
+            "created_by_run_id": created_by_run_id,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "context_ref.add", task_id, request
+            )
+            if replay is not None:
+                return self._require_context_ref(connection, replay["ref_id"])
+            brief = self._require_brief(connection, brief_id)
+            if brief.task_id != task_id:
+                raise ConflictError("context reference brief does not belong to task")
+            if brief.status is not BriefStatus.DRAFT:
+                raise ConflictError("context references can only be added to a draft brief")
+            ref_id = self._insert_context_ref(
+                connection,
+                task_id=task_id,
+                brief_id=brief_id,
+                draft=chosen,
+                created_by_task_id=created_by_task_id,
+                created_by_run_id=created_by_run_id,
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"ref_id": ref_id})
+            return self._require_context_ref(connection, ref_id)
+
+    def backfill_legacy_upstream_ref(
+        self,
+        task_id: str,
+        draft: ContextRefDraft,
+    ) -> ContextRefRecord:
+        """Attach one idempotent compatibility ref to a published synthetic Brief."""
+
+        command_id = f"legacy-upstream-context:{task_id}"
+        request = {"task_id": task_id, "context_ref": draft.to_dict()}
+        with self._write() as connection:
+            replay = self._start_command(
+                connection,
+                command_id,
+                "context_ref.backfill_legacy_upstream",
+                task_id,
+                request,
+            )
+            if replay is not None:
+                return self._require_context_ref(connection, replay["ref_id"])
+            task = self._require_task(connection, task_id)
+            if not task.active_brief_id:
+                raise ConflictError("legacy upstream backfill requires an active Brief")
+            rows = connection.execute(
+                """
+                SELECT * FROM orch_context_refs
+                WHERE task_id = ? AND brief_id = ?
+                ORDER BY created_at, id
+                """,
+                (task_id, task.active_brief_id),
+            ).fetchall()
+            existing = next(
+                (
+                    row
+                    for row in rows
+                    if str((_load(row["provenance_json"], {}) or {}).get("source"))
+                    == "legacy_upstream"
+                ),
+                None,
+            )
+            if existing is not None:
+                ref_id = str(existing["id"])
+            else:
+                ref_id = self._insert_context_ref(
+                    connection,
+                    task_id=task_id,
+                    brief_id=task.active_brief_id,
+                    draft=draft,
+                    created_by_task_id=task.parent_task_id,
+                    created_by_run_id=None,
+                    command_id=command_id,
+                )
+            self._finish_command(connection, command_id, {"ref_id": ref_id})
+            return self._require_context_ref(connection, ref_id)
+
+    def remove_context_ref(
+        self,
+        task_id: str,
+        ref_id: str,
+        *,
+        command_id: Optional[str] = None,
+    ) -> None:
+        command_id = self._command_id(command_id)
+        request = {"task_id": task_id, "ref_id": ref_id}
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "context_ref.remove", task_id, request
+            )
+            if replay is not None:
+                return
+            ref = self._require_context_ref(connection, ref_id)
+            if ref.task_id != task_id:
+                raise NotFoundError(f"context reference not found: {ref_id}")
+            brief = self._require_brief(connection, ref.brief_id)
+            if brief.status is not BriefStatus.DRAFT:
+                raise ConflictError("published context references are immutable")
+            connection.execute("DELETE FROM orch_context_refs WHERE id = ?", (ref_id,))
+            self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="context_ref",
+                aggregate_id=ref_id,
+                event_type="context_ref_removed",
+                payload={"brief_id": ref.brief_id},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"removed": True})
+
+    def get_context_ref(self, ref_id: str) -> ContextRefRecord:
+        with self._read() as connection:
+            return self._require_context_ref(connection, ref_id)
+
+    def list_context_refs(
+        self,
+        task_id: str,
+        *,
+        brief_id: Optional[str] = None,
+        requirement: Optional[ContextRequirement] = None,
+        ref_type: Optional[ContextRefType] = None,
+        limit: int = 1_000,
+        offset: int = 0,
+    ) -> tuple[ContextRefRecord, ...]:
+        limit = max(1, min(int(limit), 10_000))
+        offset = max(0, int(offset))
+        where = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if brief_id:
+            where.append("brief_id = ?")
+            params.append(brief_id)
+        if requirement is not None:
+            where.append("requirement = ?")
+            params.append(ContextRequirement(requirement).value)
+        if ref_type is not None:
+            where.append("ref_type = ?")
+            params.append(ContextRefType(ref_type).value)
+        params.extend((limit, offset))
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            rows = connection.execute(
+                "SELECT * FROM orch_context_refs WHERE "
+                + " AND ".join(where)
+                + " ORDER BY created_at, id LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return tuple(self._context_ref_from_row(row) for row in rows)
+
+    def record_context_ref_read(
+        self,
+        ref_id: str,
+        *,
+        run_id: Optional[str],
+        bytes_read: int,
+        content_hash: Optional[str],
+        stale: bool,
+        command_id: Optional[str] = None,
+    ) -> None:
+        command_id = self._command_id(command_id)
+        request = {
+            "ref_id": ref_id,
+            "run_id": run_id,
+            "bytes_read": max(0, int(bytes_read)),
+            "content_hash": content_hash,
+            "stale": bool(stale),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "context_ref.read", ref_id, request
+            )
+            if replay is not None:
+                return
+            ref = self._require_context_ref(connection, ref_id)
+            self._append_event(
+                connection,
+                task_id=ref.task_id,
+                aggregate_type="context_ref",
+                aggregate_id=ref.id,
+                event_type="context_ref_read",
+                payload=request,
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"recorded": True})
+
+    def record_context_ref_verification(
+        self,
+        ref_id: str,
+        *,
+        run_id: Optional[str],
+        result: Mapping[str, Any],
+        command_id: Optional[str] = None,
+    ) -> None:
+        """Append a content-free verification/staleness fact to the audit chain."""
+
+        command_id = self._command_id(command_id)
+        safe_result = {
+            key: value
+            for key, value in dict(result).items()
+            if key
+            in {
+                "available",
+                "content_hash",
+                "expected_hash",
+                "stale",
+                "byte_size",
+                "reason",
+            }
+        }
+        request = {"ref_id": ref_id, "run_id": run_id, **safe_result}
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "context_ref.verify", ref_id, request
+            )
+            if replay is not None:
+                return
+            ref = self._require_context_ref(connection, ref_id)
+            self._append_event(
+                connection,
+                task_id=ref.task_id,
+                aggregate_type="context_ref",
+                aggregate_id=ref.id,
+                event_type=(
+                    "context_ref_stale"
+                    if bool(safe_result.get("stale"))
+                    else "context_ref_verified"
+                ),
+                payload=request,
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"recorded": True})
+
+    # -- task relations ---------------------------------------------------
+    @staticmethod
+    def _relation_cycle_path(
+        connection: sqlite3.Connection,
+        from_task_id: str,
+        to_task_id: str,
+        relation_type: TaskRelationType,
+    ) -> Optional[list[str]]:
+        row = connection.execute(
+            """
+            WITH RECURSIVE walk(task_id, path) AS (
+                SELECT ?, ?
+                UNION ALL
+                SELECT relation.to_task_id, walk.path || '>' || relation.to_task_id
+                FROM orch_task_relations relation
+                JOIN walk ON relation.from_task_id = walk.task_id
+                WHERE relation.relation_type = ? AND relation.removed_at IS NULL
+                  AND instr('>' || walk.path || '>', '>' || relation.to_task_id || '>') = 0
+            )
+            SELECT path FROM walk WHERE task_id = ? LIMIT 1
+            """,
+            (to_task_id, to_task_id, relation_type.value, from_task_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return [from_task_id, *str(row["path"]).split(">")]
+
+    def add_relation(
+        self,
+        from_task_id: str,
+        to_task_id: str,
+        relation_type: TaskRelationType | str,
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+        created_by_task_id: Optional[str] = None,
+        created_by_run_id: Optional[str] = None,
+        lease_token: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        command_id: Optional[str] = None,
+    ) -> TaskRelationRecord:
+        relation_type = TaskRelationType(relation_type)
+        if from_task_id == to_task_id:
+            raise ConflictError("a task cannot relate to itself")
+        if contains_secret_like(dict(metadata or {})):
+            raise ValueError("relation metadata cannot contain secret-like values")
+        command_id = self._command_id(command_id)
+        request = {
+            "from_task_id": from_task_id,
+            "to_task_id": to_task_id,
+            "relation_type": relation_type.value,
+            "metadata": dict(metadata or {}),
+            "created_by_task_id": created_by_task_id,
+            "created_by_run_id": created_by_run_id,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection,
+                command_id,
+                "relation.add",
+                f"{from_task_id}:{to_task_id}",
+                request,
+            )
+            if replay is not None:
+                return self._require_relation(connection, replay["relation_id"])
+            self._require_task(connection, from_task_id)
+            target_task = self._require_task(connection, to_task_id)
+            if created_by_run_id:
+                if lease_token is None or fencing_token is None:
+                    raise LeaseConflict("run-bound relation writes require lease and fencing tokens")
+                run = self._require_run(connection, created_by_run_id)
+                self._require_lease(connection, run.id, lease_token, fencing_token)
+                if created_by_task_id and run.task_id != created_by_task_id:
+                    raise LeaseConflict("relation actor task does not own the verified run")
+            existing = connection.execute(
+                """
+                SELECT * FROM orch_task_relations
+                WHERE from_task_id = ? AND to_task_id = ? AND relation_type = ?
+                  AND removed_at IS NULL
+                """,
+                (from_task_id, to_task_id, relation_type.value),
+            ).fetchone()
+            if existing is not None:
+                self._finish_command(
+                    connection, command_id, {"relation_id": existing["id"]}
+                )
+                return self._relation_from_row(existing)
+            if relation_type is TaskRelationType.PARENT:
+                other_parent = connection.execute(
+                    """
+                    SELECT id, from_task_id FROM orch_task_relations
+                    WHERE to_task_id = ? AND relation_type = 'parent'
+                      AND removed_at IS NULL
+                    LIMIT 1
+                    """,
+                    (to_task_id,),
+                ).fetchone()
+                if other_parent is not None:
+                    raise ConflictError(
+                        f"task {to_task_id} already has parent relation "
+                        f"{other_parent['id']} from {other_parent['from_task_id']}"
+                    )
+                if (
+                    target_task.parent_task_id is not None
+                    and target_task.parent_task_id != from_task_id
+                ):
+                    raise ConflictError(
+                        f"task {to_task_id} already projects parent "
+                        f"{target_task.parent_task_id}"
+                    )
+            if relation_type in {TaskRelationType.PARENT, TaskRelationType.BLOCKS}:
+                cycle = self._relation_cycle_path(
+                    connection, from_task_id, to_task_id, relation_type
+                )
+                if cycle:
+                    raise ConflictError("relation would create a cycle: " + " -> ".join(cycle))
+            relation_id = _id("relation")
+            now = _stamp(_now())
+            connection.execute(
+                """
+                INSERT INTO orch_task_relations(
+                    id, from_task_id, to_task_id, relation_type, metadata_json,
+                    created_by_task_id, created_by_run_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    relation_id,
+                    from_task_id,
+                    to_task_id,
+                    relation_type.value,
+                    _json(metadata or {}),
+                    created_by_task_id,
+                    created_by_run_id,
+                    now,
+                ),
+            )
+            if relation_type is TaskRelationType.PARENT and target_task.parent_task_id is None:
+                connection.execute(
+                    """
+                    UPDATE orch_tasks
+                    SET parent_task_id = ?, parent_node_id = COALESCE(?, parent_node_id),
+                        version = version + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        from_task_id,
+                        dict(metadata or {}).get("parent_node_id"),
+                        now,
+                        to_task_id,
+                    ),
+                )
+            self._append_event(
+                connection,
+                task_id=to_task_id,
+                aggregate_type="task_relation",
+                aggregate_id=relation_id,
+                event_type="relation_added",
+                payload={
+                    "from_task_id": from_task_id,
+                    "to_task_id": to_task_id,
+                    "relation_type": relation_type.value,
+                },
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"relation_id": relation_id})
+            return self._require_relation(connection, relation_id)
+
+    def remove_relation(
+        self,
+        relation_id: str,
+        *,
+        actor: str,
+        command_id: Optional[str] = None,
+    ) -> TaskRelationRecord:
+        command_id = self._command_id(command_id)
+        request = {"relation_id": relation_id, "actor": str(actor)}
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "relation.remove", relation_id, request
+            )
+            if replay is not None:
+                return self._require_relation(
+                    connection, replay["relation_id"], include_removed=True
+                )
+            relation = self._require_relation(connection, relation_id)
+            now = _stamp(_now())
+            if relation.relation_type is TaskRelationType.PARENT:
+                child = self._require_task(connection, relation.to_task_id)
+                if child.parent_task_id not in {None, relation.from_task_id}:
+                    raise IntegrityError(
+                        f"parent relation {relation.id} conflicts with task projection"
+                    )
+                if child.parent_task_id == relation.from_task_id:
+                    connection.execute(
+                        """
+                        UPDATE orch_tasks
+                        SET parent_task_id = NULL, parent_node_id = NULL,
+                            version = version + 1, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, child.id),
+                    )
+            connection.execute(
+                "UPDATE orch_task_relations SET removed_at = ? WHERE id = ? AND removed_at IS NULL",
+                (now, relation_id),
+            )
+            self._append_event(
+                connection,
+                task_id=relation.to_task_id,
+                aggregate_type="task_relation",
+                aggregate_id=relation.id,
+                event_type="relation_removed",
+                payload={
+                    "from_task_id": relation.from_task_id,
+                    "to_task_id": relation.to_task_id,
+                    "relation_type": relation.relation_type.value,
+                    "actor": str(actor),
+                },
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"relation_id": relation_id})
+            return self._require_relation(connection, relation_id, include_removed=True)
+
+    def list_relations(
+        self,
+        task_id: str,
+        *,
+        relation_type: Optional[TaskRelationType] = None,
+        include_removed: bool = False,
+    ) -> tuple[TaskRelationRecord, ...]:
+        where = ["(from_task_id = ? OR to_task_id = ?)"]
+        params: list[Any] = [task_id, task_id]
+        if relation_type is not None:
+            where.append("relation_type = ?")
+            params.append(TaskRelationType(relation_type).value)
+        if not include_removed:
+            where.append("removed_at IS NULL")
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            rows = connection.execute(
+                "SELECT * FROM orch_task_relations WHERE "
+                + " AND ".join(where)
+                + " ORDER BY created_at, id",
+                params,
+            ).fetchall()
+        return tuple(self._relation_from_row(row) for row in rows)
+
+    def verify_relation_consistency(self) -> dict[str, Any]:
+        """Fail closed if the durable task projection and live graph diverge.
+
+        ``parent_task_id`` is retained for backwards-compatible reads while
+        ``PARENT`` is the canonical first-class graph representation.  Both are
+        deliberately checked at startup so historical/manual database damage
+        cannot cause the relation resolver to wake the wrong task.
+        """
+
+        with self._read() as connection:
+            task_rows = connection.execute(
+                "SELECT id, parent_task_id FROM orch_tasks ORDER BY id"
+            ).fetchall()
+            relation_rows = connection.execute(
+                """
+                SELECT id, from_task_id, to_task_id, relation_type
+                FROM orch_task_relations
+                WHERE removed_at IS NULL
+                  AND relation_type IN ('parent', 'blocks')
+                ORDER BY relation_type, created_at, id
+                """
+            ).fetchall()
+
+        projected_parent = {
+            str(row["id"]): (
+                str(row["parent_task_id"])
+                if row["parent_task_id"] is not None
+                else None
+            )
+            for row in task_rows
+        }
+        graph_parents: dict[str, list[tuple[str, str]]] = {}
+        adjacency: dict[TaskRelationType, dict[str, list[str]]] = {
+            TaskRelationType.PARENT: {},
+            TaskRelationType.BLOCKS: {},
+        }
+        for row in relation_rows:
+            relation_type = TaskRelationType(str(row["relation_type"]))
+            source = str(row["from_task_id"])
+            target = str(row["to_task_id"])
+            adjacency[relation_type].setdefault(source, []).append(target)
+            if relation_type is TaskRelationType.PARENT:
+                graph_parents.setdefault(target, []).append(
+                    (str(row["id"]), source)
+                )
+
+        for task_id, parent_id in projected_parent.items():
+            parents = graph_parents.get(task_id, [])
+            if len(parents) > 1:
+                relation_ids = ", ".join(item[0] for item in parents[:3])
+                raise IntegrityError(
+                    f"task {task_id} has multiple live parent relations: {relation_ids}"
+                )
+            graph_parent = parents[0][1] if parents else None
+            if graph_parent != parent_id:
+                raise IntegrityError(
+                    f"task {task_id} parent projection {parent_id!r} does not match "
+                    f"live relation {graph_parent!r}"
+                )
+
+        def assert_acyclic(
+            relation_type: TaskRelationType, graph: Mapping[str, Sequence[str]]
+        ) -> None:
+            # Iterative color DFS avoids Python's recursion ceiling on a large
+            # historical blocker graph while retaining a useful bounded cycle path.
+            state: dict[str, int] = {}
+            all_nodes = sorted(
+                set(graph)
+                | set(projected_parent)
+                | {child for children in graph.values() for child in children}
+            )
+            for root in all_nodes:
+                if state.get(root, 0) == 2:
+                    continue
+                path: list[str] = []
+                position: dict[str, int] = {}
+                stack: list[tuple[str, int]] = [(root, 0)]
+                while stack:
+                    node, index = stack[-1]
+                    if state.get(node, 0) == 0:
+                        state[node] = 1
+                        position[node] = len(path)
+                        path.append(node)
+                    children = graph.get(node, ())
+                    if index < len(children):
+                        child = children[index]
+                        stack[-1] = (node, index + 1)
+                        child_state = state.get(child, 0)
+                        if child_state == 1:
+                            start = position[child]
+                            cycle = path[start:] + [child]
+                            raise IntegrityError(
+                                f"{relation_type.value} relation cycle: "
+                                + " -> ".join(cycle[:65])
+                            )
+                        if child_state == 0:
+                            stack.append((child, 0))
+                        continue
+                    stack.pop()
+                    state[node] = 2
+                    position.pop(node, None)
+                    if path and path[-1] == node:
+                        path.pop()
+
+        for relation_type, graph in adjacency.items():
+            assert_acyclic(relation_type, graph)
+        return {
+            "valid": True,
+            "task_count": len(projected_parent),
+            "parent_relation_count": sum(
+                len(items) for items in graph_parents.values()
+            ),
+            "blocks_relation_count": sum(
+                len(items)
+                for items in adjacency[TaskRelationType.BLOCKS].values()
+            ),
+        }
+
+    def replace_blockers(
+        self,
+        task_id: str,
+        blocker_ids: Sequence[str],
+        *,
+        reason: str,
+        owner: str,
+        required_action: str,
+        created_by_task_id: Optional[str] = None,
+        created_by_run_id: Optional[str] = None,
+        lease_token: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        command_id: Optional[str] = None,
+    ) -> tuple[TaskRelationRecord, ...]:
+        blockers = tuple(dict.fromkeys(str(item).strip() for item in blocker_ids if str(item).strip()))
+        if task_id in blockers:
+            raise ConflictError("a task cannot block itself")
+        if not str(reason).strip() or not str(required_action).strip():
+            raise ValueError("blocker reason and required_action are required")
+        if contains_secret_like(
+            {
+                "reason": str(reason),
+                "owner": str(owner),
+                "required_action": str(required_action),
+            }
+        ):
+            raise ValueError("blocker metadata cannot contain secret-like values")
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "blocker_ids": list(blockers),
+            "reason": str(reason),
+            "owner": str(owner),
+            "required_action": str(required_action),
+            "created_by_task_id": created_by_task_id,
+            "created_by_run_id": created_by_run_id,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "blockers.replace", task_id, request
+            )
+            if replay is not None:
+                return tuple(
+                    self._require_relation(connection, item)
+                    for item in replay.get("relation_ids", ())
+                )
+            task = self._require_task(connection, task_id)
+            if created_by_run_id:
+                if lease_token is None or fencing_token is None:
+                    raise LeaseConflict("run-bound blocker writes require lease and fencing tokens")
+                run = self._require_run(connection, created_by_run_id)
+                self._require_lease(connection, run.id, lease_token, fencing_token)
+                if run.task_id != task_id:
+                    raise LeaseConflict("a run may only block its own task")
+            for blocker_id in blockers:
+                self._require_task(connection, blocker_id)
+                cycle = self._relation_cycle_path(
+                    connection, blocker_id, task_id, TaskRelationType.BLOCKS
+                )
+                if cycle:
+                    raise ConflictError("blocker would create a cycle: " + " -> ".join(cycle))
+            existing_rows = connection.execute(
+                """
+                SELECT * FROM orch_task_relations
+                WHERE to_task_id = ? AND relation_type = 'blocks' AND removed_at IS NULL
+                """,
+                (task_id,),
+            ).fetchall()
+            by_source = {str(row["from_task_id"]): row for row in existing_rows}
+            now = _stamp(_now())
+            for source, row in by_source.items():
+                if source not in blockers:
+                    connection.execute(
+                        "UPDATE orch_task_relations SET removed_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    self._append_event(
+                        connection,
+                        task_id=task_id,
+                        aggregate_type="task_relation",
+                        aggregate_id=row["id"],
+                        event_type="relation_removed",
+                        payload={"relation_type": "blocks", "from_task_id": source, "to_task_id": task_id},
+                        command_id=command_id,
+                    )
+            relation_ids: list[str] = []
+            for blocker_id in blockers:
+                row = by_source.get(blocker_id)
+                if row is not None:
+                    relation_ids.append(row["id"])
+                    continue
+                relation_id = _id("relation")
+                connection.execute(
+                    """
+                    INSERT INTO orch_task_relations(
+                        id, from_task_id, to_task_id, relation_type, metadata_json,
+                        created_by_task_id, created_by_run_id, created_at
+                    ) VALUES (?, ?, ?, 'blocks', ?, ?, ?, ?)
+                    """,
+                    (
+                        relation_id,
+                        blocker_id,
+                        task_id,
+                        _json({"reason": reason, "owner": owner, "required_action": required_action}),
+                        created_by_task_id,
+                        created_by_run_id,
+                        now,
+                    ),
+                )
+                relation_ids.append(relation_id)
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task_relation",
+                    aggregate_id=relation_id,
+                    event_type="relation_added",
+                    payload={"relation_type": "blocks", "from_task_id": blocker_id, "to_task_id": task_id},
+                    command_id=command_id,
+                )
+            if blockers and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                validate_task_transition(task.status, TaskStatus.BLOCKED)
+                connection.execute(
+                    "UPDATE orch_tasks SET status = 'blocked', version = version + 1, updated_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task",
+                    aggregate_id=task_id,
+                    event_type="task.blocked",
+                    payload={"blocker_ids": list(blockers), "owner": owner, "required_action": required_action},
+                    command_id=command_id,
+                )
+            elif (
+                not blockers
+                and not str(owner).strip()
+                and task.status is TaskStatus.BLOCKED
+            ):
+                validate_task_transition(TaskStatus.BLOCKED, TaskStatus.QUEUED)
+                connection.execute(
+                    "UPDATE orch_tasks SET status = 'queued', version = version + 1, updated_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task",
+                    aggregate_id=task_id,
+                    event_type="blockers_resolved",
+                    payload={"blocker_ids": [], "relation_set_version": _digest([])},
+                    command_id=command_id,
+                )
+                self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=task_id,
+                    target_run_id=None,
+                    reason=WakeReason.TASK_BLOCKERS_RESOLVED,
+                    source_task_id=created_by_task_id,
+                    source_run_id=created_by_run_id,
+                    source_event_id=None,
+                    payload={"blocker_ids": [], "relation_set_version": _digest([])},
+                    dedupe_key=f"{task_id}:current:task_blockers_resolved:{_digest([])}",
+                    not_before=None,
+                    command_id=command_id,
+                )
+            self._finish_command(connection, command_id, {"relation_ids": relation_ids})
+            return tuple(self._require_relation(connection, item) for item in relation_ids)
+
+    def resolve_terminal_relations(
+        self,
+        task_id: str,
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically derive parent/dependent wakes from one terminal task."""
+
+        task_snapshot = self.get_task(task_id)
+        command_id = str(
+            command_id or f"terminal-relations:{task_id}:{task_snapshot.version}"
+        )
+        request = {"task_id": task_id, "task_version": task_snapshot.version}
+        terminal_values = {
+            TaskStatus.FAILED,
+            TaskStatus.CANCELED,
+            TaskStatus.COMPLETED,
+            TaskStatus.ARCHIVED,
+        }
+
+        def completed(row: sqlite3.Row) -> bool:
+            status = TaskStatus(row["status"])
+            if status is TaskStatus.COMPLETED:
+                return True
+            if status is TaskStatus.ARCHIVED:
+                return str((_load(row["output_json"], {}) or {}).get("archived_from") or "completed") == "completed"
+            return False
+
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "relations.resolve_terminal", task_id, request
+            )
+            if replay is not None:
+                return dict(replay)
+            terminal = self._require_task(connection, task_id)
+            if terminal.status not in terminal_values:
+                raise ConflictError("relation resolution requires a terminal source task")
+            parent_wakes: list[str] = []
+            blocker_wakes: list[str] = []
+            attention_tasks: list[str] = []
+            parent_rows = connection.execute(
+                """
+                SELECT DISTINCT relation.from_task_id AS parent_id
+                FROM orch_task_relations relation
+                WHERE relation.to_task_id = ? AND relation.relation_type = 'parent'
+                  AND relation.removed_at IS NULL
+                """,
+                (task_id,),
+            ).fetchall()
+            for parent_row in parent_rows:
+                parent = self._require_task(connection, parent_row["parent_id"])
+                if parent.status in terminal_values:
+                    continue
+                child_rows = connection.execute(
+                    """
+                    SELECT child.* FROM orch_task_relations relation
+                    JOIN orch_tasks child ON child.id = relation.to_task_id
+                    WHERE relation.from_task_id = ? AND relation.relation_type = 'parent'
+                      AND relation.removed_at IS NULL
+                    ORDER BY child.created_at, child.id
+                    """,
+                    (parent.id,),
+                ).fetchall()
+                if not child_rows or any(TaskStatus(row["status"]) not in terminal_values for row in child_rows):
+                    continue
+                waiting_gate = connection.execute(
+                    """
+                    SELECT 1 FROM orch_gates
+                    WHERE task_id = ? AND kind = 'child_wait' AND status = 'open'
+                    LIMIT 1
+                    """,
+                    (parent.id,),
+                ).fetchone()
+                if parent.status is not TaskStatus.WAITING_CHILD and waiting_gate is None:
+                    continue
+                children: list[dict[str, Any]] = []
+                for child in child_rows:
+                    products = connection.execute(
+                        "SELECT id FROM orch_work_products WHERE task_id = ? ORDER BY created_at, id",
+                        (child["id"],),
+                    ).fetchall()
+                    output = _load(child["output_json"], {}) or {}
+                    result = dict(output.get("result") or {})
+                    children.append(
+                        {
+                            "task_id": child["id"],
+                            "status": child["status"],
+                            "summary": str(result.get("summary") or output.get("summary") or "")[:8_000],
+                            "work_product_refs": [row["id"] for row in products],
+                        }
+                    )
+                relation_version = _digest(
+                    [(item["task_id"], item["status"], item["work_product_refs"]) for item in children]
+                )
+                wake = self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=parent.id,
+                    target_run_id=None,
+                    reason=WakeReason.TASK_CHILDREN_COMPLETED,
+                    source_task_id=task_id,
+                    source_run_id=None,
+                    source_event_id=None,
+                    payload={"children": children, "relation_set_version": relation_version},
+                    dedupe_key=f"{parent.id}:current:task_children_completed:{relation_version}",
+                    not_before=None,
+                    command_id=command_id,
+                )
+                parent_wakes.append(wake.id)
+            dependent_rows = connection.execute(
+                """
+                SELECT DISTINCT relation.to_task_id AS dependent_id
+                FROM orch_task_relations relation
+                WHERE relation.from_task_id = ? AND relation.relation_type = 'blocks'
+                  AND relation.removed_at IS NULL
+                """,
+                (task_id,),
+            ).fetchall()
+            for dependent_row in dependent_rows:
+                dependent = self._require_task(connection, dependent_row["dependent_id"])
+                blocker_rows = connection.execute(
+                    """
+                    SELECT blocker.* FROM orch_task_relations relation
+                    JOIN orch_tasks blocker ON blocker.id = relation.from_task_id
+                    WHERE relation.to_task_id = ? AND relation.relation_type = 'blocks'
+                      AND relation.removed_at IS NULL
+                    ORDER BY blocker.created_at, blocker.id
+                    """,
+                    (dependent.id,),
+                ).fetchall()
+                canceled = [
+                    row["id"]
+                    for row in blocker_rows
+                    if TaskStatus(row["status"]) is TaskStatus.CANCELED
+                    or (
+                        TaskStatus(row["status"]) is TaskStatus.ARCHIVED
+                        and str((_load(row["output_json"], {}) or {}).get("archived_from") or "") == "canceled"
+                    )
+                ]
+                if canceled:
+                    self._append_event(
+                        connection,
+                        task_id=dependent.id,
+                        aggregate_type="task",
+                        aggregate_id=dependent.id,
+                        event_type="blocker_canceled_attention",
+                        payload={"canceled_blocker_ids": canceled, "required_action": "remove_or_replace_blocker"},
+                        command_id=command_id,
+                    )
+                    attention_tasks.append(dependent.id)
+                    continue
+                if blocker_rows and all(completed(row) for row in blocker_rows):
+                    blocker_ids = [row["id"] for row in blocker_rows]
+                    relation_version = _digest([(row["id"], row["version"]) for row in blocker_rows])
+                    if dependent.status is TaskStatus.BLOCKED:
+                        validate_task_transition(TaskStatus.BLOCKED, TaskStatus.QUEUED)
+                        now = _stamp(_now())
+                        connection.execute(
+                            """
+                            UPDATE orch_tasks SET status = 'queued', version = version + 1,
+                                updated_at = ? WHERE id = ? AND status = 'blocked'
+                            """,
+                            (now, dependent.id),
+                        )
+                        self._append_event(
+                            connection,
+                            task_id=dependent.id,
+                            aggregate_type="task",
+                            aggregate_id=dependent.id,
+                            event_type="blockers_resolved",
+                            payload={"blocker_ids": blocker_ids, "relation_set_version": relation_version},
+                            command_id=command_id,
+                        )
+                    wake = self._enqueue_wake_connection(
+                        connection,
+                        target_task_id=dependent.id,
+                        target_run_id=None,
+                        reason=WakeReason.TASK_BLOCKERS_RESOLVED,
+                        source_task_id=task_id,
+                        source_run_id=None,
+                        source_event_id=None,
+                        payload={"blocker_ids": blocker_ids, "relation_set_version": relation_version},
+                        dedupe_key=f"{dependent.id}:current:task_blockers_resolved:{relation_version}",
+                        not_before=None,
+                        command_id=command_id,
+                    )
+                    blocker_wakes.append(wake.id)
+            result = {
+                "parent_wake_ids": parent_wakes,
+                "blocker_wake_ids": blocker_wakes,
+                "attention_task_ids": attention_tasks,
+            }
+            self._finish_command(connection, command_id, result)
+            return result
+
+    # -- durable wake queue -----------------------------------------------
+    def _enqueue_wake_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        target_task_id: str,
+        target_run_id: Optional[str],
+        reason: WakeReason,
+        source_task_id: Optional[str],
+        source_run_id: Optional[str],
+        source_event_id: Optional[str],
+        payload: Mapping[str, Any],
+        dedupe_key: str,
+        not_before: Optional[datetime],
+        command_id: Optional[str],
+    ) -> WakeRequestRecord:
+        self._require_task(connection, target_task_id)
+        existing = connection.execute(
+            """
+            SELECT * FROM orch_wake_requests
+            WHERE dedupe_key = ? AND status IN ('pending', 'deferred', 'claimed', 'delivered')
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        now = _now()
+        if existing is not None:
+            merged = dict(_load(existing["payload_json"], {}))
+            incoming = dict(payload)
+            if reason in {WakeReason.TASK_COMMENTED, WakeReason.TASK_COMMENT_MENTIONED}:
+                merged_ids = list(
+                    dict.fromkeys(
+                        [str(item) for item in merged.get("comment_ids", ())]
+                        + [str(item) for item in incoming.get("comment_ids", ())]
+                    )
+                )
+                merged.update(incoming)
+                if len(merged_ids) > 100:
+                    merged["comment_ids"] = merged_ids[-100:]
+                    merged["fallback_fetch_needed"] = True
+                    merged["after_sequence"] = max(
+                        0, int(merged.get("latest_sequence") or 0) - 100
+                    )
+                else:
+                    merged["comment_ids"] = merged_ids
+            else:
+                merged.update(incoming)
+            connection.execute(
+                """
+                UPDATE orch_wake_requests
+                SET payload_json = ?, coalesced_count = coalesced_count + 1,
+                    updated_at = ?, not_before = MIN(not_before, ?)
+                WHERE id = ?
+                """,
+                (
+                    _json(merged),
+                    _stamp(now),
+                    _stamp(not_before or now),
+                    existing["id"],
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id=target_task_id,
+                aggregate_type="wake_request",
+                aggregate_id=existing["id"],
+                event_type="wake_coalesced",
+                payload={"reason": reason.value, "dedupe_key": dedupe_key},
+                command_id=command_id,
+            )
+            return self._require_wake(connection, existing["id"])
+        wake_id = _id("wake")
+        stamp = _stamp(now)
+        connection.execute(
+            """
+            INSERT INTO orch_wake_requests(
+                id, target_task_id, target_run_id, reason, source_task_id,
+                source_run_id, source_event_id, payload_json, dedupe_key, status,
+                coalesced_count, attempts, not_before, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+            """,
+            (
+                wake_id,
+                target_task_id,
+                target_run_id,
+                reason.value,
+                source_task_id,
+                source_run_id,
+                source_event_id,
+                _json(payload),
+                dedupe_key,
+                _stamp(not_before or now),
+                stamp,
+                stamp,
+            ),
+        )
+        self._append_event(
+            connection,
+            task_id=target_task_id,
+            aggregate_type="wake_request",
+            aggregate_id=wake_id,
+            event_type="wake_enqueued",
+            payload={"reason": reason.value, "dedupe_key": dedupe_key},
+            command_id=command_id,
+        )
+        return self._require_wake(connection, wake_id)
+
+    def enqueue_wake(
+        self,
+        target_task_id: str,
+        reason: WakeReason | str,
+        *,
+        target_run_id: Optional[str] = None,
+        source_task_id: Optional[str] = None,
+        source_run_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+        dedupe_key: Optional[str] = None,
+        not_before: Optional[datetime] = None,
+        command_id: Optional[str] = None,
+    ) -> WakeRequestRecord:
+        reason = WakeReason(reason)
+        chosen_key = str(
+            dedupe_key
+            or f"{target_task_id}:{target_run_id or 'current'}:{reason.value}:{source_event_id or source_task_id or 'system'}"
+        )
+        command_id = self._command_id(command_id)
+        request = {
+            "target_task_id": target_task_id,
+            "target_run_id": target_run_id,
+            "reason": reason.value,
+            "source_task_id": source_task_id,
+            "source_run_id": source_run_id,
+            "source_event_id": source_event_id,
+            "payload": dict(payload or {}),
+            "dedupe_key": chosen_key,
+            "not_before": not_before,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "wake.enqueue", target_task_id, request
+            )
+            if replay is not None:
+                return self._require_wake(connection, replay["wake_id"])
+            wake = self._enqueue_wake_connection(
+                connection,
+                target_task_id=target_task_id,
+                target_run_id=target_run_id,
+                reason=reason,
+                source_task_id=source_task_id,
+                source_run_id=source_run_id,
+                source_event_id=source_event_id,
+                payload=payload or {},
+                dedupe_key=chosen_key,
+                not_before=not_before,
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"wake_id": wake.id})
+            return wake
+
+    def claim_ready_wake(
+        self,
+        owner: str,
+        *,
+        claim_seconds: int = 60,
+        now: Optional[datetime] = None,
+    ) -> Optional[WakeRequestRecord]:
+        chosen_now = now or _now()
+        with self._write() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM orch_wake_requests
+                WHERE status = 'pending' AND not_before <= ?
+                ORDER BY not_before, created_at, id LIMIT 1
+                """,
+                (_stamp(chosen_now),),
+            ).fetchone()
+            if row is None:
+                return None
+            until = chosen_now + timedelta(seconds=max(1, int(claim_seconds)))
+            changed = connection.execute(
+                """
+                UPDATE orch_wake_requests
+                SET status = 'claimed', claimed_by = ?, claimed_until = ?,
+                    attempts = attempts + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (owner, _stamp(until), _stamp(chosen_now), row["id"]),
+            ).rowcount
+            if changed != 1:
+                return None
+            self._append_event(
+                connection,
+                task_id=row["target_task_id"],
+                aggregate_type="wake_request",
+                aggregate_id=row["id"],
+                event_type="wake_claimed",
+                payload={"claimed_by": owner, "claimed_until": _stamp(until)},
+                command_id=None,
+            )
+            return self._require_wake(connection, row["id"])
+
+    def activate_due_wakes(self, *, now: Optional[datetime] = None) -> int:
+        """Move due deferred deliveries back to the claimable queue."""
+
+        chosen_now = now or _now()
+        with self._write() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM orch_wake_requests
+                WHERE status = 'deferred' AND not_before <= ?
+                ORDER BY not_before, created_at, id
+                """,
+                (_stamp(chosen_now),),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    """
+                    UPDATE orch_wake_requests
+                    SET status = 'pending', claimed_by = NULL, claimed_until = NULL,
+                        updated_at = ? WHERE id = ? AND status = 'deferred'
+                    """,
+                    (_stamp(chosen_now), row["id"]),
+                )
+                self._append_event(
+                    connection,
+                    task_id=row["target_task_id"],
+                    aggregate_type="wake_request",
+                    aggregate_id=row["id"],
+                    event_type="wake_reactivated",
+                    payload={},
+                    command_id=None,
+                )
+            return len(rows)
+
+    def bind_wake_to_run(
+        self,
+        wake_id: str,
+        run_id: str,
+        *,
+        owner: str,
+        command_id: Optional[str] = None,
+    ) -> WakeRequestRecord:
+        """Bind a claimed wake to one queued attempt and mark its delta delivered."""
+
+        command_id = self._command_id(command_id)
+        request = {"wake_id": wake_id, "run_id": run_id, "owner": str(owner)}
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "wake.bind_run", wake_id, request
+            )
+            if replay is not None:
+                return self._require_wake(connection, wake_id)
+            wake = self._require_wake(connection, wake_id)
+            if wake.status is not WakeStatus.CLAIMED or wake.claimed_by != str(owner):
+                raise LeaseConflict("wake claim is no longer owned by this scheduler")
+            run = self._require_run(connection, run_id)
+            if run.task_id != wake.target_task_id:
+                raise ConflictError("wake and run belong to different tasks")
+            if run.status not in {
+                RunStatus.QUEUED,
+                RunStatus.CLAIMED,
+                RunStatus.RUNNING,
+                RunStatus.WAITING_GATE,
+            }:
+                raise ConflictError("wake can only bind to a live run")
+            now = _stamp(_now())
+            connection.execute(
+                """
+                UPDATE orch_wake_requests
+                SET target_run_id = ?, status = 'delivered', delivered_at = ?,
+                    updated_at = ?, claimed_by = NULL, claimed_until = NULL
+                WHERE id = ? AND status = 'claimed' AND claimed_by = ?
+                """,
+                (run.id, now, now, wake.id, str(owner)),
+            )
+            self._append_event(
+                connection,
+                task_id=wake.target_task_id,
+                aggregate_type="wake_request",
+                aggregate_id=wake.id,
+                event_type="wake_delivered",
+                payload={"run_id": run.id, "reason": wake.reason.value},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"wake_id": wake.id})
+            return self._require_wake(connection, wake.id)
+
+    def cancel_claimed_wake(
+        self,
+        wake_id: str,
+        *,
+        reason: str,
+        command_id: Optional[str] = None,
+    ) -> WakeRequestRecord:
+        return self._transition_wake(
+            wake_id,
+            expected=(WakeStatus.CLAIMED,),
+            target=WakeStatus.CANCELED,
+            error=str(reason)[:8_000],
+            command_id=command_id,
+        )
+
+    def _transition_wake(
+        self,
+        wake_id: str,
+        *,
+        expected: Sequence[WakeStatus],
+        target: WakeStatus,
+        error: Optional[str] = None,
+        not_before: Optional[datetime] = None,
+        command_id: Optional[str] = None,
+    ) -> WakeRequestRecord:
+        command_id = self._command_id(command_id)
+        request = {
+            "wake_id": wake_id,
+            "expected": [WakeStatus(item).value for item in expected],
+            "target": target.value,
+            "error": error,
+            "not_before": not_before,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, f"wake.{target.value}", wake_id, request
+            )
+            if replay is not None:
+                return self._require_wake(connection, wake_id)
+            wake = self._require_wake(connection, wake_id)
+            allowed = {WakeStatus(item) for item in expected}
+            if wake.status not in allowed:
+                raise ConflictError(
+                    f"wake {wake_id} is {wake.status.value}, expected "
+                    + ", ".join(sorted(item.value for item in allowed))
+                )
+            now = _now()
+            assignments = [
+                "status = ?",
+                "updated_at = ?",
+                "last_error = ?",
+            ]
+            values: list[Any] = [target.value, _stamp(now), error]
+            if target is not WakeStatus.CLAIMED:
+                assignments.extend(["claimed_by = NULL", "claimed_until = NULL"])
+            if not_before is not None:
+                assignments.append("not_before = ?")
+                values.append(_stamp(not_before))
+            if target is WakeStatus.DELIVERED:
+                assignments.append("delivered_at = ?")
+                values.append(_stamp(now))
+            if target is WakeStatus.COMPLETED:
+                assignments.append("completed_at = ?")
+                values.append(_stamp(now))
+            values.append(wake_id)
+            connection.execute(
+                "UPDATE orch_wake_requests SET " + ", ".join(assignments) + " WHERE id = ?",
+                values,
+            )
+            self._append_event(
+                connection,
+                task_id=wake.target_task_id,
+                aggregate_type="wake_request",
+                aggregate_id=wake.id,
+                event_type=f"wake_{target.value}",
+                payload={"reason": wake.reason.value, "error": error},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"wake_id": wake_id})
+            return self._require_wake(connection, wake_id)
+
+    def defer_wake(self, wake_id: str, *, not_before: datetime, command_id: Optional[str] = None) -> WakeRequestRecord:
+        return self._transition_wake(wake_id, expected=(WakeStatus.CLAIMED, WakeStatus.PENDING), target=WakeStatus.DEFERRED, not_before=not_before, command_id=command_id)
+
+    def mark_wake_delivered(self, wake_id: str, *, command_id: Optional[str] = None) -> WakeRequestRecord:
+        return self._transition_wake(wake_id, expected=(WakeStatus.CLAIMED,), target=WakeStatus.DELIVERED, command_id=command_id)
+
+    def mark_wake_completed(self, wake_id: str, *, command_id: Optional[str] = None) -> WakeRequestRecord:
+        return self._transition_wake(wake_id, expected=(WakeStatus.DELIVERED,), target=WakeStatus.COMPLETED, command_id=command_id)
+
+    def mark_wake_failed(
+        self,
+        wake_id: str,
+        error: str,
+        *,
+        max_attempts: int = 5,
+        backoff_seconds: int = 1,
+        command_id: Optional[str] = None,
+    ) -> WakeRequestRecord:
+        wake = self.get_wake(wake_id)
+        if wake.attempts < max(1, int(max_attempts)):
+            delay = min(
+                300,
+                max(1, int(backoff_seconds))
+                * (2 ** max(0, wake.attempts - 1)),
+            )
+            return self._transition_wake(
+                wake_id,
+                expected=(WakeStatus.CLAIMED, WakeStatus.DELIVERED),
+                target=WakeStatus.PENDING,
+                error=str(error)[:8_000],
+                not_before=_now() + timedelta(seconds=delay),
+                command_id=command_id,
+            )
+        failed = self._transition_wake(
+            wake_id,
+            expected=(WakeStatus.CLAIMED, WakeStatus.DELIVERED),
+            target=WakeStatus.FAILED,
+            error=str(error)[:8_000],
+            command_id=command_id,
+        )
+        task = self.get_task(failed.target_task_id)
+        if task.status in {
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_HUMAN,
+            TaskStatus.WAITING_CHILD,
+            TaskStatus.PAUSED,
+            TaskStatus.BLOCKED,
+        }:
+            self.transition_task_status(
+                task.id,
+                TaskStatus.NEEDS_RECONCILIATION,
+                expected_version=task.version,
+                command_id=f"wake-dead-letter:{wake_id}",
+            )
+        return self.get_wake(wake_id)
+
+    def recover_expired_wake_claims(
+        self, *, now: Optional[datetime] = None
+    ) -> int:
+        chosen_now = now or _now()
+        with self._write() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM orch_wake_requests
+                WHERE status = 'claimed' AND claimed_until IS NOT NULL AND claimed_until <= ?
+                """,
+                (_stamp(chosen_now),),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    """
+                    UPDATE orch_wake_requests SET status = 'pending', claimed_by = NULL,
+                        claimed_until = NULL, updated_at = ? WHERE id = ?
+                    """,
+                    (_stamp(chosen_now), row["id"]),
+                )
+                self._append_event(
+                    connection,
+                    task_id=row["target_task_id"],
+                    aggregate_type="wake_request",
+                    aggregate_id=row["id"],
+                    event_type="wake_claim_recovered",
+                    payload={"previous_claimed_by": row["claimed_by"]},
+                    command_id=None,
+                )
+            return len(rows)
+
+    def retry_wake(self, wake_id: str, *, command_id: Optional[str] = None) -> WakeRequestRecord:
+        return self._transition_wake(
+            wake_id,
+            expected=(WakeStatus.FAILED,),
+            target=WakeStatus.PENDING,
+            not_before=_now(),
+            command_id=command_id,
+        )
+
+    def cancel_wake(self, wake_id: str, *, command_id: Optional[str] = None) -> WakeRequestRecord:
+        return self._transition_wake(
+            wake_id,
+            expected=(WakeStatus.PENDING, WakeStatus.DEFERRED),
+            target=WakeStatus.CANCELED,
+            command_id=command_id,
+        )
+
+    def get_wake(self, wake_id: str) -> WakeRequestRecord:
+        with self._read() as connection:
+            return self._require_wake(connection, wake_id)
+
+    def list_wakes(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        statuses: Optional[Sequence[WakeStatus]] = None,
+        limit: int = 1_000,
+        offset: int = 0,
+    ) -> tuple[WakeRequestRecord, ...]:
+        where: list[str] = []
+        params: list[Any] = []
+        if task_id:
+            where.append("target_task_id = ?")
+            params.append(task_id)
+        if statuses:
+            values = [WakeStatus(item).value for item in statuses]
+            where.append("status IN (" + ",".join("?" for _ in values) + ")")
+            params.extend(values)
+        params.extend((max(1, min(int(limit), 10_000)), max(0, int(offset))))
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT * FROM orch_wake_requests"
+                + clause
+                + " ORDER BY created_at, id LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return tuple(self._wake_from_row(row) for row in rows)
+
+    def handoff_observability_snapshot(
+        self, *, now: Optional[datetime] = None
+    ) -> dict[str, int | float]:
+        """Return bounded queue/blocking aggregates for the metrics cache.
+
+        The queries use status-leading indexes and aggregate in SQLite, so metric
+        refresh cost does not grow with the payload size of wakes or tasks.
+        """
+
+        chosen_now = now or _now()
+        with self._read() as connection:
+            pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM orch_wake_requests WHERE status = 'pending'"
+                ).fetchone()[0]
+            )
+            coalesced_total = int(
+                connection.execute(
+                """
+                    SELECT COALESCE(SUM(coalesced_count), 0)
+                    FROM orch_wake_requests
+                """
+                ).fetchone()[0]
+            )
+            oldest_blocked = connection.execute(
+                """
+                SELECT updated_at FROM orch_tasks
+                WHERE status = 'blocked'
+                ORDER BY updated_at ASC LIMIT 1
+                """
+            ).fetchone()
+        blocked_seconds = 0.0
+        if oldest_blocked is not None:
+            blocked_at = _time(oldest_blocked["updated_at"])
+            if blocked_at is not None:
+                blocked_seconds = max(
+                    0.0, (chosen_now - blocked_at).total_seconds()
+                )
+        return {
+            "wakes_pending": pending,
+            "wake_coalesced_total": coalesced_total,
+            "task_blocked_duration_seconds": blocked_seconds,
+        }
+
+    # -- comments and structured mentions --------------------------------
+    @staticmethod
+    def _sanitize_comment_markdown(body: str) -> str:
+        value = str(body).replace("\x00", "")
+        value = re.sub(
+            r"(?is)<\s*(script|iframe|object|embed|style)\b[^>]*>.*?<\s*/\s*\1\s*>",
+            "",
+            value,
+        )
+        value = re.sub(r"(?is)\son[a-z]+\s*=\s*(['\"]).*?\1", "", value)
+        value = re.sub(r"(?is)javascript\s*:", "", value)
+        return value.strip()
+
+    def post_task_comment(
+        self,
+        task_id: str,
+        body_markdown: str,
+        *,
+        author_type: str,
+        author_id: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        reply_to_comment_id: Optional[str] = None,
+        created_by_run_id: Optional[str] = None,
+        lease_token: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        wake_owner: bool = True,
+        wake_coalesce_window_ms: int = 1_000,
+        command_id: Optional[str] = None,
+    ) -> TaskCommentRecord:
+        author_type = str(author_type).strip().lower()
+        if author_type not in {"operator", "agent", "system"}:
+            raise ValueError("comment author_type must be operator, agent, or system")
+        author_id = str(author_id).strip()
+        if not author_id:
+            raise ValueError("comment author_id is required")
+        body = self._sanitize_comment_markdown(body_markdown)
+        if not body:
+            raise ValueError("comment body is required")
+        if contains_secret_like({"body": body, "metadata": dict(metadata or {})}):
+            raise ValueError(
+                "comment cannot contain secret-like values; use the runtime secret mechanism"
+            )
+        if len(body.encode("utf-8")) > 65_536:
+            raise ValueError("comment exceeds 65536 bytes; store large content as an artifact")
+        chosen_metadata = dict(metadata or {})
+        mentions = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in chosen_metadata.get("mentions", ())
+                if str(item).strip()
+            )
+        )
+        if len(mentions) > _MAX_MENTIONS_PER_COMMENT:
+            raise ValueError(
+                f"a comment may mention at most {_MAX_MENTIONS_PER_COMMENT} targets"
+            )
+        for target in mentions:
+            profile_target = target.removeprefix("task:") if target.startswith("task:") else target
+            if not _MENTION_PROFILE_ID.fullmatch(profile_target):
+                raise ValueError(f"invalid canonical mention target: {target!r}")
+        chosen_metadata["mentions"] = list(mentions)
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "body_markdown": body,
+            "author_type": author_type,
+            "author_id": author_id,
+            "metadata": chosen_metadata,
+            "reply_to_comment_id": reply_to_comment_id,
+            "created_by_run_id": created_by_run_id,
+            "wake_owner": bool(wake_owner),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "comment.post", task_id, request
+            )
+            if replay is not None:
+                return self._require_comment(connection, replay["comment_id"])
+            task = self._require_task(connection, task_id)
+            if created_by_run_id:
+                if lease_token is None or fencing_token is None:
+                    raise LeaseConflict("Agent comments require lease and fencing tokens")
+                run = self._require_run(connection, created_by_run_id)
+                self._require_lease(connection, run.id, lease_token, fencing_token)
+                if run.task_id != task_id:
+                    raise LeaseConflict("an Agent may only comment its current task")
+            if reply_to_comment_id:
+                reply = self._require_comment(connection, reply_to_comment_id)
+                if reply.task_id != task_id:
+                    raise ConflictError("reply target belongs to another task")
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM orch_task_comments WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            comment_id = _id("comment")
+            now = _stamp(_now())
+            connection.execute(
+                """
+                INSERT INTO orch_task_comments(
+                    id, task_id, sequence_no, author_type, author_id,
+                    created_by_run_id, body_markdown, metadata_json,
+                    reply_to_comment_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    comment_id,
+                    task_id,
+                    sequence,
+                    author_type,
+                    author_id,
+                    created_by_run_id,
+                    body,
+                    _json(chosen_metadata),
+                    reply_to_comment_id,
+                    now,
+                ),
+            )
+            event = self._append_event(
+                connection,
+                task_id=task_id,
+                aggregate_type="task_comment",
+                aggregate_id=comment_id,
+                event_type="comment_added",
+                payload={
+                    "sequence": sequence,
+                    "author_type": author_type,
+                    "author_id": author_id,
+                    "mentions": list(mentions),
+                    "request_response": bool(chosen_metadata.get("request_response")),
+                },
+                command_id=command_id,
+            )
+            should_wake_owner = bool(wake_owner) and (
+                created_by_run_id is None
+                or bool(chosen_metadata.get("request_response"))
+                or task.status
+                in {
+                    TaskStatus.WAITING_HUMAN,
+                    TaskStatus.PAUSED,
+                    TaskStatus.BLOCKED,
+                    TaskStatus.COMPLETED,
+                }
+            )
+            if should_wake_owner:
+                owner_dedupe_key = (
+                    f"{task_id}:current:task_commented:{comment_id}"
+                )
+                coalesce_window = max(0, int(wake_coalesce_window_ms))
+                if coalesce_window:
+                    candidate = connection.execute(
+                        """
+                        SELECT dedupe_key, updated_at
+                        FROM orch_wake_requests
+                        WHERE target_task_id = ? AND reason = 'task_commented'
+                          AND status IN ('pending', 'deferred', 'claimed', 'delivered')
+                        ORDER BY updated_at DESC, id DESC LIMIT 1
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                    if candidate is not None:
+                        updated_at = _time(candidate["updated_at"])
+                        if updated_at is not None and (
+                            _now() - updated_at
+                        ).total_seconds() * 1_000 <= coalesce_window:
+                            owner_dedupe_key = str(candidate["dedupe_key"])
+                self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=task_id,
+                    target_run_id=None,
+                    reason=WakeReason.TASK_COMMENTED,
+                    source_task_id=task_id,
+                    source_run_id=created_by_run_id,
+                    source_event_id=event.id,
+                    payload={
+                        "comment_ids": [comment_id],
+                        "latest_sequence": sequence,
+                        "fallback_fetch_needed": False,
+                    },
+                    dedupe_key=owner_dedupe_key,
+                    not_before=None,
+                    command_id=command_id,
+                )
+            for target in mentions:
+                target_task_id = task_id
+                target_profile_id = target
+                if target.startswith("task:"):
+                    target_task_id = target.removeprefix("task:").strip()
+                    self._require_task(connection, target_task_id)
+                    if self._root_task_id_connection(
+                        connection, target_task_id
+                    ) != self._root_task_id_connection(connection, task_id):
+                        raise PermissionError(
+                            "task mention target must be in the same orchestration tree"
+                        )
+                    target_profile_id = "task-owner"
+                live_mentions = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM orch_wake_requests
+                        WHERE source_task_id = ? AND reason = 'task_comment_mentioned'
+                          AND status IN ('pending', 'deferred', 'claimed', 'delivered')
+                        """,
+                        (task_id,),
+                    ).fetchone()[0]
+                )
+                if live_mentions >= _MAX_LIVE_MENTION_WAKES_PER_TASK:
+                    raise ConflictError("task mention wake budget is exhausted")
+                self._append_event(
+                    connection,
+                    task_id=task_id,
+                    aggregate_type="task_comment",
+                    aggregate_id=comment_id,
+                    event_type="mention_detected",
+                    payload={
+                        "target_profile_id": target_profile_id,
+                        "target_task_id": target_task_id,
+                        "sequence": sequence,
+                    },
+                    command_id=command_id,
+                )
+                self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=target_task_id,
+                    target_run_id=None,
+                    reason=WakeReason.TASK_COMMENT_MENTIONED,
+                    source_task_id=task_id,
+                    source_run_id=created_by_run_id,
+                    source_event_id=event.id,
+                    payload={
+                        "comment_ids": [comment_id],
+                        "target_profile_id": target_profile_id,
+                        "mentioned_from_task_id": task_id,
+                        "notice_only": True,
+                    },
+                    dedupe_key=f"{target_task_id}:mention:{target_profile_id}:{comment_id}",
+                    not_before=None,
+                    command_id=command_id,
+                )
+            self._finish_command(connection, command_id, {"comment_id": comment_id})
+            return self._require_comment(connection, comment_id)
+
+    def get_task_comment(self, comment_id: str) -> TaskCommentRecord:
+        with self._read() as connection:
+            return self._require_comment(connection, comment_id)
+
+    def list_task_comments(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[TaskCommentRecord, ...]:
+        limit = max(1, min(int(limit), 1_000))
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM orch_task_comments
+                WHERE task_id = ? AND sequence_no > ?
+                ORDER BY sequence_no LIMIT ?
+                """,
+                (task_id, max(0, int(after_sequence)), limit),
+            ).fetchall()
+        return tuple(self._comment_from_row(row) for row in rows)
+
+    # -- immutable work products -----------------------------------------
+    @staticmethod
+    def _validate_work_product_uri(
+        uri: Optional[str],
+        *,
+        kind: WorkProductKind,
+        workspace: Optional[str],
+    ) -> None:
+        if not uri:
+            if kind is WorkProductKind.WORKSPACE_FILE:
+                raise ValueError("workspace_file products require a workspace URI")
+            return
+        parsed = urlparse(str(uri))
+        if not parsed.scheme:
+            raise ValueError("work product URI must use an explicit allowed scheme")
+        if parsed.scheme not in {
+            "http",
+            "https",
+            "sha256",
+            "workspace",
+            "git",
+        }:
+            raise ValueError(f"work product URI scheme is not allowed: {parsed.scheme}")
+        if parsed.username or parsed.password:
+            raise ValueError("work product URI cannot contain embedded credentials")
+        if kind is WorkProductKind.WORKSPACE_FILE and parsed.scheme != "workspace":
+            raise ValueError("workspace_file products require a workspace URI")
+        if parsed.scheme == "workspace":
+            if workspace is None:
+                raise ValueError("workspace URI requires a task workspace")
+            raw = str(uri).removeprefix("workspace:")
+            if (
+                not raw
+                or parsed.netloc
+                or parsed.query
+                or parsed.fragment
+                or "%" in raw
+                or raw.startswith(("/", "\\"))
+            ):
+                raise ValueError("workspace URI must contain one relative path")
+            pure = Path(raw)
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ValueError("workspace URI cannot escape the task workspace")
+            root = Path(workspace).expanduser().resolve(strict=True)
+            candidate = (root / pure).resolve(strict=True)
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise PermissionError(
+                    "workspace work product resolves outside the task workspace"
+                ) from exc
+            if not candidate.is_file():
+                raise ValueError("workspace work product must reference a file")
+
+    def _insert_work_product(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        run_id: Optional[str],
+        kind: WorkProductKind,
+        title: str,
+        summary: str,
+        evidence_id: Optional[str],
+        artifact_id: Optional[str],
+        uri: Optional[str],
+        content_hash: Optional[str],
+        metadata: Mapping[str, Any],
+        verification_status: str,
+        created_by: str,
+        command_id: Optional[str],
+    ) -> WorkProductRecord:
+        task = self._require_task(connection, task_id)
+        self._validate_work_product_uri(
+            uri, kind=kind, workspace=task.workspace
+        )
+        if not str(title).strip():
+            raise ValueError("work product title is required")
+        if contains_secret_like(
+            {
+                "title": str(title),
+                "summary": str(summary),
+                "uri": uri,
+                "metadata": dict(metadata),
+            }
+        ):
+            raise ValueError(
+                "work product metadata cannot contain secret-like values"
+            )
+        if verification_status not in {"unverified", "verified", "stale", "missing", "failed"}:
+            raise ValueError("invalid work product verification status")
+        if run_id:
+            run = self._require_run(connection, run_id)
+            if run.task_id != task_id:
+                raise ConflictError("work product run belongs to another task")
+        if evidence_id:
+            evidence = self._require_evidence(connection, evidence_id)
+            if evidence.task_id != task_id:
+                raise ConflictError("work product evidence belongs to another task")
+        product_id = _id("wp")
+        connection.execute(
+            """
+            INSERT INTO orch_work_products(
+                id, task_id, run_id, kind, title, summary, evidence_id,
+                artifact_id, uri, content_hash, metadata_json,
+                verification_status, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                product_id,
+                task_id,
+                run_id,
+                kind.value,
+                str(title).strip()[:500],
+                str(summary).strip()[:16_000],
+                evidence_id,
+                artifact_id,
+                uri,
+                content_hash,
+                _json(metadata),
+                verification_status,
+                str(created_by).strip(),
+                _stamp(_now()),
+            ),
+        )
+        self._append_event(
+            connection,
+            task_id=task_id,
+            aggregate_type="work_product",
+            aggregate_id=product_id,
+            event_type="work_product_created",
+            payload={
+                "kind": kind.value,
+                "title": str(title).strip()[:500],
+                "run_id": run_id,
+                "content_hash": content_hash,
+            },
+            command_id=command_id,
+        )
+        return self._require_work_product(connection, product_id)
+
+    def create_work_product(
+        self,
+        task_id: str,
+        *,
+        kind: WorkProductKind | str,
+        title: str,
+        summary: str = "",
+        run_id: Optional[str] = None,
+        evidence_id: Optional[str] = None,
+        artifact_id: Optional[str] = None,
+        uri: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        verification_status: str = "unverified",
+        created_by: str,
+        lease_token: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        command_id: Optional[str] = None,
+    ) -> WorkProductRecord:
+        kind = WorkProductKind(kind)
+        command_id = self._command_id(command_id)
+        request = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "kind": kind.value,
+            "title": str(title),
+            "summary": str(summary),
+            "evidence_id": evidence_id,
+            "artifact_id": artifact_id,
+            "uri": uri,
+            "content_hash": content_hash,
+            "metadata": dict(metadata or {}),
+            "verification_status": verification_status,
+            "created_by": str(created_by),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "work_product.create", task_id, request
+            )
+            if replay is not None:
+                return self._require_work_product(connection, replay["work_product_id"])
+            if run_id:
+                if lease_token is None or fencing_token is None:
+                    raise LeaseConflict("Agent work products require lease and fencing tokens")
+                run = self._require_run(connection, run_id)
+                self._require_lease(connection, run.id, lease_token, fencing_token)
+                if run.task_id != task_id:
+                    raise LeaseConflict("work product run belongs to another task")
+            product = self._insert_work_product(
+                connection,
+                task_id=task_id,
+                run_id=run_id,
+                kind=kind,
+                title=title,
+                summary=summary,
+                evidence_id=evidence_id,
+                artifact_id=artifact_id,
+                uri=uri,
+                content_hash=content_hash,
+                metadata=metadata or {},
+                verification_status=verification_status,
+                created_by=created_by,
+                command_id=command_id,
+            )
+            self._finish_command(
+                connection, command_id, {"work_product_id": product.id}
+            )
+            return product
+
+    def get_work_product(self, product_id: str) -> WorkProductRecord:
+        with self._read() as connection:
+            return self._require_work_product(connection, product_id)
+
+    def list_work_products(
+        self,
+        task_id: str,
+        *,
+        kind: Optional[WorkProductKind] = None,
+        limit: int = 1_000,
+        offset: int = 0,
+    ) -> tuple[WorkProductRecord, ...]:
+        where = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(WorkProductKind(kind).value)
+        params.extend((max(1, min(int(limit), 10_000)), max(0, int(offset))))
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            rows = connection.execute(
+                "SELECT * FROM orch_work_products WHERE "
+                + " AND ".join(where)
+                + " ORDER BY created_at, id LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return tuple(self._work_product_from_row(row) for row in rows)
+
+    def verify_work_product(
+        self,
+        product_id: str,
+        *,
+        available: bool,
+        actual_hash: Optional[str],
+        actor: str,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        command_id = self._command_id(command_id)
+        request = {
+            "product_id": product_id,
+            "available": bool(available),
+            "actual_hash": actual_hash,
+            "actor": str(actor),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "work_product.verify", product_id, request
+            )
+            if replay is not None:
+                return dict(replay)
+            product = self._require_work_product(connection, product_id)
+            status = (
+                "missing"
+                if not available
+                else "stale"
+                if product.content_hash and product.content_hash != actual_hash
+                else "verified"
+            )
+            result = {
+                "work_product_id": product.id,
+                "verification_status": status,
+                "expected_hash": product.content_hash,
+                "actual_hash": actual_hash,
+                "available": bool(available),
+            }
+            self._append_event(
+                connection,
+                task_id=product.task_id,
+                aggregate_type="work_product",
+                aggregate_id=product.id,
+                event_type="work_product_verified",
+                payload={**result, "actor": str(actor)},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, result)
+            return result
 
     def get_task(self, task_id: str) -> TaskRecord:
         with self._read() as connection:
@@ -795,6 +3934,8 @@ class OrchestrationStore:
                 raise VersionConflict(
                     f"task {task_id} expected version {expected_version}, found {task.version}"
                 )
+            if target is TaskStatus.QUEUED and not task.active_brief_id:
+                raise ConflictError("a task requires a published brief before it can be queued")
             validate_task_transition(task.status, target)
             now = _stamp(_now())
             changed = connection.execute(
@@ -854,6 +3995,57 @@ class OrchestrationStore:
                 payload={"from": task.status.value, "to": target.value},
                 command_id=command_id,
             )
+            if task.status is TaskStatus.DRAFT and target is TaskStatus.QUEUED:
+                brief = self._require_brief(connection, task.active_brief_id)  # type: ignore[arg-type]
+                reason = (
+                    WakeReason.TASK_ASSIGNED
+                    if task.parent_task_id
+                    else WakeReason.ASSIGNMENT
+                )
+                self._enqueue_wake_connection(
+                    connection,
+                    target_task_id=task.id,
+                    target_run_id=None,
+                    reason=reason,
+                    source_task_id=task.parent_task_id,
+                    source_run_id=None,
+                    source_event_id=None,
+                    payload={
+                        "brief_id": brief.id,
+                        "brief_revision": brief.revision,
+                        "profile_id": task.policy.get("profile_id"),
+                    },
+                    dedupe_key=f"{task.id}:current:{reason.value}:{brief.id}",
+                    not_before=None,
+                    command_id=command_id,
+                )
+            if target in {TaskStatus.CANCELING, TaskStatus.CANCELED}:
+                wakes = connection.execute(
+                    """
+                    SELECT id FROM orch_wake_requests
+                    WHERE target_task_id = ? AND status IN ('pending', 'deferred')
+                    """,
+                    (task.id,),
+                ).fetchall()
+                connection.execute(
+                    """
+                    UPDATE orch_wake_requests
+                    SET status = 'canceled', updated_at = ?, claimed_by = NULL,
+                        claimed_until = NULL
+                    WHERE target_task_id = ? AND status IN ('pending', 'deferred')
+                    """,
+                    (now, task.id),
+                )
+                for wake_row in wakes:
+                    self._append_event(
+                        connection,
+                        task_id=task.id,
+                        aggregate_type="wake_request",
+                        aggregate_id=wake_row["id"],
+                        event_type="wake_canceled",
+                        payload={"reason": "task_cancellation"},
+                        command_id=command_id,
+                    )
             self._finish_command(connection, command_id, {"task_id": task_id})
             return self._require_task(connection, task_id)
 
@@ -1302,6 +4494,7 @@ class OrchestrationStore:
         ready_at: Optional[datetime] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        recovery_gate_id: Optional[str] = None,
         command_id: Optional[str] = None,
     ) -> RunRecord:
         command_id = self._command_id(command_id)
@@ -1313,6 +4506,7 @@ class OrchestrationStore:
             "ready_at": ready_at,
             "priority": priority,
             "session_id": session_id,
+            "recovery_gate_id": recovery_gate_id,
         }
         with self._write() as connection:
             replay = self._start_command(
@@ -1348,10 +4542,69 @@ class OrchestrationStore:
             ).fetchone()[0]
             chosen_attempt = int(attempt) if attempt is not None else int(latest or 0) + 1
             retry = _load(node["retry_policy_json"], {})
-            if chosen_attempt < 1 or chosen_attempt > int(retry.get("max_attempts", 1)):
+            max_attempts = int(retry.get("max_attempts", 1))
+            if chosen_attempt < 1:
+                raise ConflictError(f"attempt {chosen_attempt} must be positive")
+            compatibility_override = False
+            if chosen_attempt > max_attempts and recovery_gate_id:
+                gate = self._require_gate(connection, recovery_gate_id)
+                compatibility = gate.prompt.get("compatibility_retry")
+                base_attempts = (
+                    compatibility.get("base_attempts")
+                    if isinstance(compatibility, Mapping)
+                    else None
+                )
+                base = (
+                    base_attempts.get(node_key)
+                    if isinstance(base_attempts, Mapping)
+                    else None
+                )
+                source_run_id = (
+                    str(base.get("run_id") or "")
+                    if isinstance(base, Mapping)
+                    else ""
+                )
+                try:
+                    source_attempt = (
+                        int(base.get("attempt") or 0)
+                        if isinstance(base, Mapping)
+                        else 0
+                    )
+                except (TypeError, ValueError):
+                    source_attempt = 0
+                source_run = (
+                    self._require_run(connection, source_run_id)
+                    if source_run_id
+                    else None
+                )
+                compatibility_override = bool(
+                    gate.task_id == task_id
+                    and gate.run_id is None
+                    and gate.kind is GateKind.RECONCILIATION
+                    and gate.status is GateStatus.APPROVED
+                    and str((gate.resolution or {}).get("decision") or "")
+                    == "retry"
+                    and isinstance(compatibility, Mapping)
+                    and str(compatibility.get("reason") or "")
+                    in _COMPATIBILITY_RETRY_REASONS
+                    and source_run is not None
+                    and source_run.task_id == task_id
+                    and source_run.node_id == node["id"]
+                    and source_run.status is RunStatus.SUCCEEDED
+                    and source_run.attempt == source_attempt
+                    and int(latest or 0) == source_attempt
+                    and chosen_attempt == source_attempt + 1
+                    and node["kind"]
+                    in {
+                        NodeKind.REVIEW.value,
+                        NodeKind.TEST.value,
+                        NodeKind.EVALUATE.value,
+                    }
+                )
+            if chosen_attempt > max_attempts and not compatibility_override:
                 raise ConflictError(
                     f"attempt {chosen_attempt} exceeds node max_attempts "
-                    f"{retry.get('max_attempts', 1)}"
+                    f"{max_attempts}"
                 )
             run_id = _id("run")
             now = _now()
@@ -1359,8 +4612,8 @@ class OrchestrationStore:
                 """
                 INSERT INTO orch_runs(
                     id, task_id, plan_id, node_id, attempt, status, session_id,
-                    priority, ready_at, fencing_token, version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)
+                    priority, ready_at, fencing_token, version, created_at, brief_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                 """,
                 (
                     run_id,
@@ -1373,6 +4626,7 @@ class OrchestrationStore:
                     int(priority if priority is not None else node["priority"]),
                     _stamp(ready_at or now),
                     _stamp(now),
+                    task.active_brief_id,
                 ),
             )
             self._append_event(
@@ -1381,7 +4635,13 @@ class OrchestrationStore:
                 aggregate_type="run",
                 aggregate_id=run_id,
                 event_type="run.queued",
-                payload={"node_key": node_key, "attempt": chosen_attempt},
+                payload={
+                    "node_key": node_key,
+                    "attempt": chosen_attempt,
+                    "recovery_gate_id": (
+                        recovery_gate_id if compatibility_override else None
+                    ),
+                },
                 command_id=command_id,
             )
             self._finish_command(connection, command_id, {"run_id": run_id})
@@ -1441,9 +4701,9 @@ class OrchestrationStore:
                 INSERT INTO orch_runs(
                     id, task_id, plan_id, node_id, attempt, status, priority,
                     ready_at, fencing_token, error_kind, error_message, version,
-                    created_at, finished_at
+                    created_at, finished_at, brief_id
                 ) VALUES (?, ?, ?, ?, 1, 'skipped', ?, ?, 0,
-                          'edge_condition', ?, 1, ?, ?)
+                          'edge_condition', ?, 1, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1455,6 +4715,7 @@ class OrchestrationStore:
                     reason[:2_000],
                     now,
                     now,
+                    task.active_brief_id,
                 ),
             )
             self._append_event(
@@ -1525,9 +4786,9 @@ class OrchestrationStore:
                     INSERT INTO orch_runs(
                         id, task_id, plan_id, node_id, attempt, status, priority,
                         ready_at, fencing_token, error_kind, error_message, version,
-                        created_at, finished_at
+                        created_at, finished_at, brief_id
                     ) VALUES (?, ?, ?, ?, 1, 'skipped', ?, ?, 0,
-                              'failure_policy', ?, 1, ?, ?)
+                              'failure_policy', ?, 1, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -1539,6 +4800,7 @@ class OrchestrationStore:
                         reason[:2_000],
                         now,
                         now,
+                        task.active_brief_id,
                     ),
                 )
                 previous_status = None
@@ -1583,9 +4845,243 @@ class OrchestrationStore:
             self._finish_command(connection, command_id, {"run_id": run_id})
             return self._require_run(connection, run_id)
 
+    def reopen_policy_skipped_run(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        session_id: str,
+        ready_at: Optional[datetime] = None,
+        command_id: Optional[str] = None,
+    ) -> RunRecord:
+        """Requeue an unstarted attempt after its failure-policy cause recovered.
+
+        A policy-controlled skip is not an Agent execution result: it has no lease,
+        checkpoint, or started timestamp.  Reopening that same attempt preserves the
+        node's real retry budget while retaining the original skip and reopen events.
+        Fenced or otherwise terminal execution results remain immutable.
+        """
+
+        command_id = self._command_id(command_id)
+        request = {
+            "run_id": run_id,
+            "reason": reason,
+            "session_id": session_id,
+            "ready_at": ready_at,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "run.reopen_policy_skip", run_id, request
+            )
+            if replay is not None:
+                return self._require_run(connection, replay["run_id"])
+            row = connection.execute(
+                """
+                SELECT r.*, n.node_key FROM orch_runs r
+                JOIN orch_nodes n ON n.id = r.node_id
+                WHERE r.id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"run not found: {run_id}")
+            if (
+                RunStatus(row["status"]) is not RunStatus.SKIPPED
+                or str(row["error_kind"] or "") != "failure_policy"
+                or row["started_at"] is not None
+            ):
+                raise ConflictError(
+                    "only an unstarted failure-policy skip may be reopened"
+                )
+            if connection.execute(
+                "SELECT 1 FROM orch_leases WHERE run_id = ?", (run_id,)
+            ).fetchone() is not None:
+                raise ConflictError("a leased run cannot be reopened")
+            task = self._require_task(connection, str(row["task_id"]))
+            if task.status not in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                raise ConflictError(
+                    "policy-skipped runs may be reopened only for a queued or running task"
+                )
+            reopened_at = _stamp(_now())
+            changed = connection.execute(
+                """
+                UPDATE orch_runs
+                SET status = 'queued', session_id = ?, ready_at = ?,
+                    error_kind = NULL, error_message = NULL, finished_at = NULL,
+                    brief_id = ?, created_at = ?, version = version + 1
+                WHERE id = ? AND status = 'skipped'
+                  AND error_kind = 'failure_policy' AND started_at IS NULL
+                  AND version = ?
+                """,
+                (
+                    session_id,
+                    _stamp(ready_at or _now()),
+                    task.active_brief_id,
+                    reopened_at,
+                    run_id,
+                    int(row["version"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ConflictError(f"run {run_id} changed while it was being reopened")
+            self._append_event(
+                connection,
+                task_id=task.id,
+                aggregate_type="run",
+                aggregate_id=run_id,
+                event_type="run.reopened",
+                payload={
+                    "node_key": str(row["node_key"]),
+                    "attempt": int(row["attempt"]),
+                    "from": RunStatus.SKIPPED.value,
+                    "to": RunStatus.QUEUED.value,
+                    "reason": reason,
+                    "policy_controlled": True,
+                },
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"run_id": run_id})
+            return self._require_run(connection, run_id)
+
     def get_run(self, run_id: str) -> RunRecord:
         with self._read() as connection:
             return self._require_run(connection, run_id)
+
+    def append_run_activity(
+        self,
+        run_id: str,
+        lease_token: str,
+        fencing_token: int,
+        *,
+        event_key: str,
+        source_id: str,
+        kind: str,
+        status: str,
+        title: str,
+        summary: str = "",
+        detail: Optional[Mapping[str, Any]] = None,
+        created_at: Optional[datetime] = None,
+    ) -> RunActivityRecord:
+        """Append one safe live-activity row under the current run lease.
+
+        ``event_key`` makes protocol retries idempotent.  The hard per-run row cap
+        prevents a noisy vendor stream from growing orchestration.db without bound.
+        """
+
+        normalized_kind = str(kind).strip().lower()
+        normalized_status = str(status).strip().lower()
+        if normalized_kind not in RUN_ACTIVITY_KINDS:
+            raise ValueError(f"unsupported run activity kind: {kind}")
+        if normalized_status not in RUN_ACTIVITY_STATUSES:
+            raise ValueError(f"unsupported run activity status: {status}")
+        normalized_key = bounded_activity_text(event_key, 256).strip()
+        normalized_source = bounded_activity_text(source_id, 256).strip()
+        normalized_title = bounded_activity_text(title, 200).strip()
+        if not normalized_key or not normalized_source or not normalized_title:
+            raise ValueError("run activity requires event_key, source_id, and title")
+        normalized_summary = bounded_activity_text(summary, 4_096)
+        normalized_detail = sanitize_activity_detail(dict(detail or {}))
+        created = _stamp(created_at or _now())
+        activity_id = "activity_" + hashlib.sha256(
+            f"{run_id}\n{normalized_key}".encode("utf-8")
+        ).hexdigest()[:32]
+
+        with self._write() as connection:
+            run = self._require_run(connection, run_id)
+            self._require_lease(connection, run_id, lease_token, fencing_token)
+            existing = connection.execute(
+                "SELECT * FROM orch_run_activity WHERE run_id = ? AND event_key = ?",
+                (run_id, normalized_key),
+            ).fetchone()
+            if existing is not None:
+                return self._run_activity_from_row(existing)
+
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM orch_run_activity WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+            if count >= MAX_RUN_ACTIVITY_ROWS:
+                normalized_key = "openworker:activity_truncated"
+                normalized_source = "openworker:activity_stream"
+                normalized_kind = "lifecycle"
+                normalized_status = "info"
+                normalized_title = "Activity stream truncated"
+                normalized_summary = (
+                    f"Only the first {MAX_RUN_ACTIVITY_ROWS:,} activity records are retained."
+                )
+                normalized_detail = {"retained_limit": MAX_RUN_ACTIVITY_ROWS}
+                activity_id = "activity_" + hashlib.sha256(
+                    f"{run_id}\n{normalized_key}".encode("utf-8")
+                ).hexdigest()[:32]
+                existing = connection.execute(
+                    "SELECT * FROM orch_run_activity WHERE run_id = ? AND event_key = ?",
+                    (run_id, normalized_key),
+                ).fetchone()
+                if existing is not None:
+                    return self._run_activity_from_row(existing)
+
+            connection.execute(
+                """
+                INSERT INTO orch_run_activity(
+                    id, task_id, run_id, event_key, source_id, kind, status,
+                    title, summary, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    activity_id,
+                    run.task_id,
+                    run_id,
+                    normalized_key,
+                    normalized_source,
+                    normalized_kind,
+                    normalized_status,
+                    normalized_title,
+                    normalized_summary,
+                    _json(normalized_detail),
+                    created,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM orch_run_activity WHERE id = ?", (activity_id,)
+            ).fetchone()
+            assert row is not None
+            return self._run_activity_from_row(row)
+
+    def list_run_activity(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        before_sequence: Optional[int] = None,
+        newest: bool = False,
+        limit: int = 1_000,
+    ) -> tuple[RunActivityRecord, ...]:
+        """Return a bounded chronological page for one task-owned run."""
+
+        bounded = max(1, min(int(limit), 2_001))
+        params: list[Any] = [run_id, task_id, max(0, int(after_sequence))]
+        where = "run_id = ? AND task_id = ? AND sequence_no > ?"
+        if before_sequence is not None:
+            where += " AND sequence_no < ?"
+            params.append(max(1, int(before_sequence)))
+        params.append(bounded)
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            run = self._require_run(connection, run_id)
+            if run.task_id != task_id:
+                raise NotFoundError(f"run not found for task {task_id}: {run_id}")
+            rows = connection.execute(
+                f"""
+                SELECT * FROM orch_run_activity WHERE {where}
+                ORDER BY sequence_no {'DESC' if newest else 'ASC'} LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        if newest:
+            rows.reverse()
+        return tuple(self._run_activity_from_row(row) for row in rows)
 
     def list_runs(
         self,
@@ -1650,6 +5146,59 @@ class OrchestrationStore:
             ).fetchall()
         return tuple(self._run_from_row(row) for row in rows)
 
+    @staticmethod
+    def _queued_run_dependencies_ready(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> bool:
+        """Recheck the latest durable predecessors before granting a run lease.
+
+        The coordinator normally enqueues a node only after its dependencies settle.
+        A human-approved retry can enqueue several disputed verification attempts in
+        one pass, though, so a downstream retry may coexist briefly with its upstream
+        retry.  Claiming both in the same scheduler tick races the runtime projection
+        and can start the downstream verifier against stale evidence.
+        """
+
+        edges = connection.execute(
+            """
+            SELECT condition, required, from_node_id
+            FROM orch_edges
+            WHERE plan_id = ? AND to_node_id = ?
+            ORDER BY id
+            """,
+            (row["plan_id"], row["node_id"]),
+        ).fetchall()
+        if not edges:
+            return True
+        required = [edge for edge in edges if bool(edge["required"])]
+        applicable = required or edges
+        matches: list[bool] = []
+        for edge in applicable:
+            predecessor = connection.execute(
+                """
+                SELECT status
+                FROM orch_runs
+                WHERE plan_id = ? AND node_id = ?
+                ORDER BY attempt DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (row["plan_id"], edge["from_node_id"]),
+            ).fetchone()
+            if predecessor is None:
+                matches.append(False)
+                continue
+            status = RunStatus(predecessor["status"])
+            condition = EdgeCondition(edge["condition"])
+            if condition in {EdgeCondition.ALWAYS, EdgeCondition.TERMINAL}:
+                matches.append(status in _TERMINAL_RUN_STATUSES)
+            elif condition is EdgeCondition.SUCCESS:
+                matches.append(status is RunStatus.SUCCEEDED)
+            else:
+                matches.append(status in _FAILED_RUN_STATUSES)
+        if JoinPolicy(row["join_policy"]) is JoinPolicy.ALL:
+            return all(matches)
+        return any(matches)
+
     def claim_next_run(
         self,
         worker_id: str,
@@ -1676,10 +5225,10 @@ class OrchestrationStore:
             if replay is not None:
                 claim_payload = replay.get("claim")
                 return self._claim_from_payload(claim_payload) if claim_payload else None
-            row = connection.execute(
+            candidates = connection.execute(
                 """
                 SELECT r.*, n.node_key, n.concurrency_key, t.priority AS task_priority,
-                       t.max_parallel_runs
+                       t.max_parallel_runs, n.join_policy
                 FROM orch_runs r
                 JOIN orch_nodes n ON n.id = r.node_id
                 JOIN orch_tasks t ON t.id = r.task_id
@@ -1720,10 +5269,17 @@ class OrchestrationStore:
                 -- SQLite rowid preserves the committed insertion order for those ties.
                 ORDER BY r.priority DESC, t.priority DESC, r.ready_at, r.created_at,
                          r.rowid, r.id
-                LIMIT 1
                 """,
                 (_stamp(chosen_now),),
-            ).fetchone()
+            )
+            row = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if self._queued_run_dependencies_ready(connection, candidate)
+                ),
+                None,
+            )
             if row is None:
                 self._finish_command(connection, command_id, {"claim": None})
                 return None
@@ -1988,6 +5544,320 @@ class OrchestrationStore:
             command_id=command_id,
         )
 
+    def complete_run_structured(
+        self,
+        run_id: str,
+        lease_token: str,
+        fencing_token: int,
+        *,
+        output: Mapping[str, Any],
+        result: Mapping[str, Any],
+        created_by: str,
+        command_id: Optional[str] = None,
+    ) -> RunRecord:
+        """Atomically validate and persist a run's TCHP result and work products."""
+
+        command_id = self._command_id(command_id)
+        request = {
+            "run_id": run_id,
+            "lease_token": lease_token,
+            "fencing_token": int(fencing_token),
+            "output": dict(output),
+            "result": dict(result),
+            "created_by": str(created_by),
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "run.complete_structured", run_id, request
+            )
+            if replay is not None:
+                return self._require_run(connection, replay["run_id"])
+            run = self._require_run(connection, run_id)
+            self._require_lease(connection, run_id, lease_token, fencing_token)
+            if run.status not in {RunStatus.CLAIMED, RunStatus.RUNNING}:
+                raise ConflictError(f"run {run_id} is not active")
+            task = self._require_task(connection, run.task_id)
+            if task.status not in _RUN_SETTLEMENT_TASK_STATUSES:
+                raise ConflictError(
+                    f"run cannot succeed while task is {task.status.value}"
+                )
+            brief = self._require_brief(
+                connection, run.brief_id or task.active_brief_id  # type: ignore[arg-type]
+            )
+            summary = str(result.get("summary") or "").strip()
+            issues: list[dict[str, Any]] = []
+            if not summary:
+                issues.append(
+                    {
+                        "path": "summary",
+                        "code": "required",
+                        "message": "completion summary is required",
+                    }
+                )
+            allowed_results = {"pass", "fail", "unknown", "not_applicable"}
+            criterion_results = {
+                str(key): str(value).strip().lower()
+                for key, value in dict(result.get("criterion_results") or {}).items()
+            }
+            criteria = {
+                str(item.get("id") or ""): item
+                for item in brief.acceptance_criteria
+                if str(item.get("id") or "")
+            }
+            for criterion_id in sorted(set(criterion_results) - set(criteria)):
+                issues.append(
+                    {
+                        "path": f"criterion_results.{criterion_id}",
+                        "code": "unknown",
+                        "message": "criterion is not declared in the published Brief",
+                    }
+                )
+            for criterion_id, criterion in criteria.items():
+                value = criterion_results.get(criterion_id)
+                if value is not None and value not in allowed_results:
+                    issues.append(
+                        {
+                            "path": f"criterion_results.{criterion_id}",
+                            "code": "invalid",
+                            "message": "result must be pass, fail, unknown, or not_applicable",
+                        }
+                    )
+                if bool(criterion.get("required", True)) and value != "pass":
+                    issues.append(
+                        {
+                            "path": f"criterion_results.{criterion_id}",
+                            "code": "required_pass",
+                            "message": "required criterion must be reported as pass",
+                        }
+                    )
+            if issues:
+                raise HandoffValidationError(issues)
+
+            product_ids: list[str] = []
+            artifact_refs: list[str] = []
+            satisfied_deliverables: set[str] = set()
+            deliverables = {
+                str(item.get("id") or ""): item
+                for item in brief.deliverables
+                if str(item.get("id") or "")
+            }
+            for index, raw_product in enumerate(result.get("work_products") or ()):
+                if not isinstance(raw_product, Mapping):
+                    raise HandoffValidationError(
+                        (
+                            {
+                                "path": f"work_products[{index}]",
+                                "code": "invalid",
+                                "message": "work product must be an object",
+                            },
+                        )
+                    )
+                existing_id = str(
+                    raw_product.get("id") or raw_product.get("work_product_id") or ""
+                ).strip()
+                if existing_id:
+                    product = self._require_work_product(connection, existing_id)
+                    if product.task_id != task.id:
+                        raise ConflictError(
+                            "completion work product belongs to another task"
+                        )
+                else:
+                    metadata = dict(raw_product.get("metadata") or {})
+                    deliverable_id = str(
+                        raw_product.get("deliverable_id")
+                        or metadata.get("deliverable_id")
+                        or ""
+                    ).strip()
+                    if deliverable_id:
+                        metadata["deliverable_id"] = deliverable_id
+                    product = self._insert_work_product(
+                        connection,
+                        task_id=task.id,
+                        run_id=run.id,
+                        kind=WorkProductKind(str(raw_product.get("kind") or "other")),
+                        title=str(raw_product.get("title") or ""),
+                        summary=str(raw_product.get("summary") or ""),
+                        evidence_id=(
+                            str(raw_product["evidence_id"])
+                            if raw_product.get("evidence_id")
+                            else None
+                        ),
+                        artifact_id=(
+                            str(raw_product["artifact_id"])
+                            if raw_product.get("artifact_id")
+                            else None
+                        ),
+                        uri=(str(raw_product["uri"]) if raw_product.get("uri") else None),
+                        content_hash=(
+                            str(raw_product["content_hash"])
+                            if raw_product.get("content_hash")
+                            else None
+                        ),
+                        metadata=metadata,
+                        verification_status=str(
+                            raw_product.get("verification_status") or "unverified"
+                        ),
+                        created_by=str(created_by),
+                        command_id=command_id,
+                    )
+                product_ids.append(product.id)
+                product_deliverable = str(
+                    product.metadata.get("deliverable_id") or ""
+                ).strip()
+                if product_deliverable:
+                    satisfied_deliverables.add(product_deliverable)
+                else:
+                    matching = [
+                        identifier
+                        for identifier, deliverable in deliverables.items()
+                        if str(deliverable.get("kind") or "other")
+                        == product.kind.value
+                    ]
+                    if len(matching) == 1:
+                        satisfied_deliverables.add(matching[0])
+                if product.artifact_id:
+                    artifact_refs.append(product.artifact_id)
+                elif product.uri:
+                    artifact_refs.append(product.uri)
+            missing_deliverables = [
+                identifier
+                for identifier, deliverable in deliverables.items()
+                if bool(deliverable.get("required", True))
+                and identifier not in satisfied_deliverables
+            ]
+            if missing_deliverables:
+                raise HandoffValidationError(
+                    tuple(
+                        {
+                            "path": f"deliverables.{identifier}",
+                            "code": "missing_work_product",
+                            "message": "required deliverable has no linked work product",
+                        }
+                        for identifier in missing_deliverables
+                    )
+                )
+
+            now = _now()
+            result_envelope = {
+                "schema_version": 2,
+                "child_task_id": task.id,
+                "brief_revision": brief.revision,
+                "status": "completed",
+                "summary": summary[:16_000],
+                "criterion_results": criterion_results,
+                "work_product_refs": product_ids,
+                "artifact_refs": artifact_refs,
+                "remaining_risks": [
+                    str(item)[:2_000]
+                    for item in result.get("remaining_risks") or ()
+                    if str(item).strip()
+                ],
+                "follow_up_task_ids": [
+                    str(item)
+                    for item in result.get("follow_up_task_ids") or ()
+                    if str(item).strip()
+                ],
+                "completed_at": _stamp(now),
+            }
+            final_output = {
+                **dict(output),
+                "structured_result": dict(result),
+                "result": result_envelope,
+            }
+            changed = connection.execute(
+                """
+                UPDATE orch_runs
+                SET status = 'succeeded', output_json = ?, error_kind = NULL,
+                    error_message = NULL, finished_at = ?, version = version + 1
+                WHERE id = ? AND fencing_token = ? AND status IN ('claimed', 'running')
+                """,
+                (_json(final_output), _stamp(now), run_id, int(fencing_token)),
+            ).rowcount
+            if changed != 1:
+                raise LeaseConflict(f"run {run_id} lost its fencing token")
+            self._cancel_preparing_gates(
+                connection,
+                run_id=run.id,
+                task_id=run.task_id,
+                reason="run_succeeded",
+                now=_stamp(now),
+                command_id=command_id,
+            )
+            connection.execute(
+                "DELETE FROM orch_leases WHERE run_id = ? AND token = ?",
+                (run_id, lease_token),
+            )
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM orch_task_comments WHERE task_id = ?",
+                    (task.id,),
+                ).fetchone()[0]
+            )
+            comment_id = _id("comment")
+            connection.execute(
+                """
+                INSERT INTO orch_task_comments(
+                    id, task_id, sequence_no, author_type, author_id,
+                    created_by_run_id, body_markdown, metadata_json,
+                    reply_to_comment_id, created_at
+                ) VALUES (?, ?, ?, 'agent', ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    comment_id,
+                    task.id,
+                    sequence,
+                    str(created_by),
+                    run.id,
+                    f"Completed: {summary}"[:16_000],
+                    _json(
+                        {
+                            "kind": "completion",
+                            "criterion_results": criterion_results,
+                            "work_product_refs": product_ids,
+                        }
+                    ),
+                    _stamp(now),
+                ),
+            )
+            self._append_event(
+                connection,
+                task_id=task.id,
+                aggregate_type="task_comment",
+                aggregate_id=comment_id,
+                event_type="comment_added",
+                payload={
+                    "sequence": sequence,
+                    "author_type": "agent",
+                    "author_id": str(created_by),
+                    "completion": True,
+                },
+                command_id=command_id,
+            )
+            self._append_event(
+                connection,
+                task_id=task.id,
+                aggregate_type="run",
+                aggregate_id=run.id,
+                event_type="structured_result_submitted",
+                payload={
+                    "brief_revision": brief.revision,
+                    "work_product_refs": product_ids,
+                    "criterion_results": criterion_results,
+                },
+                command_id=command_id,
+            )
+            self._append_event(
+                connection,
+                task_id=task.id,
+                aggregate_type="run",
+                aggregate_id=run.id,
+                event_type="run.succeeded",
+                payload={"fencing_token": int(fencing_token), "error_kind": None},
+                command_id=command_id,
+            )
+            self._finish_command(connection, command_id, {"run_id": run.id})
+            return self._require_run(connection, run.id)
+
     def fail_run(
         self,
         run_id: str,
@@ -1997,6 +5867,7 @@ class OrchestrationStore:
         error_kind: str,
         error_message: str,
         status: RunStatus = RunStatus.FAILED,
+        output: Optional[Mapping[str, Any]] = None,
         command_id: Optional[str] = None,
     ) -> RunRecord:
         status = RunStatus(status)
@@ -2007,7 +5878,7 @@ class OrchestrationStore:
             lease_token,
             fencing_token,
             status=status,
-            output=None,
+            output=output,
             error_kind=error_kind,
             error_message=error_message,
             command_id=command_id,
@@ -2595,6 +6466,80 @@ class OrchestrationStore:
             )
             self._finish_command(connection, command_id, {"gate_id": gate_id})
             return self._require_gate(connection, gate_id)
+
+    def amend_task_gate_prompt(
+        self,
+        gate_id: str,
+        prompt: Mapping[str, Any],
+        *,
+        expected_version: Optional[int] = None,
+        command_id: Optional[str] = None,
+    ) -> GateRecord:
+        """Replace the prompt of an open lifecycle gate with an audited CAS write.
+
+        This is intentionally limited to task-owned gates. Run-owned interaction
+        prompts are part of a sealed Agent checkpoint and must never be rewritten.
+        The operation supports deterministic compatibility repairs when a newer
+        coordinator can safely offer an action that an older version omitted.
+        """
+
+        command_id = self._command_id(command_id)
+        request = {
+            "gate_id": gate_id,
+            "prompt": dict(prompt),
+            "expected_version": expected_version,
+        }
+        with self._write() as connection:
+            replay = self._start_command(
+                connection, command_id, "task_gate.prompt_amend", gate_id, request
+            )
+            if replay is not None:
+                return self._require_gate(connection, replay["gate_id"])
+            gate = self._require_gate(connection, gate_id)
+            effective_version = (
+                gate.version if expected_version is None else int(expected_version)
+            )
+            if gate.run_id is not None:
+                raise ConflictError(
+                    "run-owned gate prompts are sealed and cannot be amended"
+                )
+            if gate.status is not GateStatus.OPEN:
+                raise GateConflict(f"gate {gate_id} is already {gate.status.value}")
+            if gate.version != effective_version:
+                raise GateConflict(
+                    f"gate {gate_id} expected version {effective_version}, "
+                    f"found {gate.version}"
+                )
+            encoded = _json(prompt)
+            if encoded != _json(gate.prompt):
+                changed = connection.execute(
+                    """
+                    UPDATE orch_gates
+                    SET prompt_json = ?, version = version + 1
+                    WHERE id = ? AND run_id IS NULL AND status = 'open'
+                      AND version = ?
+                    """,
+                    (encoded, gate.id, effective_version),
+                ).rowcount
+                if changed != 1:
+                    raise GateConflict(
+                        f"gate {gate_id} changed while amending its prompt"
+                    )
+                self._append_event(
+                    connection,
+                    task_id=gate.task_id,
+                    aggregate_type="gate",
+                    aggregate_id=gate.id,
+                    event_type="gate.prompt_amended",
+                    payload={
+                        "kind": gate.kind.value,
+                        "source_key": gate.source_key,
+                        "actions": list(prompt.get("actions") or ()),
+                    },
+                    command_id=command_id,
+                )
+            self._finish_command(connection, command_id, {"gate_id": gate.id})
+            return self._require_gate(connection, gate.id)
 
     def prepare_run_gate(
         self,
@@ -3648,6 +7593,28 @@ class OrchestrationStore:
                 payload={"run_id": gate.run_id, "resolved_by": resolved_by},
                 command_id=command_id,
             )
+            checkpoint = {}
+            if gate.run_id:
+                resumed_run = self._require_run(connection, gate.run_id)
+                checkpoint = dict((resumed_run.output or {}).get("engine_checkpoint") or {})
+            self._enqueue_wake_connection(
+                connection,
+                target_task_id=gate.task_id,
+                target_run_id=gate.run_id,
+                reason=WakeReason.GATE_RESOLVED,
+                source_task_id=gate.task_id,
+                source_run_id=gate.run_id,
+                source_event_id=None,
+                payload={
+                    "gate_id": gate.id,
+                    "status": status.value,
+                    "response_delta": dict(resolution),
+                    "checkpoint_ref": checkpoint.get("blob_uri"),
+                },
+                dedupe_key=f"{gate.task_id}:{gate.run_id or 'current'}:gate_resolved:{gate.id}",
+                not_before=None,
+                command_id=command_id,
+            )
             self._finish_command(connection, command_id, {"gate_id": gate_id})
             return self._require_gate(connection, gate_id)
 
@@ -3789,6 +7756,25 @@ class OrchestrationStore:
                 (normalized, f"sha256:{normalized}"),
             ).fetchone()
         return self._evidence_from_row(row) if row is not None else None
+
+    def find_work_product_artifact(
+        self, digest: str
+    ) -> Optional[WorkProductRecord]:
+        """Resolve a blob referenced by an immutable Work Product."""
+
+        normalized = str(digest).strip().lower().removeprefix("sha256:")
+        uri = f"sha256:{normalized}"
+        with self._read() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM orch_work_products
+                WHERE artifact_id = ? OR uri = ?
+                   OR content_hash = ? OR content_hash = ?
+                ORDER BY created_at, id LIMIT 1
+                """,
+                (uri, uri, normalized, uri),
+            ).fetchone()
+        return self._work_product_from_row(row) if row is not None else None
 
     # -- append-only events and transactional outbox -----------------------
     def list_events(
@@ -4533,6 +8519,18 @@ class OrchestrationStore:
             raise NotFoundError(f"task not found: {task_id}")
         return self._task_from_row(row)
 
+    def _root_task_id_connection(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> str:
+        task = self._require_task(connection, task_id)
+        seen: set[str] = set()
+        while task.parent_task_id:
+            if task.id in seen:
+                raise IntegrityError("durable task parent cycle detected")
+            seen.add(task.id)
+            task = self._require_task(connection, task.parent_task_id)
+        return task.id
+
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> TaskRecord:
         return TaskRecord(
@@ -4565,7 +8563,226 @@ class OrchestrationStore:
             version=int(row["version"]),
             created_at=_time(row["created_at"]),  # type: ignore[arg-type]
             updated_at=_time(row["updated_at"]),  # type: ignore[arg-type]
+            active_brief_id=row["active_brief_id"],
         )
+
+    @staticmethod
+    def _brief_draft_from_row(row: sqlite3.Row) -> TaskBriefDraft:
+        return TaskBriefDraft(
+            title=row["title"],
+            objective=row["objective"],
+            background=row["background"],
+            scope=_load(row["scope_json"], {}),
+            instructions=tuple(_load(row["instructions_json"], [])),
+            constraints=tuple(_load(row["constraints_json"], [])),
+            non_goals=tuple(_load(row["non_goals_json"], [])),
+            acceptance_criteria=tuple(
+                _load(row["acceptance_criteria_json"], [])
+            ),
+            deliverables=tuple(_load(row["deliverables_json"], [])),
+            result_contract=_load(row["result_contract_json"], {}),
+        )
+
+    @classmethod
+    def _brief_from_row(cls, row: sqlite3.Row) -> TaskBriefRecord:
+        draft = cls._brief_draft_from_row(row)
+        return TaskBriefRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            revision=int(row["revision"]),
+            status=BriefStatus(row["status"]),
+            title=draft.title,
+            objective=draft.objective,
+            background=draft.background,
+            scope=draft.scope,
+            instructions=draft.instructions,
+            constraints=draft.constraints,
+            non_goals=draft.non_goals,
+            acceptance_criteria=draft.acceptance_criteria,
+            deliverables=draft.deliverables,
+            result_contract=draft.result_contract,
+            created_by_task_id=row["created_by_task_id"],
+            created_by_run_id=row["created_by_run_id"],
+            content_hash=row["content_hash"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+            published_at=_time(row["published_at"]),
+        )
+
+    def _require_brief(
+        self, connection: sqlite3.Connection, brief_id: str
+    ) -> TaskBriefRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_task_briefs WHERE id = ?", (brief_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"task brief not found: {brief_id}")
+        return self._brief_from_row(row)
+
+    @staticmethod
+    def _context_ref_from_row(row: sqlite3.Row) -> ContextRefRecord:
+        draft = ContextRefDraft(
+            requirement=row["requirement"],
+            ref_type=row["ref_type"],
+            display_name=row["display_name"],
+            summary=row["summary"],
+            selection_reason=row["selection_reason"],
+            locator=_load(row["locator_json"], {}),
+            delivery_mode=row["delivery_mode"],
+            mime_type=row["mime_type"],
+            content_hash=row["content_hash"],
+            byte_size=row["byte_size"],
+            token_estimate=row["token_estimate"],
+            provenance=_load(row["provenance_json"], {}),
+            trust_level=row["trust_level"],
+        )
+        return ContextRefRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            brief_id=row["brief_id"],
+            requirement=ContextRequirement(draft.requirement),
+            ref_type=ContextRefType(draft.ref_type),
+            display_name=draft.display_name,
+            summary=draft.summary,
+            selection_reason=draft.selection_reason,
+            locator=draft.locator,
+            delivery_mode=ContextDeliveryMode(draft.delivery_mode),
+            mime_type=draft.mime_type,
+            content_hash=draft.content_hash,
+            byte_size=draft.byte_size,
+            token_estimate=draft.token_estimate,
+            provenance=draft.provenance,
+            trust_level=draft.trust_level,
+            created_by_task_id=row["created_by_task_id"],
+            created_by_run_id=row["created_by_run_id"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+        )
+
+    def _require_context_ref(
+        self, connection: sqlite3.Connection, ref_id: str
+    ) -> ContextRefRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_context_refs WHERE id = ?", (ref_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"context reference not found: {ref_id}")
+        return self._context_ref_from_row(row)
+
+    @staticmethod
+    def _relation_from_row(row: sqlite3.Row) -> TaskRelationRecord:
+        return TaskRelationRecord(
+            id=row["id"],
+            from_task_id=row["from_task_id"],
+            to_task_id=row["to_task_id"],
+            relation_type=TaskRelationType(row["relation_type"]),
+            metadata=_load(row["metadata_json"], {}),
+            created_by_task_id=row["created_by_task_id"],
+            created_by_run_id=row["created_by_run_id"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+            removed_at=_time(row["removed_at"]),
+        )
+
+    def _require_relation(
+        self,
+        connection: sqlite3.Connection,
+        relation_id: str,
+        *,
+        include_removed: bool = False,
+    ) -> TaskRelationRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_task_relations WHERE id = ?", (relation_id,)
+        ).fetchone()
+        if row is None or (row["removed_at"] is not None and not include_removed):
+            raise NotFoundError(f"task relation not found: {relation_id}")
+        return self._relation_from_row(row)
+
+    @staticmethod
+    def _wake_from_row(row: sqlite3.Row) -> WakeRequestRecord:
+        return WakeRequestRecord(
+            id=row["id"],
+            target_task_id=row["target_task_id"],
+            target_run_id=row["target_run_id"],
+            reason=WakeReason(row["reason"]),
+            source_task_id=row["source_task_id"],
+            source_run_id=row["source_run_id"],
+            source_event_id=row["source_event_id"],
+            payload=_load(row["payload_json"], {}),
+            dedupe_key=row["dedupe_key"],
+            status=WakeStatus(row["status"]),
+            coalesced_count=int(row["coalesced_count"]),
+            attempts=int(row["attempts"]),
+            not_before=_time(row["not_before"]),  # type: ignore[arg-type]
+            claimed_by=row["claimed_by"],
+            claimed_until=_time(row["claimed_until"]),
+            last_error=row["last_error"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+            updated_at=_time(row["updated_at"]),  # type: ignore[arg-type]
+            delivered_at=_time(row["delivered_at"]),
+            completed_at=_time(row["completed_at"]),
+        )
+
+    def _require_wake(
+        self, connection: sqlite3.Connection, wake_id: str
+    ) -> WakeRequestRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_wake_requests WHERE id = ?", (wake_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"wake request not found: {wake_id}")
+        return self._wake_from_row(row)
+
+    @staticmethod
+    def _comment_from_row(row: sqlite3.Row) -> TaskCommentRecord:
+        return TaskCommentRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            sequence=int(row["sequence_no"]),
+            author_type=row["author_type"],
+            author_id=row["author_id"],
+            created_by_run_id=row["created_by_run_id"],
+            body_markdown=row["body_markdown"],
+            metadata=_load(row["metadata_json"], {}),
+            reply_to_comment_id=row["reply_to_comment_id"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+        )
+
+    def _require_comment(
+        self, connection: sqlite3.Connection, comment_id: str
+    ) -> TaskCommentRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_task_comments WHERE id = ?", (comment_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"task comment not found: {comment_id}")
+        return self._comment_from_row(row)
+
+    @staticmethod
+    def _work_product_from_row(row: sqlite3.Row) -> WorkProductRecord:
+        return WorkProductRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            kind=WorkProductKind(row["kind"]),
+            title=row["title"],
+            summary=row["summary"],
+            evidence_id=row["evidence_id"],
+            artifact_id=row["artifact_id"],
+            uri=row["uri"],
+            content_hash=row["content_hash"],
+            metadata=_load(row["metadata_json"], {}),
+            verification_status=row["verification_status"],
+            created_by=row["created_by"],
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
+        )
+
+    def _require_work_product(
+        self, connection: sqlite3.Connection, product_id: str
+    ) -> WorkProductRecord:
+        row = connection.execute(
+            "SELECT * FROM orch_work_products WHERE id = ?", (product_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"work product not found: {product_id}")
+        return self._work_product_from_row(row)
 
     @staticmethod
     def _stage_from_row(row: sqlite3.Row) -> StageHistoryRecord:
@@ -4694,6 +8911,24 @@ class OrchestrationStore:
             created_at=_time(row["created_at"]),  # type: ignore[arg-type]
             started_at=_time(row["started_at"]),
             finished_at=_time(row["finished_at"]),
+            brief_id=row["brief_id"],
+        )
+
+    @staticmethod
+    def _run_activity_from_row(row: sqlite3.Row) -> RunActivityRecord:
+        return RunActivityRecord(
+            sequence=int(row["sequence_no"]),
+            id=row["id"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            event_key=row["event_key"],
+            source_id=row["source_id"],
+            kind=row["kind"],
+            status=row["status"],
+            title=row["title"],
+            summary=row["summary"],
+            detail=_load(row["detail_json"], {}),
+            created_at=_time(row["created_at"]),  # type: ignore[arg-type]
         )
 
     def _require_lease(

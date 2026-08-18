@@ -7,6 +7,7 @@ import {
   type ApiRequest,
   type OrchestrationApi,
 } from "./api";
+import { TaskHandoffPanel, type HandoffPanelKind } from "./HandoffPanels";
 import type {
   AgentRole,
   AgentProfileSummary,
@@ -14,6 +15,7 @@ import type {
   AuditPage,
   AttentionAction,
   AttentionGate,
+  ContextRefInput,
   CreateOrchestrationTask,
   ModelPolicySummary,
   OrchestrationHealth,
@@ -22,6 +24,7 @@ import type {
   OutboxDeadLetter,
   RoutingModelDescriptor,
   RuntimePresetDescriptor,
+  RunActivity,
   RunTranscript,
   TaskEvidence,
   TaskNode,
@@ -43,9 +46,9 @@ import {
   StatusBadge,
 } from "./ui";
 
-type DetailTab = "graph" | "runs" | "evidence" | "activity";
+type DetailTab = "brief" | "context" | "dependencies" | "communication" | "products" | "wakes" | "graph" | "runs" | "evidence" | "activity";
 type GraphMode = "dag" | "list";
-type TaskAction = "submit" | "pause" | "resume" | "cancel" | "archive";
+type TaskAction = "submit" | "pause" | "resume" | "cancel" | "archive" | "restore";
 type TaskFilter = "active" | "finished" | "archived" | "all";
 
 const TASK_PAGE_SIZE = 20;
@@ -58,6 +61,8 @@ const ERROR_KIND_DISPLAY_LIMIT = 120;
 const ERROR_MESSAGE_DISPLAY_LIMIT = 1_600;
 const RECONCILIATION_RUN_DISPLAY_LIMIT = 8;
 const PRIMARY_ROLE_CONFLICT_MESSAGE = "Writable code tasks require a Worker primary profile. Turn on Read-only task or select a Worker profile.";
+const WRITABLE_DELIVERABLE_DEFAULT = "implementation_patch:Completed outcome";
+const READ_ONLY_DELIVERABLE_DEFAULT = "artifact:Read-only analysis report";
 
 const PROFILE_ROLE_GUIDANCE: Record<AgentRole, { responsibility: string; permission: string }> = {
   worker: {
@@ -181,6 +186,10 @@ export function OrchestrationSurface({
   const [transcript, setTranscript] = useState<RunTranscript | null>(null);
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [runActivity, setRunActivity] = useState<RunActivity[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [activityHasOlder, setActivityHasOlder] = useState(false);
   const [health, setHealth] = useState<OrchestrationHealth | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [deadLetters, setDeadLetters] = useState<OutboxDeadLetter[]>([]);
@@ -191,8 +200,13 @@ export function OrchestrationSurface({
   const [auditPageLoading, setAuditPageLoading] = useState<"attention" | "runs" | "evidence" | "">("");
   const [auditPageError, setAuditPageError] = useState<{ kind: "attention" | "runs" | "evidence"; message: string } | null>(null);
   const listRequestId = useRef(0);
+  const listInitialized = useRef(false);
   const detailRequestId = useRef(0);
   const transcriptRequestId = useRef(0);
+  const activityRequestId = useRef(0);
+  const activityInFlight = useRef(0);
+  const activityCursor = useRef(0);
+  const activityOldestCursor = useRef<number | null>(null);
   const healthRequestId = useRef(0);
   const requeueIntents = useRef(new Map<string, {
     actor: string;
@@ -201,11 +215,16 @@ export function OrchestrationSurface({
   }>());
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const runDetailsIdRef = useRef(runDetailsId);
+  runDetailsIdRef.current = runDetailsId;
 
   const loadTasks = useCallback(async () => {
     const requestId = ++listRequestId.current;
-    setLoadingList(true);
-    setListError(null);
+    const blocking = !listInitialized.current;
+    if (blocking) {
+      setLoadingList(true);
+      setListError(null);
+    }
     try {
       const next = await api.listTasks({
         ...(taskFilter === "all" ? {} : { statuses: TASK_FILTER_STATUSES[taskFilter] }),
@@ -216,11 +235,17 @@ export function OrchestrationSurface({
       setHasNextPage(next.length > TASK_PAGE_SIZE);
       const page = next.slice(0, TASK_PAGE_SIZE);
       setTasks(page);
+      listInitialized.current = true;
+      setListError(null);
       setSelectedId((current) => current || initialTaskId || page[0]?.id || "");
     } catch (error) {
-      if (listRequestId.current === requestId) setListError(errorMessage(error));
+      // Event-driven refreshes keep the last good page mounted. Replacing it with a
+      // loading/error panel for every outbox burst made the task list visibly flash.
+      if (listRequestId.current === requestId && blocking) {
+        setListError(errorMessage(error));
+      }
     } finally {
-      if (listRequestId.current === requestId) setLoadingList(false);
+      if (listRequestId.current === requestId && blocking) setLoadingList(false);
     }
   }, [api, initialTaskId, taskFilter, taskPage]);
 
@@ -476,6 +501,7 @@ export function OrchestrationSurface({
       resume: api.resumeTask,
       cancel: api.cancelTask,
       archive: api.archiveTask,
+      restore: api.restoreTask,
     }[action];
     const next = await operation(selectedId);
     setDetail(next);
@@ -511,6 +537,114 @@ export function OrchestrationSurface({
     }
   }, [api]);
 
+  const loadRunActivity = useCallback(async (
+    taskId: string,
+    runId: string,
+    reset = false,
+  ) => {
+    if (activityInFlight.current) return;
+    const requestId = ++activityRequestId.current;
+    activityInFlight.current = requestId;
+    const afterSequence = reset ? 0 : activityCursor.current;
+    setActivityLoading(true);
+    if (reset) setActivityError(null);
+    try {
+      const page = await api.getRunActivity(taskId, runId, {
+        ...(afterSequence ? { afterSequence } : {}),
+        latest: afterSequence === 0,
+        limit: 500,
+      });
+      if (
+        activityRequestId.current !== requestId
+        || selectedIdRef.current !== taskId
+        || runDetailsIdRef.current !== runId
+      ) return;
+      setRunActivity((current) => {
+        const merged = new Map<string, RunActivity>();
+        if (!reset) current.forEach((item) => merged.set(item.id, item));
+        page.activity.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()]
+          .sort((left, right) => left.sequence - right.sequence)
+          .slice(-5_001);
+      });
+      activityCursor.current = Math.max(
+        activityCursor.current,
+        ...page.activity.map((item) => item.sequence),
+      );
+      if (reset) {
+        setActivityHasOlder(page.has_more);
+        activityOldestCursor.current = page.activity[0]?.sequence ?? null;
+      }
+      setActivityError(null);
+    } catch (error) {
+      if (
+        activityRequestId.current === requestId
+        && selectedIdRef.current === taskId
+        && runDetailsIdRef.current === runId
+      ) {
+        setActivityError(errorMessage(error));
+      }
+    } finally {
+      if (activityInFlight.current === requestId) {
+        activityInFlight.current = 0;
+      }
+      if (
+        activityRequestId.current === requestId
+        && selectedIdRef.current === taskId
+        && runDetailsIdRef.current === runId
+      ) {
+        setActivityLoading(false);
+      }
+    }
+  }, [api]);
+
+  const loadOlderRunActivity = useCallback(async (taskId: string, runId: string) => {
+    const beforeSequence = activityOldestCursor.current;
+    if (activityInFlight.current || beforeSequence == null) return;
+    const requestId = ++activityRequestId.current;
+    activityInFlight.current = requestId;
+    setActivityLoading(true);
+    try {
+      const page = await api.getRunActivity(taskId, runId, {
+        beforeSequence,
+        latest: true,
+        limit: 500,
+      });
+      if (
+        activityRequestId.current !== requestId
+        || selectedIdRef.current !== taskId
+        || runDetailsIdRef.current !== runId
+      ) return;
+      setRunActivity((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        page.activity.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()]
+          .sort((left, right) => left.sequence - right.sequence)
+          .slice(-5_001);
+      });
+      activityOldestCursor.current = page.activity[0]?.sequence ?? beforeSequence;
+      setActivityHasOlder(page.has_more);
+      setActivityError(null);
+    } catch (error) {
+      if (
+        activityRequestId.current === requestId
+        && selectedIdRef.current === taskId
+        && runDetailsIdRef.current === runId
+      ) {
+        setActivityError(errorMessage(error));
+      }
+    } finally {
+      if (activityInFlight.current === requestId) activityInFlight.current = 0;
+      if (
+        activityRequestId.current === requestId
+        && selectedIdRef.current === taskId
+        && runDetailsIdRef.current === runId
+      ) {
+        setActivityLoading(false);
+      }
+    }
+  }, [api]);
+
   const viewRunDetails = (runId: string) => {
     if (!selectedId) return;
     transcriptRequestId.current += 1;
@@ -518,6 +652,14 @@ export function OrchestrationSurface({
     setTranscript(null);
     setTranscriptError(null);
     setTranscriptLoading(false);
+    activityRequestId.current += 1;
+    activityInFlight.current = 0;
+    activityCursor.current = 0;
+    activityOldestCursor.current = null;
+    setRunActivity([]);
+    setActivityError(null);
+    setActivityLoading(false);
+    setActivityHasOlder(false);
   };
 
   // The modal stores only the durable run id. Every fresh task-detail snapshot updates
@@ -527,6 +669,23 @@ export function OrchestrationSurface({
     if (!runDetailsId || !detail || detail.id !== selectedId) return;
     void loadRunTranscript(selectedId, runDetailsId);
   }, [detail, loadRunTranscript, runDetailsId, selectedId]);
+
+  useEffect(() => {
+    if (!runDetailsId || !selectedId) return;
+    activityCursor.current = 0;
+    activityOldestCursor.current = null;
+    setRunActivity([]);
+    setActivityHasOlder(false);
+    void loadRunActivity(selectedId, runDetailsId, true);
+    const timer = window.setInterval(() => {
+      void loadRunActivity(selectedId, runDetailsId);
+    }, 1_500);
+    return () => {
+      window.clearInterval(timer);
+      activityRequestId.current += 1;
+      activityInFlight.current = 0;
+    };
+  }, [loadRunActivity, runDetailsId, selectedId]);
 
   const runDetails = useMemo(
     () => runDetailsId && detail ? taskRuns(detail).find((run) => run.id === runDetailsId) : undefined,
@@ -539,6 +698,14 @@ export function OrchestrationSurface({
     setTranscript(null);
     setTranscriptError(null);
     setTranscriptLoading(false);
+    activityRequestId.current += 1;
+    activityInFlight.current = 0;
+    activityCursor.current = 0;
+    activityOldestCursor.current = null;
+    setRunActivity([]);
+    setActivityError(null);
+    setActivityLoading(false);
+    setActivityHasOlder(false);
   };
 
   return (
@@ -652,6 +819,7 @@ export function OrchestrationSurface({
             <ErrorNotice message={detailError} onRetry={() => void loadDetail(selectedId)} />
           ) : detail ? (
             <TaskDetailView
+              api={api}
               task={detail}
               resolving={loadingDetail}
               onResolve={resolveGate}
@@ -678,6 +846,12 @@ export function OrchestrationSurface({
           transcript={transcript}
           loading={transcriptLoading}
           error={transcriptError}
+          activity={runActivity}
+          activityLoading={activityLoading}
+          activityError={activityError}
+          activityHasOlder={activityHasOlder}
+          onRefreshActivity={() => void loadRunActivity(selectedId, runDetailsId)}
+          onLoadOlderActivity={() => void loadOlderRunActivity(selectedId, runDetailsId)}
           onClose={closeRunDetails}
         />
       )}
@@ -828,6 +1002,16 @@ function CreateTaskForm({
   const [idempotencyKey] = useState(() => createClientIdempotencyKey("task-create"));
   const [criteria, setCriteria] = useState("");
   const [constraints, setConstraints] = useState("");
+  const [background, setBackground] = useState("");
+  const [includedScope, setIncludedScope] = useState("");
+  const [excludedScope, setExcludedScope] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [nonGoals, setNonGoals] = useState("");
+  const [deliverables, setDeliverables] = useState(WRITABLE_DELIVERABLE_DEFAULT);
+  const [contextRefs, setContextRefs] = useState<ContextRefInput[]>([]);
+  const [contextPath, setContextPath] = useState("");
+  const [contextReason, setContextReason] = useState("");
+  const [wizardStep, setWizardStep] = useState(1);
   const [requireReview, setRequireReview] = useState(false);
   const [requireTests, setRequireTests] = useState(false);
   const [profiles, setProfiles] = useState<AgentProfileSummary[]>([]);
@@ -847,6 +1031,18 @@ function CreateTaskForm({
   useEffect(() => {
     if (initialWorkspace) setWorkspace((current) => current || initialWorkspace);
   }, [initialWorkspace]);
+
+  useEffect(() => {
+    setDeliverables((current) => {
+      if (readOnly && current === WRITABLE_DELIVERABLE_DEFAULT) {
+        return READ_ONLY_DELIVERABLE_DEFAULT;
+      }
+      if (!readOnly && current === READ_ONLY_DELIVERABLE_DEFAULT) {
+        return WRITABLE_DELIVERABLE_DEFAULT;
+      }
+      return current;
+    });
+  }, [readOnly]);
 
   useEffect(() => {
     let active = true;
@@ -924,13 +1120,24 @@ function CreateTaskForm({
   const presetUnavailable = Boolean(selectedPreset && (selectedPreset.available === false || presetUnavailableRuntimeIds.length > 0));
 
   const lines = (value: string) => value.split("\n").map((item) => item.trim()).filter(Boolean);
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
+  const submit = async (event: FormEvent | null, publishAndStart = true) => {
+    event?.preventDefault();
     if (!objective.trim()) return;
     if (writableCodeRoleConflict) return;
     setSubmitting(true);
     setError(null);
     try {
+      const criterionLines = lines(criteria);
+      const deliverableRows = lines(deliverables).map((item, index) => {
+        const [kind, ...titleParts] = item.split(":");
+        return {
+          id: `deliverable-${index + 1}`,
+          kind: kind.trim() || "other",
+          title: titleParts.join(":").trim() || item,
+          required: true,
+        };
+      });
+      const briefTitle = title.trim() || objective.trim().slice(0, 120);
       await onCreate({
         idempotency_key: idempotencyKey,
         ...(title.trim() ? { title: title.trim() } : {}),
@@ -940,7 +1147,7 @@ function CreateTaskForm({
         ...(domain === "code" && workspace.trim()
           ? { workspace: workspace.trim() }
           : {}),
-        acceptance_criteria: lines(criteria),
+        acceptance_criteria: criterionLines,
         constraints: lines(constraints),
         profile_id: profileId,
         model_policy_id: policyId,
@@ -951,7 +1158,41 @@ function CreateTaskForm({
             : {}),
         require_review: Boolean(runtimePresetId) || requireReview,
         require_tests: Boolean(runtimePresetId) || requireTests,
-        auto_start: true,
+        auto_start: publishAndStart,
+        publish_brief: publishAndStart,
+        brief: {
+          title: briefTitle,
+          objective: objective.trim(),
+          background: background.trim(),
+          scope: {
+            domain,
+            include: lines(includedScope),
+            exclude: lines(excludedScope),
+            ...(lines(includedScope).length === 0 ? {
+              whole_task: true,
+              reason: "The root Brief objective defines the bounded task scope.",
+            } : {}),
+            ...(domain === "code" && workspace.trim() ? { workspace: workspace.trim() } : {}),
+          },
+          instructions: lines(instructions).length
+            ? lines(instructions)
+            : ["Complete the objective within the declared scope and provide attributable verification."],
+          constraints: lines(constraints),
+          non_goals: lines(nonGoals),
+          acceptance_criteria: (criterionLines.length ? criterionLines : ["The requested outcome is complete and verified."]).map((text, index) => ({
+            id: `criterion-${index + 1}`,
+            text,
+            required: true,
+            verification: "Provide attributable evidence in the structured result.",
+          })),
+          deliverables: deliverableRows.length ? deliverableRows : [{ id: "deliverable-1", kind: "other", title: "Completed outcome", required: true }],
+          result_contract: {
+            schema_id: readOnly ? "analysis_result_v1" : "implementation_result_v1",
+            schema_version: 1,
+            required_fields: ["summary", "criterion_results", "work_products", "risks"],
+          },
+        },
+        context_refs: contextRefs,
       });
     } catch (caught) {
       setError(errorMessage(caught));
@@ -961,12 +1202,25 @@ function CreateTaskForm({
   };
 
   return (
-    <form className={`${CARD} mx-auto max-w-3xl p-5`} onSubmit={(event) => void submit(event)} data-testid="create-orchestration-task">
+    <form className={`${CARD} mx-auto max-w-3xl p-5`} onSubmit={(event) => void submit(event, true)} data-testid="create-orchestration-task">
       <SectionHead title="New orchestrated task" />
       <p className="-mt-1 mb-4 text-[12px] leading-relaxed text-muted">
         The coordinator will score complexity, clarify ambiguity, freeze a DAG, isolate execution/review/testing, and request formal acceptance when policy requires it.
       </p>
       {error && <ErrorNotice message={error} />}
+      <nav className="mb-4 grid grid-cols-5 gap-1 rounded-xl border border-line bg-paper p-1" aria-label="Create task wizard">
+        {["Goal", "Brief", "Context", "Execution", "Preview"].map((label, index) => (
+          <button
+            key={label}
+            type="button"
+            className={`rounded-lg px-2 py-1.5 text-[10.5px] ${wizardStep === index + 1 ? "bg-panel font-semibold text-accent shadow-sm" : "text-muted hover:text-ink"}`}
+            aria-current={wizardStep === index + 1 ? "step" : undefined}
+            onClick={() => setWizardStep(index + 1)}
+          >
+            {index + 1}. {label}
+          </button>
+        ))}
+      </nav>
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="sm:col-span-2">
           <span className="mb-1 block text-[11.5px] font-medium text-muted">Objective</span>
@@ -1156,6 +1410,35 @@ function CreateTaskForm({
           <textarea className={`${INPUT} min-h-28 resize-y`} value={constraints} onChange={(event) => setConstraints(event.target.value)} />
         </label>
       </div>
+      {wizardStep === 2 && (
+        <section className={`${CARD} mt-4 grid gap-3 bg-paper p-4 sm:grid-cols-2`} aria-label="Structured Brief fields">
+          <div className="sm:col-span-2"><SectionHead title="Step 2 · Structured Brief" /></div>
+          <label className="sm:col-span-2"><span className="mb-1 block text-[11.5px] font-medium text-muted">Background</span><textarea className={`${INPUT} min-h-20 resize-y`} value={background} onChange={(event) => setBackground(event.target.value)} /></label>
+          <label><span className="mb-1 block text-[11.5px] font-medium text-muted">Included paths/components · one per line</span><textarea className={`${INPUT} min-h-24 resize-y`} value={includedScope} onChange={(event) => setIncludedScope(event.target.value)} /></label>
+          <label><span className="mb-1 block text-[11.5px] font-medium text-muted">Excluded paths/components · one per line</span><textarea className={`${INPUT} min-h-24 resize-y`} value={excludedScope} onChange={(event) => setExcludedScope(event.target.value)} /></label>
+          <label><span className="mb-1 block text-[11.5px] font-medium text-muted">Ordered instructions · one per line</span><textarea className={`${INPUT} min-h-24 resize-y`} value={instructions} onChange={(event) => setInstructions(event.target.value)} /></label>
+          <label><span className="mb-1 block text-[11.5px] font-medium text-muted">Non-goals · one per line</span><textarea className={`${INPUT} min-h-24 resize-y`} value={nonGoals} onChange={(event) => setNonGoals(event.target.value)} /></label>
+          <label className="sm:col-span-2"><span className="mb-1 block text-[11.5px] font-medium text-muted">Deliverables · kind:title, one per line</span><textarea className={`${INPUT} min-h-20 resize-y`} value={deliverables} onChange={(event) => setDeliverables(event.target.value)} /></label>
+          <div className="sm:col-span-2 grid grid-cols-4 gap-2 text-[10px]">
+            {([['Objective', Boolean(objective.trim())], ['Scope', true], ['Criteria', Boolean(lines(criteria).length)], ['Deliverables', Boolean(lines(deliverables).length)]] as Array<[string, boolean]>).map(([label, complete]) => <span key={label} className={`rounded-lg border px-2 py-1.5 ${complete ? "border-okLine bg-okSoft text-ok" : "border-warnInk/20 bg-warnSoft text-warnInk"}`}>{complete ? "✓" : "○"} {label}</span>)}
+          </div>
+        </section>
+      )}
+      {wizardStep === 3 && (
+        <section className={`${CARD} mt-4 bg-paper p-4`} aria-label="Context picker">
+          <SectionHead title="Step 3 · Context manifest" aside={<span className="text-[10.5px] text-muted">{contextRefs.length} refs · on-demand by default</span>} />
+          <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]"><input className={INPUT} aria-label="New context path" placeholder="Workspace-relative file path" value={contextPath} onChange={(event) => setContextPath(event.target.value)} /><input className={INPUT} aria-label="New context selection reason" placeholder="Selection reason" value={contextReason} onChange={(event) => setContextReason(event.target.value)} /><button type="button" className={BUTTON} disabled={!contextPath.trim() || !contextReason.trim()} onClick={() => { setContextRefs((current) => [...current, { requirement: "recommended", ref_type: "file", display_name: contextPath.trim(), selection_reason: contextReason.trim(), locator: { relative_path: contextPath.trim() }, delivery_mode: "on_demand", trust_level: "operator_provided" }]); setContextPath(""); setContextReason(""); }}>Add ref</button></div>
+          <div className="mt-3 space-y-1.5">{contextRefs.map((ref, index) => <div key={`${ref.display_name}-${index}`} className="flex items-center gap-2 rounded-lg border border-line bg-panel px-3 py-2 text-[11px]"><StatusBadge status={ref.requirement} /><span className="min-w-0 flex-1 truncate">{ref.display_name}</span><span className="text-faint">{humanize(ref.delivery_mode || "on_demand")}</span><button type="button" className={DANGER_BUTTON} onClick={() => setContextRefs((current) => current.filter((_, itemIndex) => itemIndex !== index))}>Remove</button></div>)}</div>
+          <p className="mt-3 text-[10.5px] leading-relaxed text-muted">Only metadata enters the initial envelope. File bodies remain outside the prompt until an explicit read.</p>
+        </section>
+      )}
+      {wizardStep === 4 && <div className={`${CARD} mt-4 bg-paper p-4 text-[11.5px] text-muted`}><SectionHead title="Step 4 · Execution" />The profile, routing policy, role-aware preset, workspace boundary, review, and test controls above define the frozen execution policy.</div>}
+      {wizardStep === 5 && (
+        <section className={`${CARD} mt-4 bg-paper p-4`} aria-label="Execution envelope preview">
+          <SectionHead title="Step 5 · ExecutionEnvelope preview" />
+          <dl className="grid gap-2 text-[11.5px] sm:grid-cols-[10rem_1fr]"><dt className="text-faint">Brief</dt><dd className="text-ink">{title.trim() || objective.trim().slice(0, 120) || "Incomplete"}</dd><dt className="text-faint">Context manifest</dt><dd className="text-ink">{contextRefs.length} refs; contents excluded</dd><dt className="text-faint">Role/profile</dt><dd className="text-ink">{selectedProfileRole ? humanize(selectedProfileRole) : "Unknown"} · {profileId}</dd><dt className="text-faint">Runtime</dt><dd className="text-ink">{runtimePresetId || requestedModel || "Automatic"}</dd><dt className="text-faint">Expected products</dt><dd className="text-ink">{lines(deliverables).join(", ") || "Incomplete"}</dd></dl>
+        </section>
+      )}
       {catalogError && <div className="mt-2 text-[11px] text-warnInk">Profiles and policies could not be refreshed; built-in defaults will be used. {catalogError}</div>}
       <div className="mt-3 flex flex-wrap gap-4 text-[11.5px] text-muted">
         <label className="flex items-center gap-2"><input type="checkbox" checked={Boolean(runtimePresetId) || requireReview} disabled={Boolean(runtimePresetId)} onChange={(event) => setRequireReview(event.target.checked)} /> Require reviewer</label>
@@ -1163,6 +1446,9 @@ function CreateTaskForm({
       </div>
       <div className="mt-5 flex justify-end gap-2">
         <button type="button" className={BUTTON} disabled={submitting} onClick={onCancel}>Cancel</button>
+        <button type="button" className={BUTTON} disabled={submitting || !objective.trim() || writableCodeRoleConflict} onClick={() => void submit(null, false)}>
+          {submitting ? "Saving…" : "Save draft"}
+        </button>
         <button type="submit" className={PRIMARY_BUTTON} disabled={submitting || !objective.trim() || presetUnavailable || writableCodeRoleConflict}>
           {submitting ? "Creating…" : "Create and start"}
         </button>
@@ -1189,7 +1475,7 @@ function TaskRow({ task, selected, onSelect }: { task: OrchestrationTaskSummary;
       </div>
       <div className="mt-1 flex items-center gap-1.5">
         <StatusBadge status={task.status} />
-        <span className="truncate text-[10.5px] text-faint">{humanize(task.stage)}</span>
+        <span className="truncate text-[10.5px] text-faint">{task.stage === "archive" ? (task.status === "running" ? "Finalizing" : "Finalized") : humanize(task.stage)}</span>
         <span className="ml-auto shrink-0 text-[10px] text-faint">{formatTime(task.updated_at)}</span>
       </div>
     </button>
@@ -1197,6 +1483,7 @@ function TaskRow({ task, selected, onSelect }: { task: OrchestrationTaskSummary;
 }
 
 function TaskDetailView({
+  api,
   task,
   resolving,
   onResolve,
@@ -1213,6 +1500,7 @@ function TaskDetailView({
   onLoadOlderRuns,
   onLoadOlderEvidence,
 }: {
+  api: OrchestrationApi;
   task: OrchestrationTaskDetail;
   resolving: boolean;
   onResolve: (
@@ -1239,17 +1527,34 @@ function TaskDetailView({
   const [graphMode, setGraphMode] = useState<GraphMode>("dag");
   const [actionBusy, setActionBusy] = useState<TaskAction | "">("");
   const [actionError, setActionError] = useState<string | null>(null);
+  const workProductCount = task.handoff_summary?.work_products?.count || 0;
+  const previousTaskState = useRef({ id: "", status: "" });
   useEffect(() => {
-    setTab("graph");
-    setActionBusy("");
-    setActionError(null);
-  }, [task.id]);
+    const previous = previousTaskState.current;
+    const switchedTask = previous.id !== task.id;
+    const resultBecameReady = (
+      previous.id === task.id
+      && previous.status !== task.status
+      && ["completed", "archived"].includes(task.status)
+    );
+    if (switchedTask || resultBecameReady) {
+      setTab(
+        ["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0
+          ? "products"
+          : "graph",
+      );
+      setActionBusy("");
+      setActionError(null);
+    }
+    previousTaskState.current = { id: task.id, status: task.status };
+  }, [task.id, task.status, workProductCount]);
   const pendingAttention = (task.attention || []).filter((gate) => gate.status === "pending");
   const canSubmit = task.status === "draft";
   const canPause = ["queued", "running", "waiting_human"].includes(task.status);
   const canResume = ["paused", "blocked", "needs_reconciliation"].includes(task.status);
   const canCancel = !["completed", "failed", "canceled", "cancelled", "archived", "canceling"].includes(task.status);
   const canArchive = ["completed", "failed", "canceled", "cancelled"].includes(task.status);
+  const canRestore = task.status === "archived" && task.terminal_outcome === "completed";
 
   const act = async (action: TaskAction) => {
     if (action === "cancel" && !window.confirm("Cancel this task and all active descendants?")) return;
@@ -1271,10 +1576,20 @@ function TaskDetailView({
           <div className="min-w-0 flex-1">
             <div className="mb-1.5 flex items-center gap-2">
               <StatusBadge status={task.status} />
+              {task.handoff_summary?.protocol === "legacy" && <StatusBadge status="draft" label="Legacy handoff" />}
+              {!!task.handoff_summary?.wakes?.pending && <StatusBadge status="pending" label={`${task.handoff_summary.wakes.pending} pending wake${task.handoff_summary.wakes.pending === 1 ? "" : "s"}`} />}
+              {!!task.handoff_summary?.wakes?.failed && <button onClick={() => setTab("wakes")}><StatusBadge status="failed" label={`${task.handoff_summary.wakes.failed} failed wake${task.handoff_summary.wakes.failed === 1 ? "" : "s"}`} /></button>}
               <span className="text-[11px] text-faint">Updated {formatTime(task.updated_at)}</span>
             </div>
             <h1 className="truncate text-[20px] font-semibold tracking-[-0.01em] text-ink">{task.title}</h1>
             {task.objective && <p className="mt-1 max-w-3xl text-[12.5px] leading-relaxed text-muted">{task.objective}</p>}
+            <div className="mt-1 flex flex-wrap gap-2 text-[10.5px] text-faint">
+              <code>{task.id}</code>
+              {task.status === "waiting_child" && <span>Waiting for {(task.children || []).filter((child) => !["completed", "failed", "canceled", "archived"].includes(child.status)).length} active child task(s)</span>}
+              {task.status === "blocked" && <button className="text-accent" onClick={() => setTab("dependencies")}>Open blocker details</button>}
+              {task.status === "waiting_human" && <span>Waiting on {pendingAttention.map((gate) => humanize(gate.kind)).join(", ") || "operator input"}</span>}
+              {task.status === "needs_reconciliation" && <button className="text-accent" onClick={() => setTab("wakes")}>Open wake diagnostics</button>}
+            </div>
           </div>
           <div className="flex shrink-0 flex-wrap justify-end gap-2">
             {canSubmit && <button className={PRIMARY_BUTTON} disabled={!!actionBusy} onClick={() => void act("submit")}>{actionBusy === "submit" ? "Starting…" : "Start"}</button>}
@@ -1282,9 +1597,11 @@ function TaskDetailView({
             {canResume && <button className={PRIMARY_BUTTON} disabled={!!actionBusy} onClick={() => void act("resume")}>{actionBusy === "resume" ? "Resuming…" : "Resume"}</button>}
             {canCancel && <button className={DANGER_BUTTON} aria-label="Cancel task" disabled={!!actionBusy} onClick={() => void act("cancel")}>{actionBusy === "cancel" ? "Canceling…" : "Cancel"}</button>}
             {canArchive && <button className={BUTTON} disabled={!!actionBusy} onClick={() => void act("archive")}>{actionBusy === "archive" ? "Archiving…" : "Archive"}</button>}
+            {canRestore && <button className={PRIMARY_BUTTON} disabled={!!actionBusy} onClick={() => void act("restore")}>{actionBusy === "restore" ? "Restoring…" : "Restore to Completed"}</button>}
             <button className={BUTTON} disabled={resolving || !!actionBusy} onClick={onRefresh}>
               <Icon name="refresh" size={13} /> Refresh
             </button>
+            <button className={BUTTON} onClick={() => void navigator.clipboard?.writeText(task.id)}>Copy task ID</button>
           </div>
         </div>
         {actionError && <div className="mt-3"><ErrorNotice message={actionError} /></div>}
@@ -1311,6 +1628,30 @@ function TaskDetailView({
       </header>
 
       <StageTimeline current={task.stage} taskStatus={task.status} states={task.stages} />
+
+      {["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0 && (
+        <section
+          className="mt-4 flex flex-wrap items-center gap-3 rounded-xl2 border border-okLine bg-okSoft px-4 py-3"
+          aria-label="Completed results"
+          data-testid="completed-results-banner"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="text-[12.5px] font-medium text-ink">
+              Final result is ready
+            </div>
+            <div className="mt-0.5 text-[11px] text-muted">
+              {task.status === "waiting_human"
+                ? `The declared deliverable and ${workProductCount} preserved work product${workProductCount === 1 ? "" : "s"} remain available while a decision is pending.`
+                : task.status === "archived"
+                  ? "This successfully completed result was filed in Archive. Restore it to keep it in the Completed list."
+                  : `The declared deliverable is ready, with ${workProductCount} immutable work product${workProductCount === 1 ? "" : "s"} retained as evidence.`}
+            </div>
+          </div>
+          <button className={PRIMARY_BUTTON} onClick={() => setTab("products")}>
+            View final result
+          </button>
+        </section>
+      )}
 
       {(!!task.children?.length || task.children_page?.truncated) && (
         <section className="mt-4" aria-label="Child agents">
@@ -1365,8 +1706,14 @@ function TaskDetailView({
         />
       )}
 
-      <div className="mt-5 flex items-center border-b border-line">
+      <div className="mt-5 flex items-center overflow-x-auto border-b border-line">
         {([
+          ["brief", "Brief", task.brief?.revision || 0],
+          ["context", "Context", task.handoff_summary?.context?.ref_count || 0],
+          ["dependencies", "Dependencies", Object.values(task.handoff_summary?.relations || {}).reduce((sum, value) => sum + Number(value || 0), 0)],
+          ["communication", "Communication", task.handoff_summary?.comments?.count || 0],
+          ["products", "Results", task.handoff_summary?.work_products?.count || 0],
+          ["wakes", "Wakes", task.handoff_summary?.wakes?.count || 0],
           ["graph", "Work graph", task.nodes?.length || 0],
           ["runs", "Agent runs", taskRuns(task).length],
           ["evidence", "Evidence", task.evidence?.length || 0],
@@ -1380,7 +1727,7 @@ function TaskDetailView({
           return (
           <button
             key={value}
-            className={`border-b-2 px-3 py-2 text-[12.5px] ${
+            className={`shrink-0 border-b-2 px-3 py-2 text-[12.5px] ${
               tab === value ? "border-accent font-medium text-accent" : "border-transparent text-muted hover:text-ink"
             }`}
             onClick={() => setTab(value)}
@@ -1392,6 +1739,17 @@ function TaskDetailView({
       </div>
 
       <div className="py-4">
+        {(["brief", "context", "dependencies", "communication", "products", "wakes"] as HandoffPanelKind[]).includes(tab as HandoffPanelKind) && (
+          <TaskHandoffPanel
+            key={`${task.id}:${tab}`}
+            api={api}
+            task={task}
+            kind={tab as HandoffPanelKind}
+            onTaskRefresh={onRefresh}
+            apiDownload={apiDownload}
+            onSelectTask={onSelectTask}
+          />
+        )}
         {tab === "graph" && (
           <WorkGraph nodes={task.nodes || []} mode={graphMode} onModeChange={setGraphMode} />
         )}
@@ -1620,7 +1978,7 @@ function AcceptanceGateDetails({ gate }: { gate: AttentionGate }) {
                   </span>
                   <AcceptanceStatus status={report.status} />
                 </div>
-                {report.summary && <p className="mt-1 text-[10.5px] leading-relaxed text-muted">{report.summary}</p>}
+                {report.summary && <p className="mt-1 whitespace-pre-wrap break-words text-[10.5px] leading-relaxed text-muted">{report.summary}</p>}
                 {report.findings.length > 0 && (
                   <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[10.5px] text-muted">
                     {report.findings.map((finding, findingIndex) => <li key={`${findingIndex}:${finding}`}>{finding}</li>)}
@@ -1869,11 +2227,11 @@ function RunTreeNode({
       <button
         type="button"
         className="mr-2 mt-2 shrink-0 rounded px-2 py-1 text-[10.5px] text-accent hover:bg-accentSoft"
-        aria-label="View run transcript"
-        title={`View transcript for ${displayTitle}`}
+        aria-label="View Agent progress"
+        title={`View live progress for ${displayTitle}`}
         onClick={() => onViewRun(run.id)}
       >
-        Transcript
+        Progress
       </button>
       </div>
       {children.map((child) => (
@@ -2087,12 +2445,52 @@ function ActivityList({ task }: { task: OrchestrationTaskDetail }) {
   );
 }
 
+function groupedRunActivity(items: RunActivity[]): RunActivity[] {
+  const grouped = new Map<string, RunActivity>();
+  for (const item of items.filter((candidate) => candidate.kind !== "usage")) {
+    const canCombine = item.kind === "tool"
+      || item.kind === "reasoning_summary"
+      || item.detail.content_withheld === true;
+    const key = canCombine ? `${item.kind}:${item.source_id}` : item.id;
+    const current = grouped.get(key);
+    if (!current) {
+      grouped.set(key, { ...item, detail: { ...item.detail } });
+      continue;
+    }
+    const summary = item.kind === "reasoning_summary"
+      ? `${current.summary}${item.summary}`
+      : item.summary || current.summary;
+    grouped.set(key, {
+      ...current,
+      sequence: item.sequence,
+      status: item.status,
+      title: item.title || current.title,
+      summary,
+      detail: { ...current.detail, ...item.detail },
+      created_at: item.created_at,
+    });
+  }
+  return [...grouped.values()].sort((left, right) => left.sequence - right.sequence);
+}
+
+function activityDetailText(value: unknown): string {
+  if (typeof value === "string") return value;
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized === undefined ? String(value ?? "") : serialized;
+}
+
 function RunDetailsModal({
   runId,
   run,
   transcript,
   loading,
   error,
+  activity,
+  activityLoading,
+  activityError,
+  activityHasOlder,
+  onRefreshActivity,
+  onLoadOlderActivity,
   onClose,
 }: {
   runId: string;
@@ -2100,6 +2498,12 @@ function RunDetailsModal({
   transcript: RunTranscript | null;
   loading: boolean;
   error: string | null;
+  activity: RunActivity[];
+  activityLoading: boolean;
+  activityError: string | null;
+  activityHasOlder: boolean;
+  onRefreshActivity: () => void;
+  onLoadOlderActivity: () => void;
   onClose: () => void;
 }) {
   const content = (value: unknown) => {
@@ -2117,12 +2521,22 @@ function RunDetailsModal({
     ["Started", run?.started_at ? formatTime(run.started_at) : undefined],
     ["Completed", run?.completed_at ? formatTime(run.completed_at) : undefined],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
+  const timeline = useMemo(() => groupedRunActivity(activity), [activity]);
+  const latestUsage = [...activity].reverse().find((item) => item.kind === "usage");
+  const totalTokens = Number(latestUsage?.detail.total_tokens || 0);
+  const inputTokens = Number(latestUsage?.detail.input_tokens || 0);
+  const cachedTokens = Number(latestUsage?.detail.cached_input_tokens || 0);
+  const outputTokens = Number(latestUsage?.detail.output_tokens || 0);
+  const tokenLimit = Number(run?.budget?.tokens || 0);
+  const hasTokenLimit = Boolean(run?.budget && tokenLimit > 0);
+  const completedTools = timeline.filter((item) => item.kind === "tool" && item.status === "completed").length;
+  const activeSteps = timeline.filter((item) => item.status === "running" || item.status === "pending").length;
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-6" role="dialog" aria-modal="true" aria-label="Agent run details">
       <section className="flex max-h-[88vh] w-full max-w-4xl flex-col rounded-xl border border-line bg-panel shadow-xl">
         <header className="flex items-center gap-3 border-b border-line px-4 py-3">
           <div className="min-w-0 flex-1">
-            <div className="mb-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-faint">Agent run details</div>
+            <div className="mb-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-faint">Agent progress and run details</div>
             <div className="flex min-w-0 items-center gap-2">
               <h3 className="truncate text-[13.5px] font-semibold text-ink">{run?.title || transcript?.title || "Agent run"}</h3>
               {run && <StatusBadge status={run.status} />}
@@ -2154,6 +2568,128 @@ function RunDetailsModal({
             {run && <RunDiagnostic run={run} />}
           </section>
 
+          <section className="mt-4 border-t border-line pt-4" aria-label="Live Agent activity">
+            <SectionHead
+              title="Live Agent activity"
+              aside={(
+                <div className="flex items-center gap-2 text-[10px] text-faint">
+                  <span>{activityLoading ? "Refreshing..." : "Live · refreshes every 1.5s"}</span>
+                  <button
+                    type="button"
+                    className="rounded px-1.5 py-0.5 text-accent hover:bg-accentSoft"
+                    onClick={onRefreshActivity}
+                    disabled={activityLoading}
+                  >
+                    Refresh
+                  </button>
+                </div>
+              )}
+            />
+            <div className="mb-3 rounded-lg border border-accent/20 bg-accentSoft/40 px-3 py-2 text-[10.5px] leading-relaxed text-muted">
+              “Reasoning summary” is the provider’s safe summary, not private chain-of-thought. Tool rows retain execution metadata only; raw tool output and file contents are excluded.
+            </div>
+            {activityError && <ErrorNotice message={activityError} onRetry={onRefreshActivity} />}
+            {activityHasOlder && (
+              <div className="mb-3 text-center">
+                <button
+                  type="button"
+                  className={BUTTON}
+                  onClick={onLoadOlderActivity}
+                  disabled={activityLoading}
+                >
+                  Load earlier steps
+                </button>
+              </div>
+            )}
+            {activity.length > 0 && (
+              <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4" aria-label="Live run metrics">
+                <div className={`${CARD} p-2.5`}>
+                  <div className="text-[9.5px] font-semibold uppercase tracking-wide text-faint">
+                    {hasTokenLimit ? "Reported / run limit" : "Reported tokens · no run cap"}
+                  </div>
+                  <div className="mt-1 text-[13px] font-semibold text-ink">
+                    {totalTokens ? totalTokens.toLocaleString() : "—"}
+                    {hasTokenLimit ? ` / ${tokenLimit.toLocaleString()}` : ""}
+                  </div>
+                </div>
+                <div className={`${CARD} p-2.5`}>
+                  <div className="text-[9.5px] font-semibold uppercase tracking-wide text-faint">Input / cached</div>
+                  <div className="mt-1 text-[12px] font-semibold text-ink">{inputTokens.toLocaleString()} / {cachedTokens.toLocaleString()}</div>
+                </div>
+                <div className={`${CARD} p-2.5`}>
+                  <div className="text-[9.5px] font-semibold uppercase tracking-wide text-faint">Output tokens</div>
+                  <div className="mt-1 text-[13px] font-semibold text-ink">{outputTokens.toLocaleString()}</div>
+                </div>
+                <div className={`${CARD} p-2.5`}>
+                  <div className="text-[9.5px] font-semibold uppercase tracking-wide text-faint">Tools / active</div>
+                  <div className="mt-1 text-[13px] font-semibold text-ink">{completedTools} / {activeSteps}</div>
+                </div>
+              </div>
+            )}
+            {activityLoading && !activity.length ? (
+              <LoadingBlock label="Loading live Agent activity..." />
+            ) : timeline.length ? (
+              <div className="space-y-2" role="list" aria-label="Agent activity timeline">
+                {timeline.map((item) => {
+                  const detailEntries = Object.entries(item.detail)
+                    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+                    .slice(0, 20);
+                  return (
+                    <details key={`${item.id}:${item.sequence}`} className={`${CARD} group`} role="listitem">
+                      <summary
+                        className="flex cursor-pointer list-none items-start gap-2.5 px-3 py-2.5 hover:bg-paper"
+                        aria-label={`Expand ${item.title}`}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                            item.status === "failed"
+                              ? "bg-danger"
+                              : item.status === "running" || item.status === "pending"
+                                ? "bg-accent"
+                                : item.status === "completed"
+                                  ? "bg-ok"
+                                  : "bg-faint"
+                          }`}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="text-[11.5px] font-semibold text-ink">{item.title}</span>
+                            <span className="rounded bg-paper px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-faint">{humanize(item.kind)}</span>
+                          </span>
+                          {item.summary && (
+                            <span className="mt-0.5 block truncate text-[10.5px] text-muted">{boundedDisplayText(item.summary, 240)}</span>
+                          )}
+                        </span>
+                        <span className="shrink-0 text-right">
+                          <StatusBadge status={item.status} />
+                          <span className="mt-1 block text-[9px] text-faint">{formatTime(item.created_at)}</span>
+                        </span>
+                      </summary>
+                      <div className="border-t border-line px-3 py-3">
+                        {item.summary && (
+                          <div className="whitespace-pre-wrap break-words text-[11px] leading-relaxed text-ink">{boundedDisplayText(item.summary, 4_000)}</div>
+                        )}
+                        {detailEntries.length > 0 && (
+                          <dl className="mt-3 grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
+                            {detailEntries.map(([key, value]) => (
+                              <div key={key} className="min-w-0">
+                                <dt className="text-[9px] font-semibold uppercase tracking-wide text-faint">{humanize(key)}</dt>
+                                <dd className="mt-0.5 whitespace-pre-wrap break-all font-mono text-[10px] text-muted">{boundedDisplayText(activityDetailText(value), 1_200)}</dd>
+                              </div>
+                            ))}
+                          </dl>
+                        )}
+                      </div>
+                    </details>
+                  );
+                })}
+              </div>
+            ) : (
+              <EmptyState title="No live activity yet" detail="Queued runs will start reporting once an Agent claims them." />
+            )}
+          </section>
+
           <section className="mt-4 border-t border-line pt-4" aria-label="Retained transcript">
             <SectionHead
               title="Retained transcript"
@@ -2164,7 +2700,7 @@ function RunDetailsModal({
               ) : undefined}
             />
           {loading && !transcript ? (
-            <LoadingBlock label="Loading transcriptâ€¦" />
+            <LoadingBlock label="Loading transcript..." />
           ) : error ? (
             <ErrorNotice message={error} />
           ) : transcript && !transcript.available ? (

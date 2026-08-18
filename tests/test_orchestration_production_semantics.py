@@ -1076,6 +1076,88 @@ async def test_cleanup_breach_remains_authoritative_when_usage_exceeds_budget(tm
         await service.stop()
 
 
+@pytest.mark.asyncio
+async def test_standard_usage_breach_is_bounded_and_not_automatically_retried(
+    tmp_path,
+):
+    class OverBudgetExecutor:
+        calls = 0
+
+        async def execute(self, context):
+            self.calls += 1
+            return ExecutionOutcome(
+                status="succeeded",
+                session_id=context.claim.run.session_id or "hidden",
+                summary="The provider returned after crossing its allocation.",
+                usage={
+                    "model_calls": 10_000,
+                    "tool_calls": 10_000,
+                    "tokens": 10_000_000,
+                    "wall_seconds": 10_000,
+                },
+            )
+
+    executor = OverBudgetExecutor()
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "standard-over-budget",
+        executor=executor,
+        poll_seconds=0.05,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Stop a normal run at its durable budget ceiling",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the budget breach is reconciled"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {
+                            "key": "execute",
+                            "agent": "worker",
+                            "retry_policy": {
+                                "max_attempts": 2,
+                                "initial_delay_seconds": 0,
+                            },
+                        }
+                    ],
+                    "edges": [],
+                },
+            }
+        )["id"]
+        gate = await wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in service.store.list_gates(
+                        task_id, statuses=(GateStatus.OPEN,)
+                    )
+                    if item.kind is GateKind.RECONCILIATION
+                ),
+                None,
+            )
+        )
+        runs = service.store.list_runs(task_id)
+        assert len(runs) == 1
+        assert runs[0].status is RunStatus.FAILED
+        assert runs[0].error_kind == "runtime_limit"
+        assert executor.calls == 1
+        assert gate.prompt["actions"] == ["request_changes", "cancel"]
+        usage = next(
+            item.payload
+            for item in service.store.list_evidence(task_id)
+            if item.payload.get("runtime_usage_segment")
+        )
+        assert usage["usage"]["tokens"] == 10_000_000
+        assert usage["accounted_usage"]["tokens"] < 10_000_000
+        assert usage["budget_exceeded"] is True
+        service._runtime_for_task(task_id, rebuild=True)
+    finally:
+        await service.stop()
+
+
 class _TerminationCleanupExecutor:
     def __init__(self, *, hold_cleanup: bool = False) -> None:
         self.started = asyncio.Event()
@@ -1353,6 +1435,561 @@ class RejectingVerificationExecutor:
         )
 
 
+class AdjudicatingVerificationExecutor:
+    async def execute(self, context):
+        role = context.profile.role.value
+        criteria = {
+            criterion: "pass" for criterion in context.task.acceptance_criteria
+        }
+        output = {"summary": f"{role} completed"}
+        if role in {"reviewer", "tester", "evaluator"}:
+            status = "fail" if role == "tester" else "pass"
+            output["verdict"] = {
+                "status": status,
+                "summary": (
+                    "tester raised a non-criterion report objection"
+                    if role == "tester"
+                    else "the current candidate satisfies the acceptance contract"
+                ),
+                "criteria": criteria,
+                "findings": (
+                    ["report scope wording should be clarified"]
+                    if role == "tester"
+                    else []
+                ),
+                "subject": dict(context.subject),
+            }
+        return ExecutionOutcome(
+            status="succeeded",
+            session_id=context.claim.run.session_id or "adjudication",
+            output=output,
+        )
+
+
+class PassingCompatibilityReplayExecutor:
+    async def execute(self, context):
+        role = context.profile.role.value
+        status = (
+            "pass"
+            if role not in {"reviewer", "tester", "evaluator"}
+            or context.claim.run.attempt > 1
+            else "unknown"
+        )
+        summary = f"{role} attempt {context.claim.run.attempt}: {status}"
+        criteria = {
+            criterion: status for criterion in context.task.acceptance_criteria
+        }
+        output = {
+            "summary": summary,
+            "structured_result": {
+                "status": status,
+                "summary": summary,
+                "criteria": criteria,
+            },
+            "subscription_runtime": {"runtime_id": "legacy-subscription"},
+        }
+        if role in {"reviewer", "tester", "evaluator"}:
+            output["verdict"] = {
+                "status": status,
+                "summary": summary,
+                "criteria": criteria,
+                "subject": dict(context.subject),
+            }
+        return ExecutionOutcome(
+            status="succeeded",
+            session_id=context.claim.run.session_id or "compatibility-replay",
+            output=output,
+        )
+
+
+class PassingEnvelopeContinuationExecutor(PassingCompatibilityReplayExecutor):
+    async def execute(self, context):
+        outcome = await super().execute(context)
+        if (
+            context.profile.role.value == "evaluator"
+            and context.claim.run.attempt == 2
+        ):
+            criteria = {
+                criterion: "unknown"
+                for criterion in context.task.acceptance_criteria
+            }
+            summary = "evaluator attempt 2: upstream verdict summaries were omitted"
+            output = dict(outcome.output)
+            output["summary"] = summary
+            output["structured_result"] = {
+                "status": "unknown",
+                "summary": summary,
+                "criteria": criteria,
+            }
+            output["verdict"] = {
+                "status": "unknown",
+                "summary": summary,
+                "criteria": criteria,
+                "subject": dict(context.subject),
+            }
+            return ExecutionOutcome(
+                status="succeeded",
+                session_id=outcome.session_id,
+                output=output,
+            )
+        return outcome
+
+
+def test_legacy_subscription_result_is_backfilled_as_handoff_product(tmp_path):
+    service = OrchestrationService(
+        FakeManager(), tmp_path / "legacy-product", executor=object()
+    )
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Produce a durable analysis",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the analysis is available"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {"key": "execute", "kind": "execute", "agent": "worker"}
+                    ],
+                    "edges": [],
+                },
+                "auto_start": False,
+            }
+        )["id"]
+        service.submit_task(task_id)
+        service._advance_task(task_id)
+        claim = service.store.claim_next_run("legacy-subscription-worker")
+        assert claim is not None
+        service.store.start_run(
+            claim.run.id, claim.lease.token, claim.lease.fencing_token
+        )
+        service.store.complete_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+            output={
+                "summary": "The durable analysis is complete.",
+                "structured_result": {
+                    "status": "pass",
+                    "summary": "The durable analysis is complete.",
+                    "criteria": {"the analysis is available": "pass"},
+                },
+                "subscription_runtime": {"runtime_id": "claude-code-subscription"},
+            },
+        )
+
+        assert service.store.list_work_products(task_id) == ()
+        assert service._repair_legacy_subscription_work_products() == 1
+        assert service._repair_legacy_subscription_work_products() == 0
+        product = service.store.list_work_products(task_id)[0]
+        assert product.run_id is None
+        assert product.metadata["source_run_id"] == claim.run.id
+        assert product.summary == "The durable analysis is complete."
+        assert product.artifact_id and product.artifact_id.startswith("sha256:")
+    finally:
+        service.store.close()
+        service.catalog.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_handoff_reverification_replays_in_dependency_waves(tmp_path):
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "legacy-reverification",
+        executor=PassingCompatibilityReplayExecutor(),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Produce and verify a recovered subscription result",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the recovered result is verified"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {"key": "execute", "kind": "execute", "agent": "worker"},
+                        {
+                            "key": "review",
+                            "kind": "review",
+                            "agent": "reviewer",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                        {
+                            "key": "test",
+                            "kind": "test",
+                            "agent": "tester",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                        {
+                            "key": "evaluate",
+                            "kind": "evaluate",
+                            "agent": "evaluator",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                    ],
+                    "edges": [
+                        {"from": "execute", "to": "review"},
+                        {"from": "execute", "to": "test"},
+                        {"from": "review", "to": "evaluate"},
+                        {"from": "test", "to": "evaluate"},
+                    ],
+                },
+            }
+        )["id"]
+        gates = await wait_until(
+            lambda: service.store.list_gates(
+                task_id, statuses=(GateStatus.OPEN,)
+            ),
+            timeout=15,
+        )
+        gate = gates[0]
+        assert [
+            item.get("id") if isinstance(item, dict) else item
+            for item in gate.prompt["actions"]
+        ] == ["accept_current", "request_changes", "cancel"]
+        assert service._repair_legacy_subscription_work_products() == 4
+        assert service._repair_legacy_verification_reconciliation_gates() == 1
+        gate = service.store.get_gate(gate.id)
+        assert [
+            item.get("id") if isinstance(item, dict) else item
+            for item in gate.prompt["actions"]
+        ] == ["accept_current", "retry", "request_changes", "cancel"]
+        assert set(
+            gate.prompt["compatibility_retry"]["base_attempts"]
+        ) == {"review", "test", "evaluate"}
+
+        service.resolve_gate(
+            task_id,
+            gate.id,
+            decision="retry",
+            expected_version=gate.version,
+            idempotency_key="retry-legacy-verification-chain",
+        )
+        runs = await wait_until(
+            lambda: (
+                rows
+                if len(rows := service.store.list_runs(task_id)) == 7
+                and all(row.status is RunStatus.SUCCEEDED for row in rows)
+                else None
+            ),
+            timeout=20,
+        )
+        attempts: dict[str, list] = {}
+        for run in runs:
+            attempts.setdefault(run.node_key, []).append(run)
+        assert [run.attempt for run in attempts["execute"]] == [1]
+        assert sorted(run.attempt for run in attempts["review"]) == [1, 2]
+        assert sorted(run.attempt for run in attempts["test"]) == [1, 2]
+        assert sorted(run.attempt for run in attempts["evaluate"]) == [1, 2]
+        evaluator_retry = next(
+            run for run in attempts["evaluate"] if run.attempt == 2
+        )
+        assert evaluator_retry.created_at >= max(
+            run.finished_at
+            for key in ("review", "test")
+            for run in attempts[key]
+            if run.attempt == 2 and run.finished_at is not None
+        )
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reverification_gets_one_bounded_envelope_continuation(tmp_path):
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "legacy-envelope-continuation",
+        executor=PassingEnvelopeContinuationExecutor(),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Produce and verify a recovered subscription result",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the recovered result is verified"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {"key": "execute", "kind": "execute", "agent": "worker"},
+                        {
+                            "key": "review",
+                            "kind": "review",
+                            "agent": "reviewer",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                        {
+                            "key": "test",
+                            "kind": "test",
+                            "agent": "tester",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                        {
+                            "key": "evaluate",
+                            "kind": "evaluate",
+                            "agent": "evaluator",
+                            "retry_policy": {"max_attempts": 1},
+                        },
+                    ],
+                    "edges": [
+                        {"from": "execute", "to": "review"},
+                        {"from": "execute", "to": "test"},
+                        {"from": "review", "to": "evaluate"},
+                        {"from": "test", "to": "evaluate"},
+                    ],
+                },
+            }
+        )["id"]
+        first_gate = (
+            await wait_until(
+                lambda: service.store.list_gates(
+                    task_id, statuses=(GateStatus.OPEN,)
+                ),
+                timeout=15,
+            )
+        )[0]
+        assert service._repair_legacy_subscription_work_products() == 4
+        assert service._repair_legacy_verification_reconciliation_gates() == 1
+        first_gate = service.store.get_gate(first_gate.id)
+        service.resolve_gate(
+            task_id,
+            first_gate.id,
+            decision="retry",
+            expected_version=first_gate.version,
+            idempotency_key="retry-before-bounded-envelope-continuation",
+        )
+
+        second_gate = (
+            await wait_until(
+                lambda: next(
+                    (
+                        gate
+                        for gate in service.store.list_gates(
+                            task_id, statuses=(GateStatus.OPEN,)
+                        )
+                        if gate.id != first_gate.id
+                    ),
+                    None,
+                ),
+                timeout=20,
+            )
+        )
+        evaluator_retry = max(
+            (
+                run
+                for run in service.store.list_runs(task_id)
+                if run.node_key == "evaluate"
+            ),
+            key=lambda run: run.attempt,
+        )
+        assert evaluator_retry.attempt == 2
+        service.create_operator_work_product(
+            task_id,
+            {
+                "kind": "evaluation",
+                "title": "Evaluator attempt 2 result",
+                "summary": str((evaluator_retry.output or {}).get("summary") or ""),
+                "metadata": {
+                    "source": "subscription_structured_result_test",
+                    "source_run_id": evaluator_retry.id,
+                },
+            },
+        )
+
+        assert service._repair_legacy_verification_reconciliation_gates() == 1
+        second_gate = service.store.get_gate(second_gate.id)
+        assert [
+            item.get("id") if isinstance(item, dict) else item
+            for item in second_gate.prompt["actions"]
+        ] == ["accept_current", "retry", "request_changes", "cancel"]
+        assert second_gate.prompt["compatibility_retry"] == {
+            "reason": "bounded_work_product_envelope_handoff",
+            "base_attempts": {
+                "evaluate": {
+                    "run_id": evaluator_retry.id,
+                    "attempt": 2,
+                }
+            },
+        }
+        service.resolve_gate(
+            task_id,
+            second_gate.id,
+            decision="retry",
+            expected_version=second_gate.version,
+            idempotency_key="retry-bounded-envelope-continuation",
+        )
+        runs = await wait_until(
+            lambda: (
+                rows
+                if len(rows := service.store.list_runs(task_id)) == 8
+                and all(row.status is RunStatus.SUCCEEDED for row in rows)
+                else None
+            ),
+            timeout=20,
+        )
+        assert sorted(
+            run.attempt for run in runs if run.node_key == "evaluate"
+        ) == [1, 2, 3]
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_adjudicates_independent_verifier_dissent(tmp_path):
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "adjudicated-verification",
+        executor=AdjudicatingVerificationExecutor(),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Produce and adjudicate an independently checked result",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the result is correct"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {"key": "execute", "kind": "execute", "agent": "worker"},
+                        {"key": "review", "kind": "review", "agent": "reviewer"},
+                        {"key": "test", "kind": "test", "agent": "tester"},
+                        {
+                            "key": "evaluate",
+                            "kind": "evaluate",
+                            "agent": "evaluator",
+                        },
+                    ],
+                    "edges": [
+                        {"from": "execute", "to": "review"},
+                        {"from": "execute", "to": "test"},
+                        {"from": "review", "to": "evaluate"},
+                        {"from": "test", "to": "evaluate"},
+                    ],
+                },
+            }
+        )["id"]
+
+        task = await wait_until(
+            lambda: (
+                current
+                if (current := service.store.get_task(task_id)).status
+                is TaskStatus.COMPLETED
+                else None
+            ),
+            timeout=15,
+        )
+        assert task.status is TaskStatus.COMPLETED
+        assert service.store.list_gates(
+            task_id, statuses=(GateStatus.OPEN,)
+        ) == ()
+        evaluation = next(
+            item
+            for item in reversed(service.store.list_evidence(task_id))
+            if item.payload.get("title") == "Inter-step evaluation"
+        )
+        assert evaluation.payload["verdict"] == "proceed"
+        assert evaluation.payload["adjudication"]["authority"] == "evaluator"
+        assert len(evaluation.payload["adjudication"]["dissenting_run_ids"]) == 1
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_human_can_accept_current_verification_without_restarting_agents(tmp_path):
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "accepted-current-verification",
+        executor=RejectingVerificationExecutor(),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Produce a result whose current evidence can be accepted",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the result is correct"],
+                "complexity_factors": low_complexity(),
+                "plan": {
+                    "nodes": [
+                        {"key": "execute", "kind": "execute", "agent": "worker"},
+                        {
+                            "key": "review",
+                            "kind": "review",
+                            "agent": "reviewer",
+                            "retry_policy": {"max_attempts": 2},
+                        },
+                        {
+                            "key": "evaluate",
+                            "kind": "evaluate",
+                            "agent": "evaluator",
+                            "retry_policy": {"max_attempts": 2},
+                        },
+                    ],
+                    "edges": [
+                        {"from": "execute", "to": "review"},
+                        {"from": "review", "to": "evaluate"},
+                    ],
+                },
+            }
+        )["id"]
+        gate = (
+            await wait_until(
+                lambda: service.store.list_gates(
+                    task_id, statuses=(GateStatus.OPEN,)
+                ),
+                timeout=15,
+            )
+        )[0]
+        action_ids = [
+            item.get("id") if isinstance(item, dict) else item
+            for item in gate.prompt["actions"]
+        ]
+        assert action_ids == [
+            "accept_current",
+            "retry",
+            "request_changes",
+            "cancel",
+        ]
+        original_run_ids = {
+            run.id for run in service.store.list_runs(task_id)
+        }
+
+        service.resolve_gate(
+            task_id,
+            gate.id,
+            decision="accept_current",
+            response="The completed evidence is sufficient for this task.",
+            expected_version=gate.version,
+            idempotency_key="accept-current-verification",
+        )
+        await wait_until(
+            lambda: (
+                current
+                if (current := service.store.get_task(task_id)).status
+                is TaskStatus.COMPLETED
+                else None
+            ),
+            timeout=15,
+        )
+        assert {
+            run.id for run in service.store.list_runs(task_id)
+        } == original_run_ids
+        accepted = next(
+            item
+            for item in reversed(service.store.list_evidence(task_id))
+            if item.payload.get("title") == "Final acceptance"
+        )
+        assert accepted.payload["override"] is True
+        assert accepted.payload["verification_override_gate_id"] == gate.id
+    finally:
+        await service.stop()
+
+
 @pytest.mark.asyncio
 async def test_successful_verification_runs_with_fail_verdict_open_reconciliation(tmp_path):
     service = OrchestrationService(
@@ -1372,11 +2009,17 @@ async def test_successful_verification_runs_with_fail_verdict_open_reconciliatio
                 "plan": {
                     "nodes": [
                         {"key": "execute", "kind": "execute", "agent": "worker"},
-                        {"key": "review", "kind": "review", "agent": "reviewer"},
+                        {
+                            "key": "review",
+                            "kind": "review",
+                            "agent": "reviewer",
+                            "retry_policy": {"max_attempts": 2},
+                        },
                         {
                             "key": "evaluate",
                             "kind": "evaluate",
                             "agent": "evaluator",
+                            "retry_policy": {"max_attempts": 2},
                         },
                     ],
                     "edges": [
@@ -1398,6 +2041,61 @@ async def test_successful_verification_runs_with_fail_verdict_open_reconciliatio
         assert all(run.status is RunStatus.SUCCEEDED for run in runs)
         assert service.store.get_task(task_id).status is not TaskStatus.ARCHIVED
         assert {gate.kind for gate in gates} == {GateKind.RECONCILIATION}
+        gate = gates[0]
+        assert [
+            item.get("id") if isinstance(item, dict) else item
+            for item in gate.prompt["actions"]
+        ] == ["accept_current", "retry", "request_changes", "cancel"]
+
+        legacy_prompt = dict(gate.prompt)
+        legacy_prompt.update(
+            {
+                "title": "Execution needs reconciliation",
+                "description": "A verifier could not retrieve the candidate.",
+                "actions": ["request_changes", "cancel"],
+            }
+        )
+        gate = service.store.amend_task_gate_prompt(
+            gate.id,
+            legacy_prompt,
+            expected_version=gate.version,
+            command_id="simulate-legacy-verdict-gate",
+        )
+        assert service._repair_legacy_verification_reconciliation_gates() == 1
+        gate = service.store.get_gate(gate.id)
+        assert gate.prompt["title"] == "Verification needs reconciliation"
+        assert [
+            item.get("id") if isinstance(item, dict) else item
+            for item in gate.prompt["actions"]
+        ] == ["accept_current", "retry", "request_changes", "cancel"]
+
+        service.resolve_gate(
+            task_id,
+            gate.id,
+            decision="retry",
+            expected_version=gate.version,
+            idempotency_key="retry-adverse-verification",
+        )
+        retried = await wait_until(
+            lambda: (
+                rows
+                if len(
+                    rows := service.store.list_runs(task_id)
+                ) >= 5
+                and all(
+                    item.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                    for item in rows
+                )
+                else None
+            ),
+            timeout=15,
+        )
+        attempts = {}
+        for item in retried:
+            attempts.setdefault(item.node_key, []).append(item.attempt)
+        assert sorted(attempts["execute"]) == [1]
+        assert sorted(attempts["review"]) == [1, 2]
+        assert sorted(attempts["evaluate"]) == [1, 2]
     finally:
         await service.stop()
 
@@ -1588,6 +2286,162 @@ def test_single_node_retry_receives_remaining_logical_budget(tmp_path):
         assert retry_runtime.spec.budget.model_calls == 4
         assert retry_runtime.spec.budget.tokens == 900
         assert service.store.get_task(task_id).status is TaskStatus.RUNNING
+    finally:
+        service.store.close()
+
+
+def test_legacy_over_budget_run_rebuilds_and_cannot_enqueue_zero_budget_retry(
+    tmp_path,
+):
+    service = OrchestrationService(FakeManager(), tmp_path / "data", executor=object())
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Recover a historical over-budget terminal run",
+                "domain": "knowledge",
+                "acceptance_criteria": ["recovery remains operable"],
+                "complexity_factors": low_complexity(),
+                "budget": {
+                    "model_calls": 2,
+                    "tool_calls": 4,
+                    "tokens": 100,
+                    "wall_seconds": 10,
+                },
+                "plan": {
+                    "nodes": [
+                        {
+                            "key": "only",
+                            "agent": "worker",
+                            "retry_policy": {
+                                "max_attempts": 2,
+                                "initial_delay_seconds": 0,
+                            },
+                        }
+                    ],
+                    "edges": [],
+                },
+                "auto_start": False,
+            }
+        )["id"]
+        service.submit_task(task_id)
+        service._advance_task(task_id)
+        claim = service.store.claim_next_run("legacy-over-budget")
+        assert claim is not None
+        service.store.start_run(
+            claim.run.id, claim.lease.token, claim.lease.fencing_token
+        )
+        service.store.add_evidence(
+            task_id,
+            kind=EvidenceKind.METRIC,
+            payload={
+                "runtime_usage_segment": True,
+                # Older releases persisted only the measured value.
+                "usage": {
+                    "model_calls": 20,
+                    "tool_calls": 40,
+                    "tokens": 10_000,
+                    "wall_seconds": 1_000,
+                },
+            },
+            created_by="legacy-runtime",
+            run_id=claim.run.id,
+            plan_id=claim.run.plan_id,
+            node_id=claim.run.node_id,
+        )
+        failed = service.store.fail_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+            error_kind="runtime_limit",
+            error_message="runtime budget exceeded",
+        )
+
+        runtime = service._runtime_for_task(task_id, rebuild=True)
+        runtime_node = runtime.get(service._run_runtime_id(failed.id))
+        assert runtime_node.direct_usage == runtime_node.spec.budget
+        graph = service.store.get_plan(failed.plan_id)
+        task = service.store.get_task(task_id)
+        assert service._can_retry(graph.nodes[0], failed, explicit=True) is False
+        assert service._retry_run(task, graph, graph.nodes[0], failed) is False
+        assert len(service.store.list_runs(task_id)) == 1
+        historical_retry = service.store.enqueue_run(
+            task_id,
+            graph.nodes[0].key,
+            plan_id=graph.plan.id,
+            attempt=2,
+        )
+        assert service._run_payload(historical_retry)["budget"] == {
+            "model_calls": 0,
+            "tool_calls": 0,
+            "tokens": 0,
+            "wall_seconds": 0,
+        }
+    finally:
+        service.store.close()
+
+
+def test_unlimited_mode_reopens_historical_budget_failure_without_old_cap(tmp_path):
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "data",
+        executor=object(),
+        enforce_runtime_budgets=False,
+    )
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Continue after removing runtime budget ceilings",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the run can continue"],
+                "complexity_factors": low_complexity(),
+                "budget": {
+                    "model_calls": 1,
+                    "tool_calls": 1,
+                    "tokens": 1,
+                    "wall_seconds": 1,
+                },
+                "plan": {
+                    "nodes": [
+                        {
+                            "key": "only",
+                            "agent": "worker",
+                            "retry_policy": {
+                                "max_attempts": 2,
+                                "initial_delay_seconds": 0,
+                            },
+                        }
+                    ],
+                    "edges": [],
+                },
+                "auto_start": False,
+            }
+        )["id"]
+        service.submit_task(task_id)
+        service._advance_task(task_id)
+        claim = service.store.claim_next_run("unlimited-budget-recovery")
+        assert claim is not None
+        service.store.start_run(
+            claim.run.id, claim.lease.token, claim.lease.fencing_token
+        )
+        failed = service.store.fail_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+            error_kind="runtime_limit",
+            error_message="historical runtime budget exceeded",
+        )
+
+        graph = service.store.get_plan(failed.plan_id)
+        task = service.store.get_task(task_id)
+        runtime = service._runtime_for_task(task_id, rebuild=True)
+        runtime_node = runtime.get(service._run_runtime_id(failed.id))
+
+        assert runtime_node.spec.budget.is_unlimited is True
+        assert service._can_retry(graph.nodes[0], failed, explicit=True) is True
+        assert service._run_payload(failed)["budget"] is None
+        assert service._retry_run(task, graph, graph.nodes[0], failed) is True
+        assert [run.attempt for run in service.store.list_runs(task_id)] == [1, 2]
+        assert service.task_detail(task_id)["runtime_budget_mode"] == "unlimited"
     finally:
         service.store.close()
 

@@ -38,7 +38,16 @@ describe("OrchestrationSurface", () => {
       },
       runs: [
         { run_id: "run-root", session_id: "session-root", node_id: "prepare", title: "Prepare run", status: "succeeded", model: "openai:gpt-high" },
-        { run_id: "run-child", session_id: "session-child", node_id: "verify", parent_run_id: "run-root", title: "Test run", status: "running", model: "anthropic:balanced" },
+        {
+          run_id: "run-child",
+          session_id: "session-child",
+          node_id: "verify",
+          parent_run_id: "run-root",
+          title: "Test run",
+          status: "running",
+          model: "anthropic:balanced",
+          budget: { model_calls: 2, tool_calls: 14, tokens: 2_000, wall_seconds: 900 },
+        },
       ],
       gates: [{
         gate_id: "gate-1",
@@ -114,6 +123,43 @@ describe("OrchestrationSurface", () => {
           message_count: 1, offset: 0, limit: 500, has_more: false,
         } as T;
       }
+      if (path.startsWith("/v1/orchestration/tasks/task-1/runs/run-child/activity?")) {
+        return {
+          task_id: "task-1",
+          run_id: "run-child",
+          activity: [
+            {
+              sequence: 1, id: "activity-1", event_key: "reasoning-1", source_id: "reasoning-source",
+              kind: "reasoning_summary", status: "running", title: "Reasoning summary",
+              summary: "Inspecting ", detail: { provider_summary: true }, created_at: "2026-08-03T01:01:00Z",
+            },
+            {
+              sequence: 2, id: "activity-2", event_key: "reasoning-2", source_id: "reasoning-source",
+              kind: "reasoning_summary", status: "completed", title: "Reasoning summary",
+              summary: "test results.", detail: { provider_summary: true }, created_at: "2026-08-03T01:01:01Z",
+            },
+            {
+              sequence: 3, id: "activity-3", event_key: "tool-1-start", source_id: "tool-source",
+              kind: "tool", status: "running", title: "Command", summary: "npm test",
+              detail: { command: "npm test", cwd: "C:/workspace" }, created_at: "2026-08-03T01:01:02Z",
+            },
+            {
+              sequence: 4, id: "activity-4", event_key: "tool-1-finish", source_id: "tool-source",
+              kind: "tool", status: "completed", title: "Command", summary: "npm test",
+              detail: { exit_code: 0, duration_ms: 450 }, created_at: "2026-08-03T01:01:03Z",
+            },
+            {
+              sequence: 5, id: "activity-5", event_key: "usage", source_id: "usage-source",
+              kind: "usage", status: "info", title: "Token usage updated", summary: "1,250 total tokens",
+              detail: { total_tokens: 1250, input_tokens: 1000, cached_input_tokens: 800, output_tokens: 250 },
+              created_at: "2026-08-03T01:01:04Z",
+            },
+          ],
+          has_more: false,
+          order: "oldest_to_newest",
+          privacy: { reasoning: "provider_summary_only", tool_output: "metadata_only" },
+        } as T;
+      }
       if (path === "/v1/orchestration/tasks/task-1/pause" && method === "POST") return detail as T;
       if (path.endsWith("/resolve")) return { ok: true } as T;
       throw new Error(`Unexpected request: ${method} ${path}`);
@@ -134,7 +180,7 @@ describe("OrchestrationSurface", () => {
 
     expect(await screen.findByRole("heading", { name: "Ship the release" })).toBeTruthy();
     const timeline = screen.getByLabelText("Task stages");
-    for (const label of ["Intake", "Complexity", "Clarification", "Planning", "Evaluation", "Final acceptance", "Archive"]) {
+    for (const label of ["Intake", "Complexity", "Clarification", "Planning", "Evaluation", "Final acceptance", "Finalize"]) {
       expect(within(timeline).getByText(label)).toBeTruthy();
     }
     expect(timeline.textContent).toContain("Execute");
@@ -187,11 +233,32 @@ describe("OrchestrationSurface", () => {
     expect(within(runDialog).getByText("anthropic:balanced")).toBeTruthy();
     expect(within(runDialog).getByText("tester")).toBeTruthy();
     expect(within(runDialog).getByRole("region", { name: "Retained transcript" })).toBeTruthy();
+    expect(within(runDialog).getByRole("region", { name: "Live Agent activity" })).toBeTruthy();
+    expect((await within(runDialog).findAllByText("Inspecting test results.")).length).toBeGreaterThan(0);
+    expect(within(runDialog).getByText("1,250 / 2,000")).toBeTruthy();
+    fireEvent.click(within(runDialog).getByLabelText("Expand Command"));
+    expect(within(runDialog).getByText("C:/workspace")).toBeTruthy();
     expect(await within(runDialog).findByText("All checks passed.")).toBeTruthy();
     fireEvent.click(within(runDialog).getByRole("button", { name: "Close" }));
+    Reflect.set(detail.runs[1], "budget", null);
+    const detailReadsBeforeUnlimitedRefresh = calls.filter(
+      (call) => call.path === "/v1/orchestration/tasks/task-1" && call.method === "GET",
+    ).length;
+    fireEvent.click(screen.getByLabelText("Refresh tasks"));
+    await waitFor(() => {
+      expect(calls.filter(
+        (call) => call.path === "/v1/orchestration/tasks/task-1" && call.method === "GET",
+      ).length).toBeGreaterThan(detailReadsBeforeUnlimitedRefresh);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Test run/ }));
+    const unlimitedRunDialog = await screen.findByRole("dialog", { name: "Agent run details" });
+    expect(within(unlimitedRunDialog).getByText("Reported tokens · no run cap")).toBeTruthy();
+    expect(within(unlimitedRunDialog).getByText("1,250")).toBeTruthy();
+    expect(within(unlimitedRunDialog).queryByText("1,250 / 2,000")).toBeNull();
+    fireEvent.click(within(unlimitedRunDialog).getByRole("button", { name: "Close" }));
     const delegatedRunButton = screen.getByRole("button", { name: /Delegated probe/ }) as HTMLButtonElement;
     expect(delegatedRunButton.disabled).toBe(false);
-    fireEvent.click(screen.getAllByRole("button", { name: "View run transcript" })[1]);
+    fireEvent.click(screen.getAllByRole("button", { name: "View Agent progress" })[1]);
     expect(await screen.findByText("All checks passed.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
@@ -382,7 +449,7 @@ describe("OrchestrationSurface", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create and start" }));
 
     await waitFor(() => {
-      expect(calls).toContainEqual({
+      expect(calls.find((call) => call.path === "/v1/orchestration/tasks" && call.method === "POST")).toMatchObject({
         path: "/v1/orchestration/tasks",
         method: "POST",
         body: {
@@ -400,6 +467,20 @@ describe("OrchestrationSurface", () => {
           require_review: false,
           require_tests: false,
           auto_start: true,
+          publish_brief: true,
+          context_refs: [],
+          brief: {
+            title: "Research the decision",
+            objective: "Research the decision and cite the conclusion.",
+            acceptance_criteria: [
+              { id: "criterion-1", text: "Conclusion is cited", required: true },
+              { id: "criterion-2", text: "Sources are traceable", required: true },
+            ],
+            deliverables: [
+              { id: "deliverable-1", kind: "implementation_patch", required: true },
+            ],
+            result_contract: { schema_id: "implementation_result_v1", schema_version: 1 },
+          },
         },
       });
     });
@@ -556,6 +637,19 @@ describe("OrchestrationSurface", () => {
         read_only: true,
         profile_id: "architecture-planner",
         workspace: "C:/work/read-only",
+        brief: {
+          deliverables: [
+            {
+              id: "deliverable-1",
+              kind: "artifact",
+              title: "Read-only analysis report",
+              required: true,
+            },
+          ],
+          result_contract: {
+            schema_id: "analysis_result_v1",
+          },
+        },
       });
     });
   });
@@ -680,6 +774,14 @@ describe("OrchestrationSurface", () => {
           resolvers.set(match[1], resolve as (value: unknown) => void);
         });
       }
+      if (/\/runs\/(run-[ab])\/activity\?/.test(path)) {
+        const runId = /\/runs\/(run-[ab])\//.exec(path)?.[1] || "";
+        return {
+          task_id: "task-transcripts", run_id: runId, activity: [], has_more: false,
+          order: "oldest_to_newest",
+          privacy: { reasoning: "provider_summary_only", tool_output: "metadata_only" },
+        } as T;
+      }
       throw new Error(`Unexpected request: GET ${path}`);
     };
     const transcript = (runId: string, content: string) => ({
@@ -698,7 +800,7 @@ describe("OrchestrationSurface", () => {
     render(<OrchestrationSurface apiRequest={apiRequest} apiDownload={noDownload} />);
     await screen.findByRole("heading", { name: "Inspect transcripts" });
     fireEvent.click(screen.getByRole("button", { name: /Agent runs/ }));
-    const transcriptButtons = screen.getAllByRole("button", { name: "View run transcript" });
+    const transcriptButtons = screen.getAllByRole("button", { name: "View Agent progress" });
     fireEvent.click(transcriptButtons[0]);
     fireEvent.click(transcriptButtons[1]);
 
@@ -765,6 +867,13 @@ describe("OrchestrationSurface", () => {
           has_more: false,
         } as T;
       }
+      if (path.startsWith("/v1/orchestration/tasks/task-live-run/runs/run-live/activity?")) {
+        return {
+          task_id: current.id, run_id: "run-live", activity: [], has_more: false,
+          order: "oldest_to_newest",
+          privacy: { reasoning: "provider_summary_only", tool_output: "metadata_only" },
+        } as T;
+      }
       throw new Error(`Unexpected request: GET ${path}`);
     };
 
@@ -797,6 +906,53 @@ describe("OrchestrationSurface", () => {
       expect(within(dialog).getByText("final retained transcript")).toBeTruthy();
       expect(transcriptCalls).toBeGreaterThanOrEqual(2);
     });
+  });
+
+  it("keeps the current task list mounted during event-driven refreshes", async () => {
+    const current = {
+      id: "task-stable-list",
+      title: "Stable task",
+      objective: "Refresh without flashing.",
+      status: "running",
+      stage: "execution_review_test",
+      updated_at: "2026-08-17T08:31:22Z",
+      stages: [], attention: [], nodes: [], edges: [], runs: [], evidence: [], activity: [],
+    };
+    let listCalls = 0;
+    let finishRefresh: ((value: typeof current[]) => void) | undefined;
+    let emit: ((event: { type: string; data?: Record<string, unknown> }) => void) | undefined;
+    const apiRequest: ApiRequest = async <T,>(path: string) => {
+      if (path.startsWith("/v1/orchestration/tasks?")) {
+        listCalls += 1;
+        if (listCalls === 1) return [current] as T;
+        return await new Promise<T>((resolve) => {
+          finishRefresh = resolve as (value: typeof current[]) => void;
+        });
+      }
+      if (path === "/v1/orchestration/tasks/task-stable-list") return current as T;
+      throw new Error(`Unexpected request: GET ${path}`);
+    };
+
+    render(
+      <OrchestrationSurface
+        apiRequest={apiRequest}
+        apiDownload={noDownload}
+        subscribeEvents={(listener) => {
+          emit = listener;
+          return () => undefined;
+        }}
+      />,
+    );
+    await screen.findByRole("heading", { name: "Stable task" });
+    expect(screen.getAllByText("Stable task").length).toBeGreaterThanOrEqual(2);
+
+    act(() => emit?.({ type: "orchestration_event", data: { task_id: current.id } }));
+    await waitFor(() => expect(listCalls).toBe(2));
+
+    expect(screen.queryByText("Loading tasks…")).toBeNull();
+    expect(screen.getAllByText("Stable task").length).toBeGreaterThanOrEqual(2);
+
+    await act(async () => finishRefresh?.([current]));
   });
 
   it("does not retain the code workspace when creation switches to knowledge", async () => {

@@ -19,7 +19,7 @@ export const STAGE_LABELS: Record<OrchestrationStage, string> = {
   execution_review_test: "Execute · review · test",
   inter_step_evaluation: "Evaluation",
   final_acceptance: "Final acceptance",
-  archive: "Archive",
+  archive: "Finalize",
 };
 
 export function humanize(value: string): string {

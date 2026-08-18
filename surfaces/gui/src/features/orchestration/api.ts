@@ -3,6 +3,8 @@ import type {
   AgentProfileSpec,
   AgentProfileSummary,
   AgentProfileVersion,
+  ContextRef,
+  ContextRefInput,
   AgentRun,
   AuditPage,
   AttentionGate,
@@ -15,26 +17,36 @@ import type {
   ModelRoutingPolicySpec,
   OrchestrationTaskDetail,
   OrchestrationHealth,
+  HandoffRuntimeSettings,
   OrchestrationTaskSummary,
   OutboxDeadLetterPage,
+  ResultQuestion,
   RoutingModelDescriptor,
   RuntimePresetDescriptor,
   RuntimePresetRoleAssignment,
   RoutingSimulationFacts,
   RoutingSimulationResult,
+  RunActivityPage,
   RunTranscript,
   SubscriptionRuntimeDescriptor,
   SubscriptionRuntimeHealth,
   TaskActivity,
+  TaskBrief,
+  TaskBriefInput,
+  TaskComment,
+  TaskCommentDelta,
   TaskEvidence,
   TaskEvidencePage,
   TaskGatesPage,
   TaskNode,
   TaskRunsPage,
   TaskStageState,
+  TaskRelation,
   VersionProvenance,
   WorkStatus,
   ValidationReport,
+  WakeRequest,
+  WorkProduct,
 } from "./types";
 
 export type ApiRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -96,6 +108,7 @@ function normalizedStatus(value: unknown, fallback: WorkStatus = "pending"): Wor
 function normalizeRun(value: unknown, node?: JsonRecord): AgentRun {
   const item = record(value);
   const output = record(item.output);
+  const budget = record(item.budget);
   const errorMessage = text(item.error_message || item.error || output.error_message || output.error) || undefined;
   return {
     id: text(item.id || item.run_id),
@@ -113,6 +126,12 @@ function normalizeRun(value: unknown, node?: JsonRecord): AgentRun {
     error_kind: text(item.error_kind || output.error_kind) || undefined,
     error_message: errorMessage,
     session_id: text(item.session_id) || null,
+    budget: Object.keys(budget).length ? {
+      model_calls: number(budget.model_calls),
+      tool_calls: number(budget.tool_calls),
+      tokens: number(budget.tokens),
+      wall_seconds: number(budget.wall_seconds),
+    } : null,
   };
 }
 
@@ -144,6 +163,9 @@ function normalizeHealth(value: unknown): OrchestrationHealth {
   const item = record(value);
   const leader = record(item.leader);
   const outbox = record(item.outbox);
+  const handoff = record(item.handoff);
+  const handoffSettings = record(handoff.settings);
+  const handoffMetrics = record(handoff.metrics);
   return {
     ready: Boolean(item.ready),
     state: text(item.state, "unknown"),
@@ -171,6 +193,37 @@ function normalizeHealth(value: unknown): OrchestrationHealth {
     last_error_at: text(item.last_error_at) || null,
     last_error: text(item.last_error) || null,
     consecutive_failures: item.consecutive_failures == null ? undefined : number(item.consecutive_failures),
+    handoff: Object.keys(handoff).length ? {
+      settings: normalizeHandoffSettings(handoffSettings),
+      metrics: {
+        counters: Object.fromEntries(
+          Object.entries(record(handoffMetrics.counters)).map(([key, value]) => [key, number(value)]),
+        ),
+        gauges: Object.fromEntries(
+          Object.entries(record(handoffMetrics.gauges)).map(([key, value]) => [key, number(value)]),
+        ),
+        histograms: record(handoffMetrics.histograms),
+      },
+    } : undefined,
+  };
+}
+
+function normalizeHandoffSettings(value: unknown): HandoffRuntimeSettings {
+  const item = record(value);
+  return {
+    structured_handoff_enabled: item.structured_handoff_enabled == null ? true : Boolean(item.structured_handoff_enabled),
+    structured_handoff_required_for_new_tasks: Boolean(item.structured_handoff_required_for_new_tasks),
+    legacy_spawn_agent_enabled: item.legacy_spawn_agent_enabled == null ? true : Boolean(item.legacy_spawn_agent_enabled),
+    default_context_token_budget: number(item.default_context_token_budget, 8_000),
+    max_context_refs: number(item.max_context_refs, 50),
+    max_inline_bytes_per_ref: number(item.max_inline_bytes_per_ref, 8_192),
+    max_inline_bytes_total: number(item.max_inline_bytes_total, 32_768),
+    max_comment_batch: number(item.max_comment_batch, 100),
+    wake_coalesce_window_ms: number(item.wake_coalesce_window_ms, 1_000),
+    wake_max_attempts: number(item.wake_max_attempts, 5),
+    wake_backoff_seconds: number(item.wake_backoff_seconds, 1),
+    context_read_audit_enabled: item.context_read_audit_enabled == null ? true : Boolean(item.context_read_audit_enabled),
+    transcript_sharing_default: Boolean(item.transcript_sharing_default),
   };
 }
 
@@ -193,6 +246,168 @@ function normalizeTaskSummary(value: unknown): OrchestrationTaskSummary {
     profile_version: item.profile_version == null ? undefined : number(item.profile_version),
     parent_task_id: text(item.parent_task_id) || null,
     parent_run_id: text(item.parent_run_id) || null,
+    terminal_outcome: text(item.terminal_outcome) as OrchestrationTaskSummary["terminal_outcome"] || undefined,
+  };
+}
+
+function normalizeBrief(value: unknown): TaskBrief {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    task_id: text(item.task_id),
+    revision: number(item.revision),
+    status: lower(item.status, "draft") as TaskBrief["status"],
+    title: text(item.title),
+    objective: text(item.objective),
+    background: text(item.background),
+    scope: record(item.scope),
+    instructions: stringList(item.instructions),
+    constraints: stringList(item.constraints),
+    non_goals: stringList(item.non_goals),
+    acceptance_criteria: array(item.acceptance_criteria).map((raw, index) => {
+      const criterion = record(raw);
+      return {
+        id: text(criterion.id, `criterion-${index + 1}`),
+        text: text(criterion.text || criterion.description),
+        required: criterion.required == null ? true : Boolean(criterion.required),
+        verification: text(criterion.verification) || undefined,
+      };
+    }),
+    deliverables: array(item.deliverables).map((raw, index) => {
+      const deliverable = record(raw);
+      return {
+        id: text(deliverable.id, `deliverable-${index + 1}`),
+        kind: text(deliverable.kind, "other"),
+        title: text(deliverable.title) || undefined,
+        required: deliverable.required == null ? true : Boolean(deliverable.required),
+      };
+    }),
+    result_contract: record(item.result_contract),
+    content_hash: text(item.content_hash),
+    created_by_task_id: text(item.created_by_task_id) || null,
+    created_by_run_id: text(item.created_by_run_id) || null,
+    created_at: text(item.created_at),
+    published_at: text(item.published_at) || null,
+  };
+}
+
+function normalizeContextRef(value: unknown): ContextRef {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    task_id: text(item.task_id),
+    brief_id: text(item.brief_id),
+    requirement: lower(item.requirement, "optional") as ContextRef["requirement"],
+    ref_type: lower(item.ref_type),
+    display_name: text(item.display_name, "Context reference"),
+    selection_reason: text(item.selection_reason),
+    locator: record(item.locator),
+    delivery_mode: lower(item.delivery_mode, "on_demand") as ContextRef["delivery_mode"],
+    summary: text(item.summary),
+    mime_type: text(item.mime_type) || null,
+    content_hash: text(item.content_hash) || null,
+    byte_size: item.byte_size == null ? null : number(item.byte_size),
+    token_estimate: item.token_estimate == null ? null : number(item.token_estimate),
+    provenance: record(item.provenance),
+    trust_level: text(item.trust_level, "untrusted"),
+    created_at: text(item.created_at),
+    read_count: number(item.read_count),
+    last_read_at: text(item.last_read_at) || null,
+    last_read_by_run_id: text(item.last_read_by_run_id) || null,
+  };
+}
+
+function normalizeRelation(value: unknown): TaskRelation {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    from_task_id: text(item.from_task_id),
+    to_task_id: text(item.to_task_id),
+    relation_type: lower(item.relation_type, "related"),
+    metadata: record(item.metadata),
+    created_at: text(item.created_at),
+    removed_at: text(item.removed_at) || null,
+  };
+}
+
+function normalizeComment(value: unknown): TaskComment {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    task_id: text(item.task_id),
+    sequence: number(item.sequence),
+    author_type: text(item.author_type),
+    author_id: text(item.author_id),
+    created_by_run_id: text(item.created_by_run_id) || null,
+    body_markdown: text(item.body_markdown),
+    metadata: record(item.metadata),
+    reply_to_comment_id: text(item.reply_to_comment_id) || null,
+    created_at: text(item.created_at),
+  };
+}
+
+function normalizeWorkProduct(value: unknown): WorkProduct {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    task_id: text(item.task_id),
+    run_id: text(item.run_id) || null,
+    kind: text(item.kind, "other"),
+    title: text(item.title, "Work product"),
+    summary: text(item.summary),
+    evidence_id: text(item.evidence_id) || null,
+    artifact_id: text(item.artifact_id) || null,
+    uri: text(item.uri) || null,
+    content_hash: text(item.content_hash) || null,
+    metadata: record(item.metadata),
+    verification_status: text(item.verification_status, "unverified"),
+    created_by: text(item.created_by),
+    created_at: text(item.created_at),
+  };
+}
+
+function normalizeResultQuestion(value: unknown): ResultQuestion {
+  const item = record(value);
+  return {
+    id: text(item.id || item.task_id),
+    task_id: text(item.task_id || item.id),
+    source_task_id: text(item.source_task_id),
+    question: text(item.question),
+    status: lower(item.status, "draft") as ResultQuestion["status"],
+    terminal_outcome: text(item.terminal_outcome) as ResultQuestion["terminal_outcome"] || undefined,
+    stage: lower(item.stage, "intake"),
+    progress: item.progress == null ? undefined : number(item.progress),
+    answer: item.answer == null ? null : text(item.answer),
+    answer_work_product_id: text(item.answer_work_product_id) || null,
+    answer_artifact_id: text(item.answer_artifact_id) || null,
+    source_work_product_ids: stringList(item.source_work_product_ids),
+    created_at: text(item.created_at),
+    updated_at: text(item.updated_at),
+  };
+}
+
+function normalizeWake(value: unknown): WakeRequest {
+  const item = record(value);
+  return {
+    id: text(item.id),
+    target_task_id: text(item.target_task_id),
+    target_run_id: text(item.target_run_id) || null,
+    reason: text(item.reason),
+    source_task_id: text(item.source_task_id) || null,
+    source_run_id: text(item.source_run_id) || null,
+    source_event_id: text(item.source_event_id) || null,
+    payload: record(item.payload),
+    status: lower(item.status, "pending"),
+    attempts: number(item.attempts),
+    coalesced_count: number(item.coalesced_count),
+    last_error: text(item.last_error) || null,
+    not_before: text(item.not_before) || null,
+    claimed_by: text(item.claimed_by) || null,
+    claimed_until: text(item.claimed_until) || null,
+    delivered_at: text(item.delivered_at) || null,
+    completed_at: text(item.completed_at) || null,
+    created_at: text(item.created_at),
+    updated_at: text(item.updated_at),
   };
 }
 
@@ -258,9 +473,9 @@ function normalizeGate(value: unknown): AttentionGate {
         id,
         label,
         tone: (lower(action.tone) as "primary" | "neutral" | "danger")
-          || (["reject", "cancel"].includes(id) ? "danger" : ["approve", "accept", "submit", "retry"].includes(id) ? "primary" : "neutral"),
+          || (["reject", "cancel"].includes(id) ? "danger" : ["accept_current", "approve", "accept", "submit", "retry"].includes(id) ? "primary" : "neutral"),
         requires_response: action.requires_response == null
-          ? ["submit", "request_changes"].includes(id)
+          ? ["accept_current", "submit", "request_changes"].includes(id)
           : Boolean(action.requires_response),
       };
     }),
@@ -373,6 +588,13 @@ function normalizeTaskDetail(value: unknown): OrchestrationTaskDetail {
   });
   return {
     ...summary,
+    result: Object.keys(record(envelope.result || taskRaw.result)).length
+      ? record(envelope.result || taskRaw.result)
+      : null,
+    brief: Object.keys(record(envelope.brief)).length ? normalizeBrief(envelope.brief) : undefined,
+    handoff_summary: Object.keys(record(envelope.handoff_summary)).length
+      ? record(envelope.handoff_summary) as OrchestrationTaskDetail["handoff_summary"]
+      : undefined,
     stages: array(envelope.stages || envelope.stage_history).map(normalizeStage),
     attention: array(envelope.attention || envelope.attention_gates || envelope.gates).map(normalizeGate),
     attention_page: normalizeAuditPage(envelope.attention_page),
@@ -429,8 +651,9 @@ function normalizeSnapshot(value: unknown) {
 function normalizeProfileSpec(value: unknown): AgentProfileSpec {
   const item = record(value);
   const base = record(item.base || item.cloned_from);
+  const communication = record(item.communication_policy);
   return {
-    schema_version: 1,
+    schema_version: number(item.schema_version, Object.keys(communication).length ? 2 : 1) === 2 ? 2 : 1,
     profile_id: text(item.profile_id || item.id),
     display_name: text(item.display_name || item.name),
     role: lower(item.role, "worker") as AgentProfileSpec["role"],
@@ -443,6 +666,22 @@ function normalizeProfileSpec(value: unknown): AgentProfileSpec {
     max_children: number(item.max_children),
     base: Object.keys(base).length ? { profile_id: text(base.profile_id), version: number(base.version) } : null,
     metadata: record(item.metadata),
+    communication_policy: Object.keys(communication).length ? {
+      can_delegate: Boolean(communication.can_delegate),
+      allowed_child_roles: stringList(communication.allowed_child_roles).map((role) => role.toLowerCase()) as AgentProfileSpec["allowed_child_roles"],
+      required_brief_fields: stringList(communication.required_brief_fields),
+      max_initial_context_tokens: number(communication.max_initial_context_tokens, 4_000),
+      max_context_refs: number(communication.max_context_refs, 20),
+      max_inline_bytes_per_ref: number(communication.max_inline_bytes_per_ref, 8_192),
+      max_inline_bytes_total: number(communication.max_inline_bytes_total, 32_768),
+      allowed_context_ref_types: stringList(communication.allowed_context_ref_types),
+      allow_full_transcript_reference: Boolean(communication.allow_full_transcript_reference),
+      allowed_relation_types: stringList(communication.allowed_relation_types),
+      can_comment: communication.can_comment == null ? true : Boolean(communication.can_comment),
+      can_mention: communication.can_mention == null ? true : Boolean(communication.can_mention),
+      can_mention_receive: communication.can_mention_receive == null ? true : Boolean(communication.can_mention_receive),
+      result_contract_id: text(communication.result_contract_id, "task_result_v2"),
+    } : undefined,
   };
 }
 
@@ -726,7 +965,29 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
   const root = "/v1/orchestration";
   const createKeys = new WeakMap<CreateOrchestrationTask, string>();
   const resolutionKeys = new Map<string, string>();
+  const mutationRequest = (
+    method: "POST" | "PUT" | "PATCH" | "DELETE",
+    scope: string,
+    body?: unknown,
+    headers: Record<string, string> = {},
+  ) => jsonRequest(method, body, {
+    ...headers,
+    "Idempotency-Key": createClientIdempotencyKey(scope),
+  });
   return {
+    async getHandoffSettings(): Promise<HandoffRuntimeSettings> {
+      return normalizeHandoffSettings(
+        await apiRequest<unknown>("/v1/orchestration/handoff-settings"),
+      );
+    },
+
+    async updateHandoffSettings(settings: HandoffRuntimeSettings): Promise<HandoffRuntimeSettings> {
+      return normalizeHandoffSettings(await apiRequest<unknown>(
+        "/v1/orchestration/handoff-settings",
+        mutationRequest("PUT", "handoff-settings", settings),
+      ));
+    },
+
     async createTask(spec: CreateOrchestrationTask): Promise<OrchestrationTaskDetail> {
       const idempotencyKey = spec.idempotency_key
         || createKeys.get(spec)
@@ -734,7 +995,11 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
       createKeys.set(spec, idempotencyKey);
       return normalizeTaskDetail(await apiRequest(
         `${root}/tasks`,
-        jsonRequest("POST", { ...spec, read_only: Boolean(spec.read_only), idempotency_key: idempotencyKey }),
+        jsonRequest(
+          "POST",
+          { ...spec, read_only: Boolean(spec.read_only), idempotency_key: idempotencyKey },
+          { "Idempotency-Key": idempotencyKey },
+        ),
       ));
     },
     async listTasks(options: TaskListOptions = {}): Promise<OrchestrationTaskSummary[]> {
@@ -753,6 +1018,155 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
         `${root}/tasks/${encodeURIComponent(id)}`,
       );
       return normalizeTaskDetail(out);
+    },
+    async listTaskBriefs(taskId: string): Promise<TaskBrief[]> {
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/briefs`);
+      return array(out).map(normalizeBrief);
+    },
+    async getTaskBrief(taskId: string, revision: number): Promise<TaskBrief> {
+      return normalizeBrief(await apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/briefs/${revision}`));
+    },
+    validateTaskBrief(taskId: string, brief: TaskBriefInput): Promise<ValidationReport & { content_hash?: string }> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/briefs/validate`, jsonRequest("POST", brief));
+    },
+    async createTaskBrief(taskId: string, brief: TaskBriefInput): Promise<TaskBrief> {
+      return normalizeBrief(await apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/briefs`, mutationRequest("POST", "brief-create", brief)));
+    },
+    async updateTaskBrief(taskId: string, brief: TaskBrief): Promise<TaskBrief> {
+      const payload: TaskBriefInput = {
+        title: brief.title,
+        objective: brief.objective,
+        background: brief.background,
+        scope: brief.scope,
+        instructions: brief.instructions,
+        constraints: brief.constraints,
+        non_goals: brief.non_goals,
+        acceptance_criteria: brief.acceptance_criteria,
+        deliverables: brief.deliverables,
+        result_contract: brief.result_contract,
+      };
+      return normalizeBrief(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/briefs/${brief.revision}`,
+        mutationRequest("PATCH", "brief-update", payload, { "If-Match": brief.content_hash }),
+      ));
+    },
+    async publishTaskBrief(taskId: string, brief: Pick<TaskBrief, "revision" | "content_hash">): Promise<TaskBrief> {
+      return normalizeBrief(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/briefs/${brief.revision}/publish`,
+        mutationRequest("POST", "brief-publish", undefined, { "If-Match": brief.content_hash }),
+      ));
+    },
+    async listContextRefs(taskId: string, briefId?: string): Promise<ContextRef[]> {
+      const query = briefId ? `?brief_id=${encodeURIComponent(briefId)}` : "";
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/context-refs${query}`);
+      return array(out).map(normalizeContextRef);
+    },
+    async addContextRef(taskId: string, contextRef: ContextRefInput, briefId?: string): Promise<ContextRef> {
+      return normalizeContextRef(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/context-refs`,
+        mutationRequest("POST", "context-ref-add", { brief_id: briefId, context_ref: contextRef }),
+      ));
+    },
+    readContextRef(refId: string, startLine?: number, endLine?: number): Promise<Record<string, unknown>> {
+      const query = new URLSearchParams();
+      if (startLine !== undefined) query.set("start_line", String(startLine));
+      if (endLine !== undefined) query.set("end_line", String(endLine));
+      const suffix = query.toString();
+      return apiRequest(`${root}/context-refs/${encodeURIComponent(refId)}/content${suffix ? `?${suffix}` : ""}`);
+    },
+    verifyContextRef(refId: string): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/context-refs/${encodeURIComponent(refId)}/verify`, mutationRequest("POST", "context-ref-verify"));
+    },
+    async listTaskRelations(taskId: string): Promise<TaskRelation[]> {
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/relations`);
+      return array(out).map(normalizeRelation);
+    },
+    async addTaskRelation(
+      taskId: string,
+      relation: Pick<TaskRelation, "from_task_id" | "to_task_id" | "relation_type"> & { metadata?: Record<string, unknown> },
+    ): Promise<TaskRelation> {
+      return normalizeRelation(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/relations`,
+        mutationRequest("POST", "relation-add", relation),
+      ));
+    },
+    async removeTaskRelation(taskId: string, relationId: string): Promise<TaskRelation> {
+      return normalizeRelation(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/relations/${encodeURIComponent(relationId)}`,
+        mutationRequest("DELETE", "relation-remove"),
+      ));
+    },
+    async replaceTaskBlockers(
+      taskId: string,
+      taskIds: string[],
+      reason = "Operator updated blockers",
+    ): Promise<TaskRelation[]> {
+      const out = await apiRequest<unknown[]>(
+        `${root}/tasks/${encodeURIComponent(taskId)}/blockers`,
+        mutationRequest("PUT", "blockers-replace", {
+          task_ids: taskIds,
+          reason,
+          owner: "local-user",
+          required_action: "Complete all blocker tasks",
+        }),
+      );
+      return array(out).map(normalizeRelation);
+    },
+    async listTaskComments(taskId: string, afterSequence = 0): Promise<TaskCommentDelta> {
+      const out = record(await apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/comments?after_sequence=${afterSequence}`));
+      return {
+        task_id: text(out.task_id, taskId),
+        after_sequence: number(out.after_sequence, afterSequence),
+        latest_sequence: number(out.latest_sequence),
+        new_count: number(out.new_count),
+        comments: array(out.comments).map(normalizeComment),
+        fallback_fetch_needed: Boolean(out.fallback_fetch_needed),
+      };
+    },
+    async postTaskComment(taskId: string, bodyMarkdown: string, metadata: Record<string, unknown> = {}): Promise<TaskComment> {
+      return normalizeComment(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/comments`,
+        mutationRequest("POST", "comment-post", { body_markdown: bodyMarkdown, metadata }),
+      ));
+    },
+    async listTaskWorkProducts(taskId: string): Promise<WorkProduct[]> {
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/work-products`);
+      return array(out).map(normalizeWorkProduct);
+    },
+    async listResultQuestions(taskId: string): Promise<ResultQuestion[]> {
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/result-questions`);
+      return array(out).map(normalizeResultQuestion);
+    },
+    async askResultQuestion(taskId: string, question: string): Promise<ResultQuestion> {
+      return normalizeResultQuestion(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/result-questions`,
+        mutationRequest("POST", "result-question", { question }),
+      ));
+    },
+    async createTaskWorkProduct(
+      taskId: string,
+      product: Pick<WorkProduct, "kind" | "title" | "summary"> & Partial<Pick<WorkProduct, "uri" | "content_hash">>,
+    ): Promise<WorkProduct> {
+      return normalizeWorkProduct(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/work-products`,
+        mutationRequest("POST", "work-product-create", product),
+      ));
+    },
+    verifyWorkProduct(productId: string): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/work-products/${encodeURIComponent(productId)}/verify`, mutationRequest("POST", "work-product-verify"));
+    },
+    async listTaskWakes(taskId: string): Promise<WakeRequest[]> {
+      const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/wakes`);
+      return array(out).map(normalizeWake);
+    },
+    async retryWake(wakeId: string): Promise<WakeRequest> {
+      return normalizeWake(await apiRequest(`${root}/wakes/${encodeURIComponent(wakeId)}/retry`, mutationRequest("POST", "wake-retry")));
+    },
+    async cancelWake(wakeId: string): Promise<WakeRequest> {
+      return normalizeWake(await apiRequest(`${root}/wakes/${encodeURIComponent(wakeId)}/cancel`, mutationRequest("POST", "wake-cancel")));
+    },
+    getHeartbeatContext(taskId: string, afterSequence = 0): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/heartbeat-context?after_sequence=${afterSequence}`);
     },
     async getHealth(): Promise<OrchestrationHealth> {
       try {
@@ -875,6 +1289,48 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
         updated_at: text(out.updated_at) || null,
       };
     },
+    async getRunActivity(
+      taskId: string,
+      runId: string,
+      options: { afterSequence?: number; beforeSequence?: number; latest?: boolean; limit?: number } = {},
+    ): Promise<RunActivityPage> {
+      const query = new URLSearchParams({
+        limit: String(options.limit ?? 500),
+        latest: String(options.latest ?? true),
+      });
+      if (options.afterSequence != null) query.set("after_sequence", String(options.afterSequence));
+      if (options.beforeSequence != null) query.set("before_sequence", String(options.beforeSequence));
+      const out = record(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/activity?${query.toString()}`,
+      ));
+      return {
+        task_id: text(out.task_id, taskId),
+        run_id: text(out.run_id, runId),
+        activity: array(out.activity).map((raw) => {
+          const item = record(raw);
+          return {
+            sequence: number(item.sequence),
+            id: text(item.id),
+            event_key: text(item.event_key),
+            source_id: text(item.source_id),
+            kind: text(item.kind, "lifecycle") as RunActivityPage["activity"][number]["kind"],
+            status: text(item.status, "info") as RunActivityPage["activity"][number]["status"],
+            title: text(item.title, "Agent activity"),
+            summary: text(item.summary),
+            detail: record(item.detail),
+            created_at: text(item.created_at),
+          };
+        }),
+        has_more: Boolean(out.has_more),
+        next_sequence: out.next_sequence == null ? null : number(out.next_sequence),
+        next_parameter: text(out.next_parameter) || undefined,
+        order: text(out.order, "oldest_to_newest"),
+        privacy: {
+          reasoning: text(record(out.privacy).reasoning, "provider_summary_only"),
+          tool_output: text(record(out.privacy).tool_output, "metadata_only"),
+        },
+      };
+    },
     async submitTask(id: string): Promise<OrchestrationTaskDetail> {
       return normalizeTaskDetail(await apiRequest(
         `${root}/tasks/${encodeURIComponent(id)}/submit`,
@@ -902,6 +1358,12 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
     async archiveTask(id: string): Promise<OrchestrationTaskDetail> {
       return normalizeTaskDetail(await apiRequest(
         `${root}/tasks/${encodeURIComponent(id)}/archive`,
+        jsonRequest("POST"),
+      ));
+    },
+    async restoreTask(id: string): Promise<OrchestrationTaskDetail> {
+      return normalizeTaskDetail(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(id)}/restore`,
         jsonRequest("POST"),
       ));
     },

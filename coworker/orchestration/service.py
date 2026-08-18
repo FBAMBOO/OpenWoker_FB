@@ -19,7 +19,16 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from ..providers.matrix import MATRIX
-from .blobs import ContentAddressedBlobStore
+from .activity import bounded_activity_text
+from .blobs import BlobIntegrityError, ContentAddressedBlobStore
+from .communications import TaskCommunicationService
+from .context import (
+    ContextBudgetCalculator,
+    ContextManifestBuilder,
+    ContextPolicy,
+    ContextRefResolver,
+    LegacyUpstreamExternalizer,
+)
 from .catalogs import ConfigurationCatalog
 from .dag import validate_plan
 from .errors import (
@@ -30,6 +39,22 @@ from .errors import (
     VersionConflict,
 )
 from .executor import ExecutionOutcome, OpenWorkerExecutor, RunExecutionContext
+from .envelope import build_execution_envelope, render_initial_user_prompt
+from .handoff_models import (
+    BriefStatus,
+    ContextRefDraft,
+    ContextRefType,
+    ContextRequirement,
+    HandoffValidationError,
+    TaskBriefDraft,
+    TaskRelationType,
+    WakeReason,
+    WakeStatus,
+    WorkProductKind,
+    contains_secret_like,
+    jsonable as handoff_jsonable,
+)
+from .handoff_settings import HandoffRuntimeSettings
 from .models import (
     ComplexityLevel,
     EdgeCondition,
@@ -67,6 +92,8 @@ from .policy import (
 )
 from .presets import RuntimePreset, runtime_preset, runtime_presets
 from .profiles import AgentProfile, AgentRole
+from .observability import HandoffMetrics
+from .relations import TaskRelationService
 from .routing import (
     ModelCandidate,
     ModelPolicy,
@@ -77,6 +104,7 @@ from .routing import (
 )
 from .runtime import (
     DEFAULT_TASK_BUDGET,
+    UNLIMITED_RUNTIME_BUDGET,
     BudgetExceededError,
     PermissionSet,
     RootPermission,
@@ -90,6 +118,8 @@ from .runtime import (
     RuntimeStatus,
 )
 from .store import OrchestrationStore
+from .wakes import WakeService
+from .work_products import WorkProductService
 from .subscription_runtime import (
     SubscriptionDispatchExecutor,
     SubscriptionRuntimeRegistry,
@@ -146,6 +176,25 @@ _READ_ONLY_RUNTIME_TOOLS = frozenset(
         "cancel_agent",
         "todo_write",
         "submit_verdict",
+        "get_task_context",
+        "list_context_refs",
+        "read_context_ref",
+        "delegate_task",
+        "post_task_comment",
+        "list_task_comments",
+        "add_task_blockers",
+        "remove_task_blocker",
+        "create_work_product",
+        "complete_task",
+        "fail_task",
+    }
+)
+_MUTATING_DELIVERABLE_KINDS = frozenset(
+    {
+        WorkProductKind.IMPLEMENTATION_PATCH.value,
+        WorkProductKind.PULL_REQUEST.value,
+        WorkProductKind.COMMIT.value,
+        WorkProductKind.BRANCH.value,
     }
 )
 _TERMINAL_TASKS = frozenset(
@@ -164,6 +213,11 @@ _DETAIL_CHILD_DEPTH = 3
 _DETAIL_TREE_ROW_LIMIT = 256
 _DETAIL_RUNTIME_LIMIT = 256
 _RUN_ERROR_MESSAGE_LIMIT = 8_000
+_LEGACY_HANDOFF_RETRY_REASON = "legacy_subscription_result_handoff"
+_BOUNDED_ENVELOPE_RETRY_REASON = "bounded_work_product_envelope_handoff"
+_COMPATIBILITY_RETRY_REASONS = frozenset(
+    {_LEGACY_HANDOFF_RETRY_REASON, _BOUNDED_ENVELOPE_RETRY_REASON}
+)
 _UNSET = object()
 
 
@@ -216,6 +270,7 @@ class OrchestrationService:
         max_concurrency: int = 8,
         poll_seconds: float = 0.25,
         executor: Optional[Any] = None,
+        enforce_runtime_budgets: bool = True,
     ) -> None:
         self.manager = manager
         self.base = Path(data_dir).expanduser().resolve()
@@ -223,8 +278,58 @@ class OrchestrationService:
         self.store = OrchestrationStore(self.base / "orchestration.db")
         self.catalog = ConfigurationCatalog(self.base / "catalog.json")
         self.blobs = ContentAddressedBlobStore(self.base / "blobs")
+        self.legacy_upstream_externalizer = LegacyUpstreamExternalizer(self.blobs)
+        self._backfill_legacy_upstream_context()
         self.workspaces = WorkspaceManager(self.base / "workspaces")
+        try:
+            if hasattr(manager, "orchestration_handoff_settings"):
+                application_settings = {
+                    "orchestration_handoff": dict(
+                        manager.orchestration_handoff_settings() or {}
+                    )
+                }
+            else:
+                application_settings = dict(manager.get_settings() or {})
+        except Exception:
+            application_settings = {}
+        raw_handoff_settings = application_settings.get("orchestration_handoff")
+        if not isinstance(raw_handoff_settings, Mapping):
+            orchestration_settings = application_settings.get("orchestration")
+            raw_handoff_settings = (
+                dict(orchestration_settings).get("communication")
+                if isinstance(orchestration_settings, Mapping)
+                else {}
+            )
+        self.handoff_settings = HandoffRuntimeSettings.from_mapping(
+            raw_handoff_settings if isinstance(raw_handoff_settings, Mapping) else {}
+        )
+        self.context_resolver = ContextRefResolver(
+            self.store,
+            blob_store=self.blobs,
+            policy=ContextPolicy(
+                max_initial_context_tokens=self.handoff_settings.default_context_token_budget,
+                max_context_refs=self.handoff_settings.max_context_refs,
+                max_inline_bytes_per_ref=self.handoff_settings.max_inline_bytes_per_ref,
+                max_inline_bytes_total=self.handoff_settings.max_inline_bytes_total,
+                context_read_audit_enabled=self.handoff_settings.context_read_audit_enabled,
+            ),
+        )
+        self.relations = TaskRelationService(self.store)
+        self.wakes = WakeService(
+            self.store,
+            max_attempts=self.handoff_settings.wake_max_attempts,
+            backoff_seconds=self.handoff_settings.wake_backoff_seconds,
+        )
+        self.communications = TaskCommunicationService(
+            self.store,
+            blob_store=self.blobs,
+            max_batch=self.handoff_settings.max_comment_batch,
+            wake_coalesce_window_ms=self.handoff_settings.wake_coalesce_window_ms,
+        )
+        self.work_products = WorkProductService(self.store)
+        self.handoff_metrics = HandoffMetrics()
         self.max_concurrency = max(1, min(int(max_concurrency), 8))
+        self.enforce_runtime_budgets = bool(enforce_runtime_budgets)
         self.runtime_limits = RuntimeLimits(max_concurrency=self.max_concurrency)
         self.poll_seconds = max(0.05, float(poll_seconds))
         self.worker_id = f"local-{uuid.uuid4().hex[:12]}"
@@ -250,6 +355,10 @@ class OrchestrationService:
                 cancel_child=self._cancel_child,
                 on_gate=self._gate_opened,
                 blob_store=self.blobs,
+                context_resolver=self.context_resolver,
+                handoff_metrics=self.handoff_metrics,
+                profile_resolver=self.catalog.resolve_profile,
+                wake_coalesce_window_ms=self.handoff_settings.wake_coalesce_window_ms,
             )
             self.executor = SubscriptionDispatchExecutor(
                 native_executor, self.subscription_runtimes
@@ -269,6 +378,9 @@ class OrchestrationService:
         self._runtime_trees: dict[str, RuntimeManager] = {}
         self._runtime_task_roots: dict[str, str] = {}
         self._last_lease_reap = datetime.min.replace(tzinfo=timezone.utc)
+        self._last_handoff_metrics_refresh = datetime.min.replace(
+            tzinfo=timezone.utc
+        )
         self._scheduler_started_at: Optional[datetime] = None
         self._last_scheduler_tick_started: Optional[datetime] = None
         self._last_scheduler_success: Optional[datetime] = None
@@ -286,10 +398,72 @@ class OrchestrationService:
         self._outbox_dead_letters = 0
         self._oldest_outbox_pending_at: Optional[str] = None
 
+    def _backfill_legacy_upstream_context(self) -> int:
+        """Externalize historical upstream input without changing compatibility columns."""
+
+        created = 0
+        for task in self.store.list_all_tasks():
+            if "upstream" in task.input:
+                raw = task.input.get("upstream")
+            elif "upstream_context" in task.input:
+                raw = task.input.get("upstream_context")
+            else:
+                continue
+            if raw in (None, "", (), [], {}):
+                continue
+            refs = self.store.list_context_refs(
+                task.id, brief_id=task.active_brief_id
+            )
+            if any(
+                str(item.provenance.get("source") or "") == "legacy_upstream"
+                for item in refs
+            ):
+                continue
+            payload = dict(raw) if isinstance(raw, Mapping) else {"value": raw}
+            draft = self.legacy_upstream_externalizer.externalize(
+                payload,
+                display_name=f"Legacy upstream input for {task.title}",
+            )
+            self.store.backfill_legacy_upstream_ref(task.id, draft)
+            created += 1
+        return created
+
+    def update_handoff_settings(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply a validated runtime communication policy without a service restart."""
+
+        settings = HandoffRuntimeSettings.from_mapping(value)
+        self.handoff_settings = settings
+        self.context_resolver.policy = ContextPolicy(
+            max_initial_context_tokens=settings.default_context_token_budget,
+            max_context_refs=settings.max_context_refs,
+            max_inline_bytes_per_ref=settings.max_inline_bytes_per_ref,
+            max_inline_bytes_total=settings.max_inline_bytes_total,
+            context_read_audit_enabled=settings.context_read_audit_enabled,
+        )
+        self.wakes.max_attempts = settings.wake_max_attempts
+        self.wakes.backoff_seconds = settings.wake_backoff_seconds
+        self.communications.max_batch = max(
+            1, min(settings.max_comment_batch, 1_000)
+        )
+        self.communications.wake_coalesce_window_ms = (
+            settings.wake_coalesce_window_ms
+        )
+        native_executor = getattr(self.executor, "native", self.executor)
+        handoff_tools = getattr(native_executor, "handoff_tools", None)
+        if handoff_tools is not None:
+            handoff_tools.wake_coalesce_window_ms = (
+                settings.wake_coalesce_window_ms
+            )
+        return settings.to_dict()
+
     # -- process lifecycle ------------------------------------------------
     async def start(self) -> None:
         if self._loop_task is not None and not self._loop_task.done():
             return
+        # Acquire the startup/leader fence before any cancellation-resistant
+        # recovery read.  Otherwise a canceled verifier and a replacement process
+        # can recover the same database concurrently.  Event-chain verification is
+        # still the first recovery action and no scheduler work begins before it.
         token, epoch = self.store.acquire_scheduler_leader(
             self.worker_id, lease_seconds=self._leader_lease_seconds
         )
@@ -308,8 +482,23 @@ class OrchestrationService:
                 self.store.reap_expired_leases,
                 command_id=f"startup-reap-{uuid.uuid4().hex}",
             )
+            await self._durable_to_thread(self.wakes.recover_expired_claims)
+            await self._durable_to_thread(self.wakes.activate_due)
             await self._durable_to_thread(self._repair_legacy_final_rejections)
             await self._durable_to_thread(self._reconcile_orphaned_gate_checkpoints)
+            await self._durable_to_thread(
+                self._repair_superseded_policy_skip_gates
+            )
+            await self._durable_to_thread(
+                self._repair_legacy_subscription_work_products
+            )
+            await self._durable_to_thread(
+                self._repair_evaluator_adjudicated_gates
+            )
+            await self._durable_to_thread(
+                self._repair_legacy_verification_reconciliation_gates
+            )
+            await self._durable_to_thread(self.store.verify_relation_consistency)
             await self._recover_incomplete_deliveries()
             await self._durable_to_thread(self._recover_delivered_publications)
             await self._recover_pending_run_commits()
@@ -464,8 +653,16 @@ class OrchestrationService:
                         self._rebuild_all_runtimes()
                 self._resume_completed_child_waits()
                 await self._recover_pending_run_commits()
+                await self._dispatch_ready_wakes()
                 await self._coordinate_tasks()
                 await self._claim_work()
+                if (
+                    now - self._last_handoff_metrics_refresh
+                ).total_seconds() >= 5:
+                    await self._durable_to_thread(
+                        self._refresh_handoff_metrics, now=now
+                    )
+                    self._last_handoff_metrics_refresh = now
                 self._record_scheduler_success()
             except asyncio.CancelledError:
                 raise
@@ -635,6 +832,10 @@ class OrchestrationService:
             "stale": scheduler_stale,
             "stale_after_seconds": stale_after_seconds,
             "active_jobs": sum(1 for job in self._jobs.values() if not job.done()),
+            "handoff": {
+                "settings": self.handoff_settings.to_dict(),
+                "metrics": self.handoff_metrics.snapshot(),
+            },
         }
 
     async def _coordinate_tasks(self) -> None:
@@ -674,6 +875,111 @@ class OrchestrationService:
             except Exception as exc:
                 logger.exception("could not advance orchestration task %s", task.id)
                 self._block_task(task.id, "coordinator_error", str(exc))
+
+    async def _dispatch_ready_wakes(self) -> None:
+        """Turn durable wake intent into at-most-one run delivery per claim."""
+
+        await self._durable_to_thread(self.wakes.activate_due)
+        await self._durable_to_thread(self.wakes.recover_expired_claims)
+        for _ in range(64):
+            wake = await self._durable_to_thread(
+                self.wakes.claim_ready_wake,
+                self.worker_id,
+                claim_seconds=60,
+            )
+            if wake is None:
+                return
+            try:
+                task = self.store.get_task(wake.target_task_id)
+                if task.status in _TERMINAL_TASKS or task.status is TaskStatus.CANCELING:
+                    self.store.cancel_claimed_wake(
+                        wake.id,
+                        reason=f"target task is {task.status.value}",
+                        command_id=_command("wake-cancel-terminal", wake.id),
+                    )
+                    continue
+                if bool(wake.payload.get("notice_only")):
+                    self.wakes.mark_delivered(wake.id)
+                    self.wakes.mark_completed(wake.id)
+                    self._observe_wake_delivery(wake)
+                    continue
+                if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                    try:
+                        await self._durable_to_thread(self._advance_task, task.id)
+                    except (ConflictError, VersionConflict):
+                        pass
+                candidates = self.store.list_runs(
+                    task.id,
+                    statuses=(
+                        RunStatus.QUEUED,
+                        RunStatus.CLAIMED,
+                        RunStatus.RUNNING,
+                        RunStatus.WAITING_GATE,
+                    ),
+                    limit=100,
+                    newest=True,
+                )
+                selected = next(
+                    (
+                        item
+                        for item in reversed(candidates)
+                        if wake.target_run_id == item.id
+                    ),
+                    None,
+                )
+                if selected is None:
+                    selected = next(
+                        (
+                            item
+                            for item in candidates
+                            if item.status is RunStatus.QUEUED
+                        ),
+                        None,
+                    )
+                if selected is not None:
+                    self.wakes.bind_to_run(
+                        wake.id, selected.id, owner=self.worker_id
+                    )
+                    self._observe_wake_delivery(wake)
+                    continue
+                self.wakes.defer_wake(
+                    wake.id,
+                    not_before=datetime.now(timezone.utc)
+                    + timedelta(seconds=max(1.0, self.poll_seconds * 4)),
+                )
+            except Exception as exc:
+                logger.exception("could not deliver orchestration wake %s", wake.id)
+                failed = self.wakes.mark_failed(wake.id, str(exc))
+                self.handoff_metrics.increment("orchestration_wake_failures_total")
+                # Retain the preview-era spelling for diagnostic consumers.
+                self.handoff_metrics.increment("orchestration_wake_failed_total")
+                if failed.status is WakeStatus.FAILED:
+                    self.handoff_metrics.increment(
+                        "orchestration_wake_dead_letter_total"
+                    )
+
+    def _observe_wake_delivery(self, wake: Any) -> None:
+        self.handoff_metrics.increment("orchestration_wake_delivered_total")
+        self.handoff_metrics.observe(
+            "orchestration_wake_delivery_latency_seconds",
+            max(0.0, (datetime.now(timezone.utc) - wake.created_at).total_seconds()),
+        )
+
+    def _refresh_handoff_metrics(
+        self, *, now: Optional[datetime] = None
+    ) -> None:
+        snapshot = self.store.handoff_observability_snapshot(now=now)
+        self.handoff_metrics.observe(
+            "orchestration_wakes_pending", snapshot["wakes_pending"]
+        )
+        self.handoff_metrics.set_counter(
+            "orchestration_wake_coalesced_total",
+            int(snapshot["wake_coalesced_total"]),
+        )
+        self.handoff_metrics.observe(
+            "orchestration_task_blocked_duration_seconds",
+            snapshot["task_blocked_duration_seconds"],
+        )
 
     async def _claim_work(self) -> None:
         capacity = self.max_concurrency - len(self._jobs)
@@ -768,6 +1074,19 @@ class OrchestrationService:
             wall_seconds=int(
                 raw.get("wall_seconds", raw.get("active_seconds", DEFAULT_TASK_BUDGET.wall_seconds))
             ),
+        )
+
+    @staticmethod
+    def _bounded_budget(
+        usage: RuntimeBudget, ceiling: RuntimeBudget
+    ) -> RuntimeBudget:
+        """Clamp observed usage for ledger recovery without changing audit truth."""
+
+        return RuntimeBudget(
+            model_calls=min(usage.model_calls, ceiling.model_calls),
+            tool_calls=min(usage.tool_calls, ceiling.tool_calls),
+            tokens=min(usage.tokens, ceiling.tokens),
+            wall_seconds=min(usage.wall_seconds, ceiling.wall_seconds),
         )
 
     @staticmethod
@@ -965,6 +1284,8 @@ class OrchestrationService:
     def _run_budget(
         self, task: TaskRecord, graph: PlanGraph, node: NodeRecord
     ) -> RuntimeBudget:
+        if not self.enforce_runtime_budgets:
+            return UNLIMITED_RUNTIME_BUDGET
         explicit = task.budget.get("run_budget") if isinstance(task.budget, Mapping) else None
         if isinstance(explicit, Mapping):
             return self._budget(explicit)
@@ -999,6 +1320,8 @@ class OrchestrationService:
         return allocation - spent
 
     def _validate_plan_budget(self, budget: Mapping[str, Any], spec: PlanSpec) -> None:
+        if not self.enforce_runtime_budgets:
+            return
         total = self._budget(budget)
         node_count = len(spec.nodes)
         if not node_count:
@@ -1224,15 +1547,55 @@ class OrchestrationService:
             }
             for item in all_evidence[-128:]
         ]
+        structured_results = [
+            dict(item)
+            for run in runs
+            for item in ((run.output or {}).get("result"),)
+            if isinstance(item, Mapping)
+            and int(item.get("schema_version") or 0) >= 2
+        ]
+        latest_structured = structured_results[-1] if structured_results else {}
+        products = self.store.list_work_products(task.id, limit=1_000)
+        active_brief = self.store.get_active_brief(task.id)
+        summary = str(
+            latest_structured.get("summary")
+            or next(
+                (
+                    item["summary"]
+                    for item in reversed(run_results)
+                    if str(item.get("summary") or "").strip()
+                ),
+                "",
+            )
+        )[:8_000]
         envelope: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "child_task_id": task.id,
             "task_id": task.id,
+            "brief_revision": active_brief.revision,
             "plan_id": task.active_plan_id,
             "status": (
                 TaskStatus.COMPLETED.value
                 if task.status is TaskStatus.RUNNING
                 and task.current_stage is OrchestrationStage.ARCHIVE
                 else task.status.value
+            ),
+            "summary": summary,
+            "criterion_results": dict(
+                latest_structured.get("criterion_results") or {}
+            ),
+            "work_product_refs": [item.id for item in products],
+            "artifact_refs": [
+                str(item.artifact_id or item.uri)
+                for item in products
+                if item.artifact_id or item.uri
+            ],
+            "remaining_risks": list(
+                latest_structured.get("remaining_risks") or ()
+            )[:100],
+            "completed_at": (
+                latest_structured.get("completed_at")
+                or _iso(task.updated_at)
             ),
             "accepted_subject": dict((accepted or {}).get("subject") or {}),
             "publication": dict((accepted or {}).get("publication") or {}),
@@ -1260,6 +1623,30 @@ class OrchestrationService:
         text = str(value or "").strip().lower()
         normalized = aliases.get(text, text)
         return normalized if normalized in {"pass", "fail", "unknown"} else "unknown"
+
+    @staticmethod
+    def _explicit_handoff_result(
+        output: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Return only a complete_task result, never a vendor structured result.
+
+        Subscription runtimes have long exposed ``structured_result`` with the
+        provider-neutral ``status/criteria/files_touched/checks`` schema.  Durable
+        handoff settlement instead requires ``criterion_results/work_products``.
+        Treating the former as the latter made a successful subscription turn fail
+        after completion because criterion text was mistaken for a missing Brief ID.
+        """
+
+        explicit = output.get("handoff_result")
+        if isinstance(explicit, Mapping):
+            return dict(explicit)
+        legacy = output.get("structured_result")
+        if isinstance(legacy, Mapping) and {
+            "criterion_results",
+            "work_products",
+        }.issubset(legacy):
+            return dict(legacy)
+        return None
 
     def _verification_reports(
         self,
@@ -1357,6 +1744,115 @@ class OrchestrationService:
             )
         return reports
 
+    @staticmethod
+    def _verification_adjudication(
+        reports: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Choose the role that is responsible for settling verifier dissent.
+
+        Evaluator/scorer nodes are graph-validated to run downstream of the
+        independent reviewer/tester nodes.  A complete passing verdict from every
+        configured adjudicator therefore settles an earlier dissent without
+        discarding it.  If an adjudicator is absent, incomplete, or adverse, all
+        verifier reports remain authoritative and the disagreement stays open.
+        """
+
+        adjudicator_roles = {AgentRole.EVALUATOR.value, AgentRole.SCORER.value}
+        adjudicators = [
+            dict(report)
+            for report in reports
+            if str(report.get("role") or "").lower() in adjudicator_roles
+        ]
+        adjudicated = bool(adjudicators) and all(
+            str(report.get("status") or "unknown") == "pass"
+            for report in adjudicators
+        )
+        dissent = [
+            dict(report)
+            for report in reports
+            if str(report.get("role") or "").lower() not in adjudicator_roles
+            and str(report.get("status") or "unknown") != "pass"
+        ]
+        authoritative = adjudicators if adjudicated else [dict(report) for report in reports]
+        return {
+            "adjudicated": adjudicated,
+            "authority": "evaluator" if adjudicated else "verification_consensus",
+            "authoritative": authoritative,
+            "adjudicators": adjudicators,
+            "dissent": dissent,
+        }
+
+    @staticmethod
+    def _verification_signature(
+        reports: Sequence[Mapping[str, Any]],
+    ) -> str:
+        material = sorted(
+            (
+                str(report.get("node_id") or report.get("node_key") or ""),
+                str(report.get("run_id") or ""),
+                str(report.get("role") or ""),
+                str(report.get("status") or "unknown"),
+            )
+            for report in reports
+        )
+        return hashlib.sha256(
+            json.dumps(material, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _accepted_current_verification_gate(
+        self,
+        task_id: str,
+        graph: PlanGraph,
+        reports: Sequence[Mapping[str, Any]],
+    ) -> Optional[GateRecord]:
+        """Return a human override only when it names the current immutable runs."""
+
+        signature = self._verification_signature(reports)
+        expected_runs = sorted(
+            (
+                str(report.get("node_id") or report.get("node_key") or ""),
+                str(report.get("run_id") or ""),
+            )
+            for report in reports
+        )
+        prefix = f"{task_id}:reconciliation:{graph.plan.id}:"
+        for gate in reversed(self.store.list_gates(task_id)):
+            resolution = dict(gate.resolution or {})
+            if (
+                gate.kind is not GateKind.RECONCILIATION
+                or gate.status is not GateStatus.APPROVED
+                or gate.run_id is not None
+                or not gate.source_key.startswith(prefix)
+                or str(resolution.get("decision") or "") != "accept_current"
+            ):
+                continue
+            prompt = dict(gate.prompt)
+            if any(
+                prompt.get(key)
+                for key in (
+                    "failed_runs",
+                    "workspace_commit_failures",
+                    "failed_children",
+                )
+            ):
+                continue
+            prompt_signature = str(prompt.get("verification_signature") or "")
+            if prompt_signature:
+                if prompt_signature == signature:
+                    return gate
+                continue
+            prompt_runs = sorted(
+                (
+                    str(report.get("node_id") or report.get("node_key") or ""),
+                    str(report.get("run_id") or ""),
+                )
+                for report in (prompt.get("verification") or ())
+                if isinstance(report, Mapping)
+            )
+            if prompt_runs == expected_runs:
+                return gate
+        return None
+
     def _rebuild_all_runtimes(self) -> None:
         roots = [task.id for task in self.store.list_root_tasks()]
         with self._runtime_lock:
@@ -1417,7 +1913,11 @@ class OrchestrationService:
                 runtime_id=task_runtime_id,
                 profile_id=str(task.policy.get("profile_id") or "orchestrator"),
                 task=task.objective,
-                budget=self._budget(task.budget),
+                budget=(
+                    self._budget(task.budget)
+                    if self.enforce_runtime_budgets
+                    else UNLIMITED_RUNTIME_BUDGET
+                ),
                 permissions=self._task_permissions(task),
                 parent_id=parent_runtime_id,
                 metadata={"task_id": task.id},
@@ -1526,9 +2026,18 @@ class OrchestrationService:
                     usage = self._usage_for_run(
                         run, usage_evidence_by_run.get(run.id, ())
                     )
-                    if usage != RuntimeBudget():
-                        manager.charge(runtime_id, usage)
-                    spent_by_node[node.id] = spent + usage
+                    # Historical versions could persist the measured usage before
+                    # noticing that it crossed this attempt's allocation. Preserve
+                    # that immutable evidence, but rebuild the ledger with only the
+                    # amount the attempt could have consumed. Recovery must never
+                    # block an operator merely because the terminal run was over
+                    # budget.
+                    accounted = self._bounded_budget(
+                        usage, runtime_node.remaining_budget
+                    )
+                    if accounted != RuntimeBudget():
+                        manager.charge(runtime_id, accounted)
+                    spent_by_node[node.id] = spent + accounted
                 if run.status is RunStatus.WAITING_GATE:
                     manager.suspend(runtime_id)
                 elif run.status in _TERMINAL_RUNS:
@@ -1875,7 +2384,15 @@ class OrchestrationService:
         *,
         _parent_context: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
-        objective = str(request.get("objective") or "").strip()
+        raw_brief = request.get("brief")
+        brief_draft = (
+            TaskBriefDraft.from_mapping(raw_brief)
+            if isinstance(raw_brief, Mapping)
+            else None
+        )
+        objective = str(
+            brief_draft.objective if brief_draft else request.get("objective") or ""
+        ).strip()
         if not objective:
             raise ValueError("objective is required")
         domain = TaskDomain(str(request.get("domain") or "code"))
@@ -1886,6 +2403,21 @@ class OrchestrationService:
                 "read_only=true cannot be combined with external_writes=true; "
                 "remove external_writes or create an explicitly writable task"
             )
+        if read_only and brief_draft is not None:
+            mutating_deliverables = sorted(
+                {
+                    str(item.get("kind") or "").strip()
+                    for item in brief_draft.deliverables
+                    if str(item.get("kind") or "").strip()
+                    in _MUTATING_DELIVERABLE_KINDS
+                }
+            )
+            if mutating_deliverables:
+                raise ValueError(
+                    "read-only tasks cannot require mutating deliverables: "
+                    + ", ".join(mutating_deliverables)
+                    + "; use artifact, review_report, test_result, plan, or other"
+                )
         # Knowledge tasks must not accidentally inherit a writable project merely
         # because the desktop currently has one open.  Code tasks retain that useful
         # default; every explicit workspace is validated for either domain.
@@ -1918,11 +2450,74 @@ class OrchestrationService:
                 "runtime_preset_id and requested_model are mutually exclusive; "
                 "use per-node models for explicit custom-plan overrides"
             )
-        criteria = tuple(str(v).strip() for v in request.get("acceptance_criteria", ()) if str(v).strip())
-        constraints = tuple(str(v).strip() for v in request.get("constraints", ()) if str(v).strip())
+        criteria = (
+            tuple(
+                str(item.get("text") or "").strip()
+                for item in brief_draft.acceptance_criteria
+                if str(item.get("text") or "").strip()
+            )
+            if brief_draft
+            else tuple(str(v).strip() for v in request.get("acceptance_criteria", ()) if str(v).strip())
+        )
+        constraints = (
+            brief_draft.constraints
+            if brief_draft
+            else tuple(str(v).strip() for v in request.get("constraints", ()) if str(v).strip())
+        )
         profile_id = str(request.get("profile_id") or "worker")
         model_policy_id = str(request.get("model_policy_id") or "quality-first")
         primary_profile = self.catalog.resolve_profile(profile_id)
+        communication_policy = primary_profile.communication_policy
+        if brief_draft is not None and self.handoff_settings.structured_handoff_enabled:
+            missing_outcome_tools = {
+                "complete_task",
+                "fail_task",
+            } - set(primary_profile.allowed_tools)
+            if missing_outcome_tools:
+                raise ValueError(
+                    "structured handoff profile is missing required outcome tools: "
+                    + ", ".join(sorted(missing_outcome_tools))
+                )
+        context_policy = ContextPolicy(
+            max_initial_context_tokens=min(
+                self.handoff_settings.default_context_token_budget,
+                communication_policy.max_initial_context_tokens,
+            ),
+            max_context_refs=min(
+                self.handoff_settings.max_context_refs,
+                communication_policy.max_context_refs,
+            ),
+            max_inline_bytes_per_ref=min(
+                self.handoff_settings.max_inline_bytes_per_ref,
+                communication_policy.max_inline_bytes_per_ref,
+            ),
+            max_inline_bytes_total=min(
+                self.handoff_settings.max_inline_bytes_total,
+                communication_policy.max_inline_bytes_total,
+            ),
+            allowed_context_ref_types=communication_policy.allowed_context_ref_types,
+            allow_full_transcript_reference=communication_policy.allow_full_transcript_reference,
+            network=bool(request.get("network", False)),
+            context_read_audit_enabled=self.handoff_settings.context_read_audit_enabled,
+        )
+        raw_context_refs = request.get("context_refs") or ()
+        prepared_refs: list[ContextRefDraft] = []
+        for raw_ref in raw_context_refs:
+            if not isinstance(raw_ref, Mapping):
+                raise ValueError("each context reference must be an object")
+            context_ref = ContextRefDraft.from_mapping(raw_ref)
+            if context_ref.ref_type in {
+                ContextRefType.FILE,
+                ContextRefType.FILE_RANGE,
+                ContextRefType.GIT_DIFF,
+            }:
+                if not workspace:
+                    raise ValueError("file context references require a workspace")
+                context_ref = self.context_resolver.prepare_file_ref(
+                    str(workspace), context_ref
+                )
+            prepared_refs.append(context_ref)
+        context_refs = ContextManifestBuilder(context_policy).normalize(prepared_refs)
         allowed_primary_roles = {
             AgentRole.WORKER,
             AgentRole.PLANNER,
@@ -2022,6 +2617,10 @@ class OrchestrationService:
             "read_only": read_only,
             "network": bool(request.get("network", False)),
             "external_writes": external_writes,
+            "structured_handoff": bool(
+                brief_draft is not None
+                and self.handoff_settings.structured_handoff_enabled
+            ),
             "runtime_preset_id": selected_preset.preset_id if selected_preset else None,
             "runtime_preset_version": selected_preset.version if selected_preset else None,
             "runtime_preset_hash": (
@@ -2049,7 +2648,11 @@ class OrchestrationService:
         task = self.store.create_task(
             TaskSpec(
                 idempotency_key=idempotency_key,
-                title=str(request.get("title") or objective[:120]),
+                title=str(
+                    brief_draft.title
+                    if brief_draft
+                    else request.get("title") or objective[:120]
+                ),
                 objective=objective,
                 domain=domain,
                 workspace=str(workspace) if workspace else None,
@@ -2066,8 +2669,17 @@ class OrchestrationService:
                 parent_task_id=request.get("parent_task_id"),
                 parent_node_id=request.get("parent_node_id"),
             ),
+            brief=brief_draft,
+            context_refs=context_refs,
+            publish_brief=bool(request.get("publish_brief", True)),
             command_id=str(request.get("command_id") or _command("create", idempotency_key)),
         )
+        if brief_draft is not None and bool(request.get("publish_brief", True)):
+            self.handoff_metrics.increment("orchestration_brief_published_total")
+        if context_refs:
+            self.handoff_metrics.increment(
+                "orchestration_context_refs_created_total", len(context_refs)
+            )
         self.store.add_evidence(
             task.id,
             kind=EvidenceKind.DECISION,
@@ -2092,7 +2704,11 @@ class OrchestrationService:
                     selected_preset.version,
                 ),
             )
-        if bool(request.get("auto_start", True)) and task.status is TaskStatus.DRAFT:
+        if (
+            bool(request.get("auto_start", True))
+            and bool(request.get("publish_brief", True))
+            and task.status is TaskStatus.DRAFT
+        ):
             task = self.submit_task(task.id)
         self._runtime_for_task(task.id, rebuild=True)
         self.wake()
@@ -2100,6 +2716,17 @@ class OrchestrationService:
 
     def submit_task(self, task_id: str) -> TaskRecord:
         task = self.store.get_task(task_id)
+        if bool(task.policy.get("structured_handoff")):
+            try:
+                brief = self.store.get_active_brief(task.id)
+            except NotFoundError as exc:
+                raise ConflictError(
+                    "publish a valid Task Brief before submitting this task"
+                ) from exc
+            if brief.status is not BriefStatus.PUBLISHED:
+                raise ConflictError(
+                    "publish a valid Task Brief before submitting this task"
+                )
         if task.status is TaskStatus.DRAFT:
             task = self.store.transition_task_status(
                 task.id,
@@ -2138,6 +2765,18 @@ class OrchestrationService:
                 )
             elif task.status is not TaskStatus.PAUSED:
                 raise ConflictError(f"cannot pause a task in {task.status.value} state")
+        # PAUSED is an execution stop, not only a scheduler flag. Interrupt every
+        # currently owned process for this task without canceling its asyncio job:
+        # the executor can reap its process tree, persist measured usage, and leave
+        # a normal retry/reconciliation record for a later resume.
+        interrupt = getattr(self.executor, "interrupt", None)
+        if callable(interrupt):
+            for run in self.store.list_runs(
+                task.id,
+                statuses=(RunStatus.CLAIMED, RunStatus.RUNNING),
+                limit=1_000,
+            ):
+                interrupt(run.id)
         return task
 
     def resume_task(self, task_id: str) -> TaskRecord:
@@ -2184,12 +2823,13 @@ class OrchestrationService:
             with publication_fence:
                 fresh = self.store.get_task(current.id)
                 if fresh.status is TaskStatus.DRAFT:
-                    self.store.transition_task_status(
+                    canceled = self.store.transition_task_status(
                         fresh.id,
                         TaskStatus.CANCELED,
                         expected_version=fresh.version,
                         command_id=f"cancel-{uuid.uuid4().hex}",
                     )
+                    self.relations.resolve_terminal(canceled.id)
                     continue
                 if fresh.status in _TERMINAL_TASKS:
                     continue
@@ -2252,9 +2892,33 @@ class OrchestrationService:
                 output={**dict(task.output or {}), "archived_from": task.status.value},
                 command_id=f"archive-{uuid.uuid4().hex}",
             )
+            self.relations.resolve_terminal(task.id)
         elif task.status is not TaskStatus.ARCHIVED:
             raise ConflictError(f"cannot archive a task in {task.status.value} state")
         self._cleanup_task_workspaces(task.id)
+        return task
+
+    def restore_task(self, task_id: str) -> TaskRecord:
+        task = self.store.get_task(task_id)
+        if task.status is TaskStatus.ARCHIVED:
+            archived_from = str(
+                dict(task.output or {}).get("archived_from") or "completed"
+            )
+            if archived_from != TaskStatus.COMPLETED.value:
+                raise ConflictError(
+                    "only successfully completed tasks can be restored"
+                )
+            restored_output = dict(task.output or {})
+            restored_output.pop("archived_from", None)
+            task = self.store.transition_task_status(
+                task.id,
+                TaskStatus.COMPLETED,
+                expected_version=task.version,
+                output=restored_output,
+                command_id=f"restore-{uuid.uuid4().hex}",
+            )
+        elif task.status is not TaskStatus.COMPLETED:
+            raise ConflictError(f"cannot restore a task in {task.status.value} state")
         return task
 
     def _cleanup_task_workspaces(self, task_id: str) -> None:
@@ -2386,7 +3050,7 @@ class OrchestrationService:
             if rejected is None:
                 continue
             fresh = self.store.get_task(task.id)
-            self.store.transition_task_status(
+            failed = self.store.transition_task_status(
                 fresh.id,
                 TaskStatus.FAILED,
                 expected_version=fresh.version,
@@ -2401,6 +3065,587 @@ class OrchestrationService:
                 },
                 command_id=_command("repair-final-rejection", rejected.id),
             )
+            self.relations.resolve_terminal(failed.id)
+
+    def _repair_superseded_policy_skip_gates(self) -> int:
+        """Close reconciliation gates made stale by a successful explicit retry.
+
+        Older coordinators evaluated policy-controlled skips as final even after
+        their source node later succeeded.  A crash between the gate repair and
+        stage transition is safe: the approved recovery decision is deterministic
+        and the next startup completes the remaining transition.
+        """
+
+        repaired = 0
+        for task in self._all_tasks(
+            statuses=(TaskStatus.WAITING_HUMAN, TaskStatus.RUNNING)
+        ):
+            if (
+                task.current_stage is not OrchestrationStage.INTER_STEP_EVALUATION
+                or not task.active_plan_id
+            ):
+                continue
+            graph = self.store.get_plan(task.active_plan_id)
+            latest = self._latest_runs(
+                [
+                    run
+                    for run in self.store.list_runs(task.id)
+                    if run.plan_id == graph.plan.id
+                ]
+            )
+            superseded = self._superseded_policy_skips(latest)
+            if not superseded or any(
+                run.status in _FAILED_RUNS for run in latest.values()
+            ):
+                continue
+            superseded_run_ids = {
+                skipped.id for skipped, _source in superseded.values()
+            }
+            gates = [
+                gate
+                for gate in self.store.list_gates(task.id)
+                if gate.kind is GateKind.RECONCILIATION
+                and gate.run_id is None
+                and gate.source_key.startswith(
+                    f"{task.id}:reconciliation:{graph.plan.id}:"
+                )
+                and (
+                    gate.status is GateStatus.OPEN
+                    or (
+                        gate.status is GateStatus.APPROVED
+                        and str((gate.resolution or {}).get("decision") or "")
+                        == "resume_policy_skips"
+                    )
+                )
+            ]
+            if len(gates) != 1:
+                continue
+            gate = gates[0]
+            if gate.status is GateStatus.OPEN:
+                prompt = dict(gate.prompt)
+                if any(
+                    prompt.get(key)
+                    for key in (
+                        "failed_runs",
+                        "workspace_commit_failures",
+                        "failed_children",
+                    )
+                ):
+                    continue
+                adverse = [
+                    report
+                    for report in (prompt.get("verification") or ())
+                    if isinstance(report, Mapping)
+                    and str(report.get("status") or "") != "pass"
+                ]
+                if any(
+                    str(report.get("run_id") or "") not in superseded_run_ids
+                    for report in adverse
+                ):
+                    continue
+                self.store.resolve_gate(
+                    gate.id,
+                    GateStatus.APPROVED,
+                    {
+                        "decision": "resume_policy_skips",
+                        "response": (
+                            "A successful source retry superseded unstarted "
+                            "failure-policy skips."
+                        ),
+                    },
+                    resolved_by="orchestration-recovery",
+                    expected_version=gate.version,
+                    command_id=_command("repair-policy-skip-gate", gate.id),
+                )
+            elif str((gate.resolution or {}).get("decision") or "") != (
+                "resume_policy_skips"
+            ):
+                continue
+            fresh = self.store.get_task(task.id)
+            if (
+                fresh.status is TaskStatus.RUNNING
+                and fresh.current_stage is OrchestrationStage.INTER_STEP_EVALUATION
+            ):
+                self._transition_stage(
+                    fresh,
+                    OrchestrationStage.EXECUTION_REVIEW_TEST,
+                    "repair-successful-retry-policy-skips",
+                )
+                repaired += 1
+        return repaired
+
+    def _repair_legacy_subscription_work_products(self) -> int:
+        """Publish safe handoff records for pre-adapter subscription results.
+
+        Older subscription runtimes stored their validated structured result only in
+        ``orch_runs.output_json``. Isolated downstream roles correctly refuse to read
+        another Agent's private transcript/output, so those otherwise successful runs
+        appeared to have produced no candidate. Recovery creates an immutable,
+        task-owned compatibility Work Product from that already-durable public result.
+        New runs publish a run-owned product before settlement and never enter here.
+        """
+
+        repaired = 0
+        kinds = {
+            NodeKind.EXECUTE: WorkProductKind.ARTIFACT,
+            NodeKind.INTEGRATE: WorkProductKind.ARTIFACT,
+            NodeKind.REVIEW: WorkProductKind.REVIEW_REPORT,
+            NodeKind.TEST: WorkProductKind.TEST_RESULT,
+            NodeKind.EVALUATE: WorkProductKind.EVALUATION,
+        }
+        for task in self._all_tasks(
+            statuses=(
+                TaskStatus.RUNNING,
+                TaskStatus.WAITING_HUMAN,
+                TaskStatus.WAITING_CHILD,
+                TaskStatus.PAUSED,
+                TaskStatus.BLOCKED,
+                TaskStatus.NEEDS_RECONCILIATION,
+            )
+        ):
+            products = self.store.list_work_products(task.id, limit=1_000)
+            represented_runs = {
+                str(product.run_id or product.metadata.get("source_run_id") or "")
+                for product in products
+            }
+            graphs: dict[str, PlanGraph] = {}
+            for run in self.store.list_runs(task.id):
+                output = dict(run.output or {})
+                structured = output.get("structured_result")
+                if (
+                    run.status is not RunStatus.SUCCEEDED
+                    or run.id in represented_runs
+                    or not isinstance(structured, Mapping)
+                    or not isinstance(output.get("subscription_runtime"), Mapping)
+                ):
+                    continue
+                graph = graphs.get(run.plan_id)
+                if graph is None:
+                    graph = self.store.get_plan(run.plan_id)
+                    graphs[run.plan_id] = graph
+                node = next(
+                    (item for item in graph.nodes if item.id == run.node_id), None
+                )
+                if node is None:
+                    continue
+                metadata: dict[str, Any] = {
+                    "source": "legacy_subscription_structured_result",
+                    "source_run_id": run.id,
+                    "node_key": node.key,
+                    "node_kind": node.kind.value,
+                    "status": str(structured.get("status") or "unknown").lower(),
+                }
+                title = f"{node.title or node.key} result"
+                if run.brief_id and node.kind is NodeKind.EXECUTE:
+                    brief = self.store.get_brief_by_id(run.brief_id)
+                    required = [
+                        item
+                        for item in brief.deliverables
+                        if bool(item.get("required", True))
+                    ]
+                    if len(required) == 1:
+                        deliverable = required[0]
+                        metadata["deliverable_id"] = str(
+                            deliverable.get("id") or ""
+                        )
+                        title = str(
+                            deliverable.get("title")
+                            or deliverable.get("kind")
+                            or title
+                        )
+                safe_title = bounded_activity_text(title, 500)
+                safe_summary = bounded_activity_text(
+                    str(structured.get("summary") or ""), 16_000
+                )
+                if contains_secret_like(safe_title):
+                    safe_title = f"Recovered {node.key} result"
+                if contains_secret_like(safe_summary):
+                    safe_summary = (
+                        "[redacted legacy result summary; inspect the authorized "
+                        "artifact through an audited context read]"
+                    )
+                try:
+                    artifact = self.blobs.put_json(
+                        {
+                            "schema_version": 1,
+                            "task_id": task.id,
+                            "source_run_id": run.id,
+                            "node_key": node.key,
+                            "structured_result": dict(structured),
+                        }
+                    )
+                    self.work_products.create(
+                        task.id,
+                        kind=kinds.get(node.kind, WorkProductKind.OTHER),
+                        title=safe_title,
+                        summary=safe_summary,
+                        artifact_id=artifact.uri,
+                        uri=artifact.uri,
+                        content_hash=f"sha256:{artifact.sha256}",
+                        metadata=metadata,
+                        verification_status="unverified",
+                        created_by="orchestration-recovery",
+                        command_id=_command(
+                            "repair-subscription-work-product",
+                            run.id,
+                            artifact.sha256,
+                        ),
+                    )
+                except (OSError, PermissionError, TypeError, ValueError):
+                    logger.warning(
+                        "could not backfill subscription Work Product for run %s",
+                        run.id,
+                        exc_info=True,
+                    )
+                    continue
+                represented_runs.add(run.id)
+                repaired += 1
+        return repaired
+
+    def _repair_evaluator_adjudicated_gates(self) -> int:
+        """Close legacy verifier-conflict gates an Evaluator already settled.
+
+        Recovery is deliberately narrow: only the active plan's task-owned
+        reconciliation gate, with no execution/workspace/child failure and the
+        exact current verification runs, may be resolved automatically.
+        """
+
+        repaired = 0
+        for task in self._all_tasks(statuses=(TaskStatus.WAITING_HUMAN,)):
+            if (
+                task.current_stage is not OrchestrationStage.INTER_STEP_EVALUATION
+                or not task.active_plan_id
+            ):
+                continue
+            graph = self.store.get_plan(task.active_plan_id)
+            latest = self._latest_runs(
+                run
+                for run in self.store.list_runs(task.id)
+                if run.plan_id == graph.plan.id
+            )
+            subject = self._candidate_subject(task, graph, latest)
+            verification = self._verification_reports(
+                task.id,
+                graph,
+                latest,
+                expected_subject=subject,
+            )
+            adjudication = self._verification_adjudication(verification)
+            if not adjudication["adjudicated"] or not adjudication["dissent"]:
+                continue
+            open_gates = [
+                gate
+                for gate in self.store.list_gates(
+                    task.id, statuses=(GateStatus.OPEN,)
+                )
+                if gate.kind is GateKind.RECONCILIATION
+                and gate.run_id is None
+                and gate.source_key.startswith(
+                    f"{task.id}:reconciliation:{graph.plan.id}:"
+                )
+            ]
+            if len(open_gates) != 1:
+                continue
+            gate = open_gates[0]
+            prompt = dict(gate.prompt)
+            if any(
+                prompt.get(key)
+                for key in (
+                    "failed_runs",
+                    "workspace_commit_failures",
+                    "failed_children",
+                )
+            ):
+                continue
+            expected_runs = sorted(
+                (
+                    str(report.get("node_id") or report.get("node_key") or ""),
+                    str(report.get("run_id") or ""),
+                )
+                for report in verification
+            )
+            prompt_runs = sorted(
+                (
+                    str(report.get("node_id") or report.get("node_key") or ""),
+                    str(report.get("run_id") or ""),
+                )
+                for report in (prompt.get("verification") or ())
+                if isinstance(report, Mapping)
+            )
+            if prompt_runs != expected_runs:
+                continue
+            self.store.resolve_gate(
+                gate.id,
+                GateStatus.APPROVED,
+                {
+                    "decision": "evaluator_adjudicated",
+                    "response": (
+                        "The downstream Evaluator reviewed the independent "
+                        "verdicts and issued a complete passing decision for the "
+                        "current candidate. Earlier dissent remains in the audit."
+                    ),
+                },
+                resolved_by="orchestration-evaluator",
+                expected_version=gate.version,
+                command_id=_command("repair-evaluator-adjudication", gate.id),
+            )
+            repaired += 1
+        return repaired
+
+    def _legacy_handoff_verification_candidates(
+        self,
+        task_id: str,
+        graph: PlanGraph,
+        latest: Mapping[str, RunRecord],
+        reports: Sequence[Mapping[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Return verifier attempts affected by the pre-Work-Product handoff bug."""
+
+        recovered_run_ids = {
+            str(product.metadata.get("source_run_id") or "")
+            for product in self.store.list_work_products(task_id, limit=1_000)
+            if str(product.metadata.get("source") or "")
+            == "legacy_subscription_structured_result"
+        }
+        if not recovered_run_ids:
+            return {}
+        nodes = {node.key: node for node in graph.nodes}
+        candidates: dict[str, dict[str, Any]] = {}
+        for report in reports:
+            if str(report.get("status") or "unknown") == "pass":
+                continue
+            node_key = str(report.get("node_key") or "")
+            node = nodes.get(node_key)
+            run = latest.get(node_key)
+            if (
+                node is None
+                or run is None
+                or node.kind
+                not in {NodeKind.REVIEW, NodeKind.TEST, NodeKind.EVALUATE}
+                or run.status is not RunStatus.SUCCEEDED
+                or run.id not in recovered_run_ids
+                or not isinstance(
+                    dict(run.output or {}).get("subscription_runtime"), Mapping
+                )
+            ):
+                continue
+            candidates[node_key] = {
+                "run_id": run.id,
+                "attempt": run.attempt,
+            }
+        return candidates
+
+    def _legacy_handoff_retry_continuation_candidates(
+        self,
+        task_id: str,
+        graph: PlanGraph,
+        latest: Mapping[str, RunRecord],
+        reports: Sequence[Mapping[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Allow one final verifier replay after the legacy repair exposed evidence.
+
+        The first compatibility replay can itself have received a greedy bounded
+        Work Product prompt produced by the old coordinator. Only runs exactly one
+        attempt beyond an approved *legacy* repair qualify, so this cannot create an
+        unbounded chain of extra attempts.
+        """
+
+        legacy_bases = [
+            self._compatibility_retry_base_attempts(gate)
+            for gate in self.store.list_gates(task_id)
+            if gate.kind is GateKind.RECONCILIATION
+            and gate.status is GateStatus.APPROVED
+            and str((gate.resolution or {}).get("decision") or "") == "retry"
+            and isinstance(gate.prompt.get("compatibility_retry"), Mapping)
+            and str(
+                (gate.prompt.get("compatibility_retry") or {}).get("reason") or ""
+            )
+            == _LEGACY_HANDOFF_RETRY_REASON
+        ]
+        legacy_bases = [item for item in legacy_bases if item]
+        if not legacy_bases:
+            return {}
+        represented_runs = {
+            str(product.run_id or product.metadata.get("source_run_id") or "")
+            for product in self.store.list_work_products(task_id, limit=1_000)
+        }
+        nodes = {node.key: node for node in graph.nodes}
+        candidates: dict[str, dict[str, Any]] = {}
+        for report in reports:
+            if str(report.get("status") or "unknown") == "pass":
+                continue
+            node_key = str(report.get("node_key") or "")
+            node = nodes.get(node_key)
+            run = latest.get(node_key)
+            if (
+                node is None
+                or run is None
+                or node.kind
+                not in {NodeKind.REVIEW, NodeKind.TEST, NodeKind.EVALUATE}
+                or run.status is not RunStatus.SUCCEEDED
+                or run.id not in represented_runs
+                or not isinstance(
+                    dict(run.output or {}).get("subscription_runtime"), Mapping
+                )
+            ):
+                continue
+            if any(
+                (base := attempts.get(node_key)) is not None
+                and run.attempt == int(base["attempt"]) + 1
+                for attempts in legacy_bases
+            ):
+                candidates[node_key] = {
+                    "run_id": run.id,
+                    "attempt": run.attempt,
+                }
+        return candidates
+
+    def _repair_legacy_verification_reconciliation_gates(self) -> int:
+        """Upgrade open verifier gates without discarding completed results."""
+
+        repaired = 0
+        for task in self._all_tasks(statuses=(TaskStatus.WAITING_HUMAN,)):
+            if (
+                task.current_stage is not OrchestrationStage.INTER_STEP_EVALUATION
+                or not task.active_plan_id
+            ):
+                continue
+            graph = self.store.get_plan(task.active_plan_id)
+            latest = self._latest_runs(
+                run
+                for run in self.store.list_runs(task.id)
+                if run.plan_id == graph.plan.id
+            )
+            prefix = f"{task.id}:reconciliation:{graph.plan.id}:"
+            for gate in self.store.list_gates(
+                task.id, statuses=(GateStatus.OPEN,)
+            ):
+                if (
+                    gate.kind is not GateKind.RECONCILIATION
+                    or gate.run_id is not None
+                    or not gate.source_key.startswith(prefix)
+                ):
+                    continue
+                prompt = dict(gate.prompt)
+                action_ids = {
+                    str(
+                        item.get("id") or item.get("action") or ""
+                        if isinstance(item, Mapping)
+                        else item
+                    )
+                    for item in prompt.get("actions") or ()
+                }
+                if any(
+                    prompt.get(key)
+                    for key in (
+                        "failed_runs",
+                        "workspace_commit_failures",
+                        "failed_children",
+                    )
+                ):
+                    continue
+                adverse = [
+                    report
+                    for report in (prompt.get("verification") or ())
+                    if isinstance(report, Mapping)
+                    and str(report.get("status") or "unknown") != "pass"
+                ]
+                existing_compatibility = isinstance(
+                    prompt.get("compatibility_retry"), Mapping
+                )
+                compatibility = (
+                    {}
+                    if existing_compatibility
+                    else self._legacy_handoff_verification_candidates(
+                        task.id, graph, latest, adverse
+                    )
+                )
+                compatibility_reason = _LEGACY_HANDOFF_RETRY_REASON
+                if not compatibility and not existing_compatibility:
+                    compatibility = (
+                        self._legacy_handoff_retry_continuation_candidates(
+                            task.id, graph, latest, adverse
+                        )
+                    )
+                    compatibility_reason = _BOUNDED_ENVELOPE_RETRY_REASON
+                retryable = self._retryable_adverse_verification_runs(
+                    graph, latest, adverse
+                )
+                can_retry = bool(
+                    existing_compatibility or compatibility or retryable
+                )
+                if "accept_current" in action_ids and (
+                    ("retry" in action_ids) == can_retry
+                ):
+                    continue
+                actions: list[Any] = [
+                    {
+                        "id": "accept_current",
+                        "label": "Accept current results",
+                        "tone": "primary",
+                        "requires_response": True,
+                    }
+                ]
+                if can_retry:
+                    actions.append(
+                        {
+                            "id": "retry",
+                            "label": "Re-run disputed checks",
+                            "tone": "neutral",
+                        }
+                    )
+                actions.extend(
+                    [
+                        {
+                            "id": "request_changes",
+                            "label": "Revise deliverable",
+                            "tone": "neutral",
+                            "requires_response": True,
+                        },
+                        "cancel",
+                    ]
+                )
+                prompt.update(
+                    {
+                        "title": "Verification needs reconciliation",
+                        "description": (
+                            "Execution and its completed work products are preserved, "
+                            "but the verification roles did not reach a decisive "
+                            "result. Accept the current evidence, re-run only the "
+                            "disputed checks, or request a deliverable revision."
+                        ),
+                        "verification_signature": (
+                            self._verification_signature(
+                                [
+                                    report
+                                    for report in prompt.get("verification") or ()
+                                    if isinstance(report, Mapping)
+                                ]
+                            )
+                        ),
+                        "completed_work_products": len(
+                            self.store.list_work_products(
+                                task.id, limit=10_000
+                            )
+                        ),
+                        "actions": actions,
+                    }
+                )
+                if compatibility:
+                    prompt["compatibility_retry"] = {
+                        "reason": compatibility_reason,
+                        "base_attempts": compatibility,
+                    }
+                self.store.amend_task_gate_prompt(
+                    gate.id,
+                    prompt,
+                    expected_version=gate.version,
+                    command_id=_command(
+                        "repair-verdict-decision-gate", gate.id, "v2"
+                    ),
+                )
+                repaired += 1
+        return repaired
 
     @staticmethod
     def _task_snapshot_id(task_id: str) -> str:
@@ -2412,9 +3657,13 @@ class OrchestrationService:
         Run snapshots are children of this candidate.  Consequently ordinary run
         delivery only mutates orchestration-owned storage; the user's workspace is
         touched exactly once, after final acceptance.
+
+        Read-only tasks are the deliberate exception: their runtime sandbox already
+        prevents writes, so copying a large workspace twice adds no isolation.  They
+        read the formal source directly and publish a result set rather than a patch.
         """
 
-        if not task.workspace:
+        if not task.workspace or bool(task.policy.get("read_only", False)):
             return None
         snapshot_id = self._task_snapshot_id(task.id)
         with self._workspace_commit_lock:
@@ -2514,21 +3763,25 @@ class OrchestrationService:
         parents: dict[str, set[str]] = {item.key: set() for item in graph.nodes}
         for edge in graph.edges:
             parents[edge.to_node].add(edge.from_node)
-        keys: set[str] = set()
-        pending = list(parents[node.key])
+        distances: dict[str, int] = {}
+        pending = [(key, 1) for key in parents[node.key]]
         while pending:
-            key = pending.pop()
-            if key in keys:
+            key, distance = pending.pop()
+            previous = distances.get(key)
+            if previous is not None and previous <= distance:
                 continue
-            keys.add(key)
-            pending.extend(parents[key])
+            distances[key] = distance
+            pending.extend((parent, distance + 1) for parent in parents[key])
         latest = self._latest_runs(
             run for run in self.store.list_runs(task.id) if run.plan_id == graph.plan.id
         )
         result: list[Mapping[str, Any]] = []
-        for upstream in graph.nodes:
-            if upstream.key not in keys:
-                continue
+        graph_order = {item.key: index for index, item in enumerate(graph.nodes)}
+        upstream_nodes = sorted(
+            (item for item in graph.nodes if item.key in distances),
+            key=lambda item: (distances[item.key], graph_order[item.key]),
+        )
+        for upstream in upstream_nodes:
             run = latest.get(upstream.key)
             if run is None:
                 continue
@@ -2538,6 +3791,7 @@ class OrchestrationService:
                     "node_key": upstream.key,
                     "kind": upstream.kind.value,
                     "run_id": run.id,
+                    "distance": distances[upstream.key],
                     "status": run.status.value,
                     "output": dict(run.output or {}),
                 }
@@ -2673,7 +3927,12 @@ class OrchestrationService:
                 requires_response = bool(item.get("requires_response", False))
             else:
                 name = str(item).strip().lower()
-                requires_response = name in {"answer", "submit", "request_changes"}
+                requires_response = name in {
+                    "accept_current",
+                    "answer",
+                    "submit",
+                    "request_changes",
+                }
             if name:
                 allowed[name] = requires_response
         # A formal rejection is an auditable acceptance decision, not a generic
@@ -2700,6 +3959,7 @@ class OrchestrationService:
             "skip_dependents",
             "once",
             "override_accept",
+            "accept_current",
         }
         status = GateStatus.APPROVED if approving else (
             GateStatus.CANCELED if action == "cancel" else GateStatus.REJECTED
@@ -2869,10 +4129,66 @@ class OrchestrationService:
                     latest_by_key,
                     expected_subject=subject,
                 )
+                adjudication = self._verification_adjudication(verification)
+                authoritative_verification = adjudication["authoritative"]
                 adverse_verdicts = [
-                    report for report in verification if report["status"] != "pass"
+                    report
+                    for report in authoritative_verification
+                    if report["status"] != "pass"
                 ]
+                superseded_policy_skips = self._superseded_policy_skips(latest_by_key)
+                superseded_run_ids = {
+                    skipped.id for skipped, _source in superseded_policy_skips.values()
+                }
+                if (
+                    superseded_policy_skips
+                    and not failed
+                    and not workspace_failures
+                    and not failed_children
+                    and all(
+                        str(report.get("run_id") or "") in superseded_run_ids
+                        for report in adverse_verdicts
+                    )
+                ):
+                    # A successful explicit retry invalidates downstream fail-fast /
+                    # skip-dependents markers.  Loop back before evaluation opens a
+                    # misleading human gate; the scheduler will reopen only the
+                    # unstarted attempts whose dependency conditions are now ready.
+                    self._transition_stage(
+                        task,
+                        OrchestrationStage.EXECUTION_REVIEW_TEST,
+                        "successful-retry-reopens-policy-skips",
+                    )
+                    continue
+                compatibility_retry = None
+                if (
+                    not failed
+                    and not workspace_failures
+                    and not failed_children
+                    and adverse_verdicts
+                ):
+                    compatibility_retry = (
+                        self._continue_compatibility_verification_retry(
+                            task,
+                            graph,
+                            latest_by_key,
+                            verification,
+                        )
+                    )
+                    if compatibility_retry is True:
+                        self._transition_stage(
+                            task,
+                            OrchestrationStage.EXECUTION_REVIEW_TEST,
+                            "compatibility-verification-retry",
+                        )
+                        continue
                 retryable_failed = self._retryable_failed_runs(graph, failed)
+                retryable_verification = self._retryable_adverse_verification_runs(
+                    graph,
+                    latest_by_key,
+                    adverse_verdicts,
+                    excluded_run_ids=frozenset(run.id for run in failed),
+                )
                 self.store.add_evidence(
                     task.id,
                     kind=EvidenceKind.REVIEW,
@@ -2882,6 +4198,18 @@ class OrchestrationService:
                         "failed_runs": [run.id for run in failed],
                         "failed_children": [child.id for child in failed_children],
                         "verification": verification,
+                        "adjudication": {
+                            "authority": adjudication["authority"],
+                            "adjudicated": adjudication["adjudicated"],
+                            "adjudicator_run_ids": [
+                                report.get("run_id")
+                                for report in adjudication["adjudicators"]
+                            ],
+                            "dissenting_run_ids": [
+                                report.get("run_id")
+                                for report in adjudication["dissent"]
+                            ],
+                        },
                         "verdict": (
                             "reconcile"
                             if failed
@@ -2893,7 +4221,9 @@ class OrchestrationService:
                     },
                     created_by="orchestration-evaluator",
                     plan_id=graph.plan.id,
-                    command_id=_command("evaluation", graph.plan.id, len(runs)),
+                    command_id=_command(
+                        "evaluation-adjudication-v2", graph.plan.id, len(runs)
+                    ),
                 )
                 if failed or workspace_failures or failed_children or adverse_verdicts:
                     failure_signature = hashlib.sha256(
@@ -2929,8 +4259,22 @@ class OrchestrationService:
                             GateKind.RECONCILIATION,
                             source,
                             {
-                                "title": "Execution needs reconciliation",
-                                "description": "One or more required runs did not succeed.",
+                                "title": (
+                                    "Execution needs reconciliation"
+                                    if failed or workspace_failures or failed_children
+                                    else "Verification needs reconciliation"
+                                ),
+                                "description": (
+                                    "One or more required executions did not succeed."
+                                    if failed or workspace_failures or failed_children
+                                    else (
+                                        "Execution and its completed work products are "
+                                        "preserved, but the verification roles did not "
+                                        "reach a decisive result. Accept the current "
+                                        "evidence, re-run only the disputed checks, or "
+                                        "request a deliverable revision."
+                                    )
+                                ),
                                 "failed_runs": [self._run_payload(run) for run in failed],
                                 "workspace_commit_failures": [
                                     self._run_payload(run) for run in workspace_failures
@@ -2939,10 +4283,72 @@ class OrchestrationService:
                                     self._task_summary(child) for child in failed_children
                                 ],
                                 "verification": verification,
+                                "verification_signature": (
+                                    self._verification_signature(verification)
+                                ),
+                                "completed_work_products": len(
+                                    self.store.list_work_products(
+                                        task.id, limit=10_000
+                                    )
+                                ),
                                 "actions": (
-                                    ["retry", "request_changes", "cancel"]
-                                    if retryable_failed and not workspace_failures
-                                    else ["request_changes", "cancel"]
+                                    [
+                                        {
+                                            "id": "accept_current",
+                                            "label": "Accept current results",
+                                            "tone": "primary",
+                                            "requires_response": True,
+                                        },
+                                        {
+                                            "id": "retry",
+                                            "label": "Re-run disputed checks",
+                                            "tone": "neutral",
+                                        },
+                                        {
+                                            "id": "request_changes",
+                                            "label": "Revise deliverable",
+                                            "tone": "neutral",
+                                            "requires_response": True,
+                                        },
+                                        "cancel",
+                                    ]
+                                    if not (
+                                        failed
+                                        or workspace_failures
+                                        or failed_children
+                                    )
+                                    and (
+                                        retryable_failed or retryable_verification
+                                    )
+                                    else [
+                                        {
+                                            "id": "accept_current",
+                                            "label": "Accept current results",
+                                            "tone": "primary",
+                                            "requires_response": True,
+                                        },
+                                        {
+                                            "id": "request_changes",
+                                            "label": "Revise deliverable",
+                                            "tone": "neutral",
+                                            "requires_response": True,
+                                        },
+                                        "cancel",
+                                    ]
+                                    if not (
+                                        failed
+                                        or workspace_failures
+                                        or failed_children
+                                    )
+                                    else (
+                                        ["retry", "request_changes", "cancel"]
+                                        if (
+                                            retryable_failed
+                                            or retryable_verification
+                                        )
+                                        and not workspace_failures
+                                        else ["request_changes", "cancel"]
+                                    )
                                 ),
                             },
                         )
@@ -2950,8 +4356,30 @@ class OrchestrationService:
                     if gate.status is not GateStatus.APPROVED:
                         return task
                     decision = str((gate.resolution or {}).get("decision"))
-                    if decision == "retry":
-                        if self._retry_failed(task, graph, explicit=True):
+                    if decision == "accept_current":
+                        self._transition_stage(
+                            task,
+                            OrchestrationStage.FINAL_ACCEPTANCE,
+                            "current-verification-accepted",
+                        )
+                    elif decision == "retry":
+                        scheduled = self._retry_failed(task, graph, explicit=True)
+                        nodes_by_id = {node.id: node for node in graph.nodes}
+                        compatibility_gate = bool(
+                            gate.prompt.get("compatibility_retry")
+                        )
+                        for adverse_run in (
+                            () if compatibility_gate else retryable_verification
+                        ):
+                            adverse_node = nodes_by_id.get(adverse_run.node_id)
+                            if adverse_node is not None:
+                                scheduled = (
+                                    self._retry_run(
+                                        task, graph, adverse_node, adverse_run
+                                    )
+                                    or scheduled
+                                )
+                        if scheduled:
                             self._transition_stage(
                                 task,
                                 OrchestrationStage.EXECUTION_REVIEW_TEST,
@@ -2962,7 +4390,15 @@ class OrchestrationService:
                                 task,
                                 graph,
                                 gate,
-                                failed,
+                                tuple(failed)
+                                + tuple(retryable_verification)
+                                + tuple(
+                                    latest_by_key[key]
+                                    for key in self._compatibility_retry_base_attempts(
+                                        gate
+                                    )
+                                    if key in latest_by_key
+                                ),
                             )
                             self._transition_stage(
                                 task,
@@ -2997,8 +4433,17 @@ class OrchestrationService:
                     latest_by_key,
                     expected_subject=subject,
                 )
-                verification_passed = bool(verification) and all(
-                    report["status"] == "pass" for report in verification
+                adjudication = self._verification_adjudication(verification)
+                authoritative_verification = adjudication["authoritative"]
+                accepted_current_gate = self._accepted_current_verification_gate(
+                    task.id, graph, verification
+                )
+                verification_passed = bool(authoritative_verification) and all(
+                    report["status"] == "pass"
+                    for report in authoritative_verification
+                )
+                verification_passed = bool(
+                    verification_passed or accepted_current_gate is not None
                 )
                 execution_passed = (
                     len(runs) == len(graph.nodes)
@@ -3013,7 +4458,7 @@ class OrchestrationService:
                 for criterion in task.acceptance_criteria:
                     statuses = [
                         report["criteria"].get(criterion, "unknown")
-                        for report in verification
+                        for report in authoritative_verification
                     ]
                     criteria[criterion] = (
                         "fail"
@@ -3030,8 +4475,14 @@ class OrchestrationService:
                         execution_passed
                     ),
                 )
-                requires_gate = verdict.requires_human or not verdict.accepted
-                accepting_actor = "orchestration-policy"
+                requires_gate = (
+                    verdict.requires_human or not verdict.accepted
+                ) and accepted_current_gate is None
+                accepting_actor = (
+                    accepted_current_gate.resolved_by
+                    if accepted_current_gate is not None
+                    else "orchestration-policy"
+                ) or "local-user"
                 if requires_gate:
                     source = (
                         f"{task.id}:final:{graph.plan.id}:"
@@ -3133,13 +4584,33 @@ class OrchestrationService:
                         "accepted": True,
                         "criteria": criteria,
                         "verification": verification,
+                        "adjudication": {
+                            "authority": adjudication["authority"],
+                            "adjudicated": adjudication["adjudicated"],
+                            "adjudicator_run_ids": [
+                                report.get("run_id")
+                                for report in adjudication["adjudicators"]
+                            ],
+                            "dissenting_run_ids": [
+                                report.get("run_id")
+                                for report in adjudication["dissent"]
+                            ],
+                        },
                         "subject": subject,
                         "publication": publication,
                         "override": (
-                            not verdict.accepted
-                            and requires_gate
-                            and str((gate.resolution or {}).get("decision"))
-                            == "override_accept"
+                            accepted_current_gate is not None
+                            or (
+                                not verdict.accepted
+                                and requires_gate
+                                and str((gate.resolution or {}).get("decision"))
+                                == "override_accept"
+                            )
+                        ),
+                        "verification_override_gate_id": (
+                            accepted_current_gate.id
+                            if accepted_current_gate is not None
+                            else None
                         ),
                     },
                     created_by=accepting_actor,
@@ -3162,14 +4633,9 @@ class OrchestrationService:
                             "result_hash": result["result_hash"],
                         },
                     )
-                if task.status is TaskStatus.COMPLETED:
-                    task = self.store.transition_task_status(
-                        task.id,
-                        TaskStatus.ARCHIVED,
-                        expected_version=task.version,
-                        output={**dict(task.output or {}), "archived_from": "completed"},
-                        command_id=_command("status", task.id, task.version, "archived", "archive"),
-                    )
+                # Completion and archival are intentionally distinct. The result
+                # remains visible and interactive in COMPLETED until the operator
+                # explicitly files it with archive_task().
                 self._cleanup_task_workspaces(task.id)
                 return task
         raise RuntimeError(f"task {task_id} exceeded coordinator transition rail")
@@ -3238,13 +4704,23 @@ class OrchestrationService:
         *,
         output: Optional[Mapping[str, Any]] = None,
     ) -> TaskRecord:
-        return self.store.transition_task_status(
+        changed = self.store.transition_task_status(
             task.id,
             target,
             expected_version=task.version,
             output=output,
             command_id=_command("status", task.id, task.version, target.value, reason),
         )
+        if target in _TERMINAL_TASKS:
+            try:
+                self.relations.resolve_terminal(changed.id)
+            except Exception:
+                # The terminal status is already durable. Recovery and the next
+                # scheduler pass may safely repeat relation projection by version.
+                logger.exception(
+                    "could not project terminal relations for task %s", changed.id
+                )
+        return changed
 
     def _transition_stage(
         self,
@@ -4060,7 +5536,19 @@ class OrchestrationService:
                 self._transition_status(fresh, TaskStatus.WAITING_CHILD, "descendants-active")
             return "active"
         runs = [run for run in self.store.list_runs(task.id) if run.plan_id == graph.plan.id]
-        latest = self._latest_runs(runs)
+        recorded_latest = self._latest_runs(runs)
+        superseded_policy_skips = self._superseded_policy_skips(recorded_latest)
+        # A failure-policy skip represents work that never started.  Once the
+        # failure which caused it has a newer successful attempt, remove the skip
+        # from the scheduler's effective view so dependency readiness can be
+        # derived again.  The immutable skip event remains in history; the same
+        # unstarted attempt is reopened only when its dependencies are ready.
+        latest = {
+            key: run
+            for key, run in recorded_latest.items()
+            if key not in superseded_policy_skips
+        }
+
         def recovery_gate_plan_id(gate: GateRecord) -> str:
             frozen = str(gate.prompt.get("plan_id") or "")
             if frozen:
@@ -4169,6 +5657,12 @@ class OrchestrationService:
             current = latest.get(node.key)
             if current is not None and current.status is not RunStatus.QUEUED:
                 continue
+            if current is None and node.key in superseded_policy_skips:
+                # Another still-active failure policy suppresses this node.  Its
+                # earlier unstarted skip remains a sufficient terminal marker;
+                # do not reopen it merely to skip it again.
+                latest[node.key] = superseded_policy_skips[node.key][0]
+                continue
             source_key, policy, source_run_id = source
             self.store.skip_pending_node(
                 task.id,
@@ -4200,7 +5694,25 @@ class OrchestrationService:
                 continue
             edges = incoming[node.key]
             if not edges:
-                self._enqueue(task, graph, node)
+                stale = superseded_policy_skips.get(node.key)
+                if stale is None:
+                    latest[node.key] = self._enqueue(task, graph, node)
+                else:
+                    skipped, recovered_source = stale
+                    latest[node.key] = self.store.reopen_policy_skipped_run(
+                        skipped.id,
+                        reason=(
+                            "failure-policy source recovered in successful run "
+                            f"{recovered_source.id}"
+                        ),
+                        session_id=f"__orch__{node.id}_{skipped.attempt}",
+                        command_id=_command(
+                            "reopen-policy-skip",
+                            graph.plan.id,
+                            skipped.id,
+                            recovered_source.id,
+                        ),
+                    )
                 changed = True
                 continue
             source_runs = [latest.get(edge.from_node) for edge in edges]
@@ -4237,16 +5749,43 @@ class OrchestrationService:
                 ):
                     continue
             if ready:
-                self._enqueue(task, graph, node)
+                stale = superseded_policy_skips.get(node.key)
+                if stale is None:
+                    latest[node.key] = self._enqueue(task, graph, node)
+                else:
+                    skipped, recovered_source = stale
+                    latest[node.key] = self.store.reopen_policy_skipped_run(
+                        skipped.id,
+                        reason=(
+                            "failure-policy source recovered in successful run "
+                            f"{recovered_source.id}"
+                        ),
+                        session_id=f"__orch__{node.id}_{skipped.attempt}",
+                        command_id=_command(
+                            "reopen-policy-skip",
+                            graph.plan.id,
+                            skipped.id,
+                            recovered_source.id,
+                        ),
+                    )
+                changed = True
             else:
-                self.store.skip_node(
-                    task.id,
-                    node.key,
-                    plan_id=graph.plan.id,
-                    reason="required dependency condition was not satisfied",
-                    command_id=_command("skip", graph.plan.id, node.key),
-                )
-            changed = True
+                stale = superseded_policy_skips.get(node.key)
+                if stale is not None:
+                    # The recovered source no longer satisfies this node's edge
+                    # condition (for example a failure-only handler).  Its prior
+                    # unstarted skip remains the correct terminal disposition.
+                    latest[node.key] = stale[0]
+                    continue
+                else:
+                    latest[node.key] = self.store.skip_node(
+                        task.id,
+                        node.key,
+                        plan_id=graph.plan.id,
+                        reason="required dependency condition was not satisfied",
+                        command_id=_command("skip", graph.plan.id, node.key),
+                    )
+                    changed = True
         if changed:
             self._runtime_for_task(task.id, rebuild=True)
             return "active"
@@ -4255,14 +5794,23 @@ class OrchestrationService:
         )
         return "complete" if len(latest) == len(graph.nodes) and all(run.status in _TERMINAL_RUNS for run in latest.values()) else "active"
 
-    @staticmethod
     def _can_retry(
+        self,
         node: NodeRecord,
         run: RunRecord,
         *,
         explicit: bool,
     ) -> bool:
         if run.attempt >= node.retry_policy.max_attempts:
+            return False
+        if self.enforce_runtime_budgets and run.error_kind in {
+            "budget_exceeded",
+            "runtime_budget_exceeded",
+            "runtime_limit",
+        }:
+            # The logical work unit has exhausted at least one hard budget
+            # dimension. Re-running the same plan node cannot restore that budget;
+            # reconciliation must create a revised plan or cancel the task.
             return False
         if explicit:
             return True
@@ -4294,6 +5842,21 @@ class OrchestrationService:
                 continue
             found.add(key)
             pending.extend(outgoing[key])
+        return frozenset(found)
+
+    @staticmethod
+    def _graph_ancestors(graph: PlanGraph, start: str) -> frozenset[str]:
+        incoming: dict[str, list[str]] = {node.key: [] for node in graph.nodes}
+        for edge in graph.edges:
+            incoming[edge.to_node].append(edge.from_node)
+        found: set[str] = set()
+        pending = list(incoming[start])
+        while pending:
+            key = pending.pop()
+            if key in found:
+                continue
+            found.add(key)
+            pending.extend(incoming[key])
         return frozenset(found)
 
     def _manual_failure_control(
@@ -4393,6 +5956,168 @@ class OrchestrationService:
             and self._can_retry(node, run, explicit=True)
         )
 
+    @staticmethod
+    def _compatibility_retry_base_attempts(
+        gate: GateRecord,
+    ) -> dict[str, dict[str, Any]]:
+        raw = gate.prompt.get("compatibility_retry")
+        if (
+            not isinstance(raw, Mapping)
+            or str(raw.get("reason") or "") not in _COMPATIBILITY_RETRY_REASONS
+        ):
+            return {}
+        attempts = raw.get("base_attempts")
+        if not isinstance(attempts, Mapping):
+            return {}
+        parsed: dict[str, dict[str, Any]] = {}
+        for key, value in attempts.items():
+            if not isinstance(value, Mapping):
+                continue
+            run_id = str(value.get("run_id") or "")
+            try:
+                attempt = int(value.get("attempt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if run_id and attempt > 0:
+                parsed[str(key)] = {"run_id": run_id, "attempt": attempt}
+        return parsed
+
+    def _continue_compatibility_verification_retry(
+        self,
+        task: TaskRecord,
+        graph: PlanGraph,
+        latest: Mapping[str, RunRecord],
+        verification_reports: Sequence[Mapping[str, Any]],
+    ) -> Optional[bool]:
+        """Continue an approved one-shot repair in dependency-safe waves.
+
+        ``True`` means an active/new replay requires returning to execution,
+        ``False`` means the repair exists but cannot safely advance, and ``None``
+        means no compatibility replay applies to the current evaluation.
+        """
+
+        prefix = f"{task.id}:reconciliation:{graph.plan.id}:"
+        selected_gate = next(
+            (
+                gate
+                for gate in reversed(self.store.list_gates(task.id))
+                if gate.kind is GateKind.RECONCILIATION
+                and gate.run_id is None
+                and gate.source_key.startswith(prefix)
+                and gate.status is GateStatus.APPROVED
+                and str((gate.resolution or {}).get("decision") or "") == "retry"
+                and self._compatibility_retry_base_attempts(gate)
+            ),
+            None,
+        )
+        if selected_gate is None:
+            return None
+        base = self._compatibility_retry_base_attempts(selected_gate)
+        reports = {
+            str(report.get("node_key") or ""): report
+            for report in verification_reports
+        }
+        selected_keys = set(base)
+        if any(
+            (run := latest.get(key)) is not None
+            and run.attempt > int(value["attempt"])
+            and run.status in _ACTIVE_RUNS
+            for key, value in base.items()
+        ):
+            return True
+
+        candidates = {
+            key
+            for key in selected_keys
+            if key in reports
+            and str(reports[key].get("status") or "unknown") != "pass"
+            and (run := latest.get(key)) is not None
+            and run.id == str(base[key]["run_id"])
+            and run.attempt == int(base[key]["attempt"])
+            and run.status is RunStatus.SUCCEEDED
+        }
+        if not candidates:
+            return None
+
+        ancestors = {
+            key: self._graph_ancestors(graph, key) & selected_keys
+            for key in candidates
+        }
+        ready: list[str] = []
+        for key in sorted(candidates):
+            if ancestors[key] & candidates:
+                continue
+            prerequisites_passed = True
+            for ancestor in ancestors[key]:
+                prior = latest.get(ancestor)
+                prior_report = reports.get(ancestor)
+                if (
+                    prior is None
+                    or prior.attempt <= int(base[ancestor]["attempt"])
+                    or prior.status is not RunStatus.SUCCEEDED
+                    or prior_report is None
+                    or str(prior_report.get("status") or "unknown") != "pass"
+                ):
+                    prerequisites_passed = False
+                    break
+            if prerequisites_passed:
+                ready.append(key)
+
+        nodes = {node.key: node for node in graph.nodes}
+        scheduled = False
+        for key in ready:
+            node = nodes.get(key)
+            run = latest.get(key)
+            if node is not None and run is not None:
+                scheduled = (
+                    self._retry_run(
+                        task,
+                        graph,
+                        node,
+                        run,
+                        compatibility_gate=selected_gate,
+                    )
+                    or scheduled
+                )
+        return scheduled
+
+    def _retryable_adverse_verification_runs(
+        self,
+        graph: PlanGraph,
+        latest: Mapping[str, RunRecord],
+        reports: Sequence[Mapping[str, Any]],
+        *,
+        excluded_run_ids: frozenset[str] = frozenset(),
+    ) -> tuple[RunRecord, ...]:
+        """Return successful verifier calls whose formal verdict needs another turn.
+
+        A provider process can finish successfully while its verdict is ``unknown`` or
+        ``fail``.  Treating only failed process statuses as retryable trapped these
+        tasks behind a Human Gate with no Retry action, even after the missing evidence
+        became available.
+        """
+
+        nodes = {node.key: node for node in graph.nodes}
+        selected: list[RunRecord] = []
+        seen: set[str] = set()
+        for report in reports:
+            if str(report.get("status") or "unknown") == "pass":
+                continue
+            node_key = str(report.get("node_key") or "")
+            run = latest.get(node_key)
+            node = nodes.get(node_key)
+            if (
+                run is None
+                or node is None
+                or run.id in excluded_run_ids
+                or run.id in seen
+                or not self._can_retry(node, run, explicit=True)
+            ):
+                continue
+            seen.add(run.id)
+            selected.append(run)
+        return tuple(selected)
+
     def _retry_failed(
         self,
         task: TaskRecord,
@@ -4414,8 +6139,7 @@ class OrchestrationService:
             if run.status not in _FAILED_RUNS:
                 continue
             if self._can_retry(node, run, explicit=explicit):
-                self._retry_run(task, graph, node, run)
-                scheduled = True
+                scheduled = self._retry_run(task, graph, node, run) or scheduled
         return scheduled
 
     def _retry_run(
@@ -4424,8 +6148,37 @@ class OrchestrationService:
         graph: PlanGraph,
         node: NodeRecord,
         run: RunRecord,
+        *,
+        compatibility_gate: Optional[GateRecord] = None,
     ) -> bool:
-        if run.attempt >= node.retry_policy.max_attempts:
+        if (
+            run.attempt >= node.retry_policy.max_attempts
+            and compatibility_gate is None
+        ):
+            return False
+        allocation = self._run_budget(task, graph, node)
+        spent = RuntimeBudget()
+        for prior in sorted(
+            (
+                item
+                for item in self.store.list_runs(task.id)
+                if item.plan_id == graph.plan.id
+                and item.node_id == node.id
+                and item.status is not RunStatus.QUEUED
+            ),
+            key=lambda item: (item.attempt, item.created_at, item.id),
+        ):
+            available = allocation - spent
+            accounted = self._bounded_budget(
+                self._usage_for_run(prior), available
+            )
+            spent += accounted
+        remaining = allocation - spent
+        if (
+            remaining.model_calls < 1
+            or remaining.tokens < 1
+            or remaining.wall_seconds < 1
+        ):
             return False
         next_attempt = run.attempt + 1
         delay = min(
@@ -4447,6 +6200,9 @@ class OrchestrationService:
             node,
             attempt=next_attempt,
             ready_at=ready_at,
+            recovery_gate_id=(
+                compatibility_gate.id if compatibility_gate is not None else None
+            ),
         )
         return True
 
@@ -4458,6 +6214,7 @@ class OrchestrationService:
         *,
         attempt: Optional[int] = None,
         ready_at: Optional[datetime] = None,
+        recovery_gate_id: Optional[str] = None,
     ) -> RunRecord:
         chosen_attempt = attempt or 1
         if chosen_attempt > self.runtime_limits.max_attempts_per_node:
@@ -4474,6 +6231,7 @@ class OrchestrationService:
             # the transcript to the immutable node identity so replanning can never
             # make a Reviewer/Tester inherit a prior Worker's private conversation.
             session_id=f"__orch__{node.id}_{chosen_attempt}",
+            recovery_gate_id=recovery_gate_id,
             command_id=_command("enqueue", graph.plan.id, node.key, chosen_attempt),
         )
         self._runtime_for_task(task.id, rebuild=True)
@@ -4486,6 +6244,34 @@ class OrchestrationService:
             if run.node_key not in latest or run.attempt > latest[run.node_key].attempt:
                 latest[run.node_key] = run
         return latest
+
+    @staticmethod
+    def _superseded_policy_skips(
+        latest: Mapping[str, RunRecord],
+    ) -> dict[str, tuple[RunRecord, RunRecord]]:
+        """Return unstarted policy skips invalidated by a successful source retry."""
+
+        superseded: dict[str, tuple[RunRecord, RunRecord]] = {}
+        marker = " from failed node "
+        policy_prefixes = tuple(f"{policy.value}{marker}" for policy in FailurePolicy)
+        for node_key, run in latest.items():
+            message = str(run.error_message or "")
+            if (
+                run.status is not RunStatus.SKIPPED
+                or run.error_kind != "failure_policy"
+                or run.started_at is not None
+                or not message.startswith(policy_prefixes)
+            ):
+                continue
+            source_key = message.split(marker, 1)[1].split(";", 1)[0].strip()
+            source = latest.get(source_key)
+            if (
+                source is not None
+                and source.status is RunStatus.SUCCEEDED
+                and source.created_at > run.created_at
+            ):
+                superseded[node_key] = (run, source)
+        return superseded
 
     @staticmethod
     def _edge_matches(condition: EdgeCondition, status: RunStatus) -> bool:
@@ -4702,7 +6488,7 @@ class OrchestrationService:
         self,
         context: RunExecutionContext,
         heartbeat: asyncio.Task[None],
-        timeout_seconds: int,
+        timeout_seconds: Optional[int],
     ) -> ExecutionOutcome:
         execution = asyncio.create_task(
             self.executor.execute(context),
@@ -4774,12 +6560,80 @@ class OrchestrationService:
         raise RuntimeError("orchestration executor returned an invalid outcome")
 
     # -- run execution ---------------------------------------------------
+    def _required_context_preflight(
+        self,
+        task: TaskRecord,
+        run: RunRecord,
+        refs: Sequence[Any],
+    ) -> Optional[tuple[Any, dict[str, Any]]]:
+        """Verify required refs before any Agent/provider turn is dispatched."""
+
+        for ref in refs:
+            if ref.requirement is not ContextRequirement.REQUIRED:
+                continue
+            try:
+                result = self.context_resolver.verify(
+                    ref, workspace=task.workspace
+                )
+            except Exception as exc:
+                result = {
+                    "available": False,
+                    "stale": False,
+                    "reason": f"{type(exc).__name__}: {exc}"[:2_000],
+                }
+            self.store.record_context_ref_verification(
+                ref.id,
+                run_id=run.id,
+                result=result,
+                command_id=_command(
+                    "context-preflight", run.id, ref.id, _canonical_hash(result)
+                ),
+            )
+            if not bool(result.get("available")) or bool(result.get("stale")):
+                return ref, result
+        return None
+
+    def _record_run_activity(
+        self,
+        claim: RunClaim,
+        *,
+        event_key: str,
+        source_id: str,
+        kind: str,
+        status: str,
+        title: str,
+        summary: str = "",
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Expose coordinator work that happens before an Agent runtime starts."""
+
+        try:
+            self.store.append_run_activity(
+                claim.run.id,
+                claim.lease.token,
+                claim.lease.fencing_token,
+                event_key=event_key,
+                source_id=source_id,
+                kind=kind,
+                status=status,
+                title=title,
+                summary=summary,
+                detail=detail,
+            )
+        except Exception:
+            logger.warning(
+                "could not append coordinator activity for run %s",
+                claim.run.id,
+                exc_info=True,
+            )
+
     async def _execute_claim(self, claim: RunClaim) -> None:
         run = claim.run
         heartbeat: Optional[asyncio.Task[None]] = None
         snapshot = None
         node: Optional[NodeRecord] = None
         runtime_id = self._run_runtime_id(run.id)
+        wake_was_delivered = False
         try:
             self.store.start_run(
                 run.id,
@@ -4843,14 +6697,278 @@ class OrchestrationService:
 
             workspace: Optional[Path] = None
             if task.workspace:
-                snapshot = await self._durable_to_thread(
-                    self._ensure_run_snapshot, task, run
+                workspace_source = (
+                    f"coordinator:attempt-{run.attempt}:workspace"
                 )
-                workspace = snapshot.candidate if snapshot is not None else None
-            subject = await self._durable_to_thread(
-                self._candidate_subject, task, graph
+                if bool(task.policy.get("read_only", False)):
+                    workspace = Path(task.workspace).expanduser().resolve()
+                    if not workspace.is_dir():
+                        raise WorkspaceError(
+                            f"read-only workspace is not a directory: {workspace}"
+                        )
+                    self._record_run_activity(
+                        claim,
+                        event_key=f"{workspace_source}:ready",
+                        source_id=workspace_source,
+                        kind="lifecycle",
+                        status="completed",
+                        title="Read-only workspace ready",
+                        summary=(
+                            "The source workspace is mounted through the runtime's "
+                            "read-only sandbox; no snapshot copy is required."
+                        ),
+                        detail={"isolation": "read_only_source"},
+                    )
+                else:
+                    self._record_run_activity(
+                        claim,
+                        event_key=f"{workspace_source}:started",
+                        source_id=workspace_source,
+                        kind="lifecycle",
+                        status="running",
+                        title="Preparing isolated workspace",
+                        summary="Creating the Agent's durable workspace snapshot.",
+                        detail={"isolation": "writable_snapshot"},
+                    )
+                    try:
+                        snapshot = await self._durable_to_thread(
+                            self._ensure_run_snapshot, task, run
+                        )
+                    except Exception as exc:
+                        self._record_run_activity(
+                            claim,
+                            event_key=f"{workspace_source}:failed",
+                            source_id=workspace_source,
+                            kind="error",
+                            status="failed",
+                            title="Workspace preparation failed",
+                            summary=str(exc),
+                        )
+                        raise
+                    workspace = snapshot.candidate if snapshot is not None else None
+                    self._record_run_activity(
+                        claim,
+                        event_key=f"{workspace_source}:completed",
+                        source_id=workspace_source,
+                        kind="lifecycle",
+                        status="completed",
+                        title="Isolated workspace ready",
+                        summary="The durable workspace snapshot is ready for the Agent.",
+                        detail={"isolation": "writable_snapshot"},
+                    )
+            subject_source = f"coordinator:attempt-{run.attempt}:subject"
+            self._record_run_activity(
+                claim,
+                event_key=f"{subject_source}:started",
+                source_id=subject_source,
+                kind="lifecycle",
+                status="running",
+                title="Preparing execution subject",
+                summary="Binding this run to the current task revision.",
             )
-            upstream_context = self._upstream_context(task, graph, node)
+            try:
+                subject = await self._durable_to_thread(
+                    self._candidate_subject, task, graph
+                )
+            except Exception as exc:
+                self._record_run_activity(
+                    claim,
+                    event_key=f"{subject_source}:failed",
+                    source_id=subject_source,
+                    kind="error",
+                    status="failed",
+                    title="Execution subject preparation failed",
+                    summary=str(exc),
+                )
+                raise
+            self._record_run_activity(
+                claim,
+                event_key=f"{subject_source}:completed",
+                source_id=subject_source,
+                kind="lifecycle",
+                status="completed",
+                title="Execution subject ready",
+                summary="The Agent can now start against the bound task revision.",
+                detail={"subject_kind": subject.get("kind")},
+            )
+            # Each run is pinned to the Brief revision captured at enqueue time.
+            # Raw upstream outputs stay outside the initial prompt and are exposed
+            # only through explicit, auditable ContextRefs.
+            brief = (
+                self.store.get_brief_by_id(run.brief_id)
+                if run.brief_id
+                else self.store.get_active_brief(task.id)
+            )
+            context_refs = self.store.list_context_refs(
+                task.id, brief_id=brief.id
+            )
+            delivered_wakes = self.store.list_wakes(
+                task_id=task.id,
+                statuses=(WakeStatus.CLAIMED, WakeStatus.DELIVERED),
+                limit=100,
+            )
+            delivery_wake = next(
+                (
+                    item
+                    for item in reversed(delivered_wakes)
+                    if item.target_run_id in {None, run.id}
+                ),
+                None,
+            )
+            wake_was_delivered = delivery_wake is not None
+            context_issue = self._required_context_preflight(
+                task, run, context_refs
+            )
+            if context_issue is not None:
+                failed_ref, verification = context_issue
+                error_kind = (
+                    "required_context_stale"
+                    if bool(verification.get("stale"))
+                    else "required_context_unavailable"
+                )
+                message = (
+                    f"required ContextRef {failed_ref.id} failed dispatch preflight: "
+                    f"{verification.get('reason') or error_kind}"
+                )
+                self.store.fail_run(
+                    run.id,
+                    claim.lease.token,
+                    claim.lease.fencing_token,
+                    error_kind=error_kind,
+                    error_message=message,
+                    output={
+                        "context_ref_id": failed_ref.id,
+                        "verification": verification,
+                    },
+                    command_id=_command(
+                        "run-context-preflight-failed",
+                        run.id,
+                        claim.lease.fencing_token,
+                        failed_ref.id,
+                    ),
+                )
+                try:
+                    runtime.finish(runtime_id, RuntimeStatus.FAILED)
+                except RuntimeStateError:
+                    pass
+                fresh = self.store.get_task(task.id)
+                if fresh.status in {
+                    TaskStatus.QUEUED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_HUMAN,
+                    TaskStatus.WAITING_CHILD,
+                    TaskStatus.PAUSED,
+                    TaskStatus.BLOCKED,
+                }:
+                    self._transition_status(
+                        fresh,
+                        TaskStatus.NEEDS_RECONCILIATION,
+                        error_kind,
+                        output={
+                            **dict(fresh.output or {}),
+                            "error_kind": error_kind,
+                            "error": message,
+                            "context_ref_id": failed_ref.id,
+                        },
+                    )
+                self._runtime_for_task(task.id, rebuild=True)
+                return
+            effective_tools = set(profile.allowed_tools)
+            if runtime_node.effective_permissions.tools is not None:
+                effective_tools &= set(runtime_node.effective_permissions.tools)
+            execution_envelope = None
+            if bool(task.policy.get("structured_handoff")):
+                # A Work Product is the durable, explicit cross-role result channel.
+                # It is safe to expose task-local immutable summaries to downstream
+                # nodes; private transcripts and arbitrary upstream run outputs remain
+                # excluded.  Products created by a just-finished dependency are
+                # committed before the scheduler can dispatch this run.
+                upstream_context = self._upstream_context(task, graph, node)
+                upstream_run_order = {
+                    str(item.get("run_id") or ""): index
+                    for index, item in enumerate(upstream_context)
+                    if str(item.get("run_id") or "")
+                }
+                upstream_run_ids = set(upstream_run_order)
+                selected_products = [
+                    product
+                    for product in self.store.list_work_products(task.id, limit=100)
+                    if (
+                        product.run_id in upstream_run_ids
+                        or (
+                            product.run_id is None
+                            and (
+                                not str(
+                                    product.metadata.get("source_run_id") or ""
+                                )
+                                or str(product.metadata.get("source_run_id") or "")
+                                in upstream_run_ids
+                            )
+                        )
+                    )
+                ]
+
+                def product_rank(product: Any) -> tuple[int, datetime, str]:
+                    source_run_id = str(
+                        product.run_id
+                        or product.metadata.get("source_run_id")
+                        or ""
+                    )
+                    # Explicit task-owned/operator products have no source run and
+                    # remain first-class candidate evidence.
+                    rank = (
+                        -1
+                        if not source_run_id
+                        else upstream_run_order.get(
+                            source_run_id, len(upstream_run_order)
+                        )
+                    )
+                    return rank, product.created_at, product.id
+
+                handoff_products = tuple(sorted(selected_products, key=product_rank))
+                execution_envelope = build_execution_envelope(
+                    task=task,
+                    brief=brief,
+                    claim=claim,
+                    node=node,
+                    profile=profile,
+                    routing=routing,
+                    context_refs=context_refs,
+                    work_products=handoff_products,
+                    wake=delivery_wake,
+                    workspace_id=(
+                        snapshot.snapshot_id if snapshot is not None else None
+                    ),
+                    effective_tools=sorted(effective_tools),
+                )
+                prompt_bytes = len(
+                    render_initial_user_prompt(execution_envelope).encode("utf-8")
+                )
+                self.handoff_metrics.observe(
+                    "orchestration_handoff_initial_prompt_bytes", prompt_bytes
+                )
+                self.handoff_metrics.observe(
+                    "orchestration_handoff_context_refs",
+                    int(execution_envelope.context_manifest.get("ref_count") or 0),
+                )
+                self.handoff_metrics.observe(
+                    "orchestration_handoff_context_tokens_estimated",
+                    int(
+                        execution_envelope.context_manifest.get("estimated_tokens")
+                        or 0
+                    ),
+                )
+                self.handoff_metrics.observe(
+                    "orchestration_envelope_bytes",
+                    len(
+                        json.dumps(
+                            execution_envelope.to_dict(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ),
+                )
             context = RunExecutionContext(
                 task=task,
                 graph=graph,
@@ -4864,10 +6982,16 @@ class OrchestrationService:
                 runtime_budget=remaining_budget,
                 effective_permissions=runtime_node.effective_permissions,
                 subject=subject,
-                upstream_context=upstream_context,
+                upstream_context=(),
+                brief=brief,
+                execution_envelope=execution_envelope,
             )
-            timeout_seconds = min(node.timeout_seconds, remaining_budget.wall_seconds)
-            if timeout_seconds <= 0:
+            timeout_seconds = (
+                min(node.timeout_seconds, remaining_budget.wall_seconds)
+                if self.enforce_runtime_budgets
+                else None
+            )
+            if timeout_seconds is not None and timeout_seconds <= 0:
                 raise BudgetExceededError("run has no wall-clock budget remaining")
             outcome = await self._execute_with_lease_guard(
                 context, heartbeat, timeout_seconds
@@ -4953,7 +7077,38 @@ class OrchestrationService:
                         run.id,
                     )
                 return
-            measured = self._record_usage_segment(
+            measured = RuntimeBudget(
+                model_calls=int(outcome.usage.get("model_calls", 0) or 0),
+                tool_calls=int(outcome.usage.get("tool_calls", 0) or 0),
+                tokens=int(outcome.usage.get("tokens", 0) or 0),
+                wall_seconds=int(outcome.usage.get("wall_seconds", 0) or 0),
+            )
+            try:
+                runtime.charge(runtime_id, measured)
+            except (BudgetExceededError, RuntimeLimitError, RuntimeStateError) as exc:
+                available = runtime.get(runtime_id).remaining_budget
+                accounted = self._bounded_budget(measured, available)
+                accounting_error: BaseException = exc
+                try:
+                    if accounted != RuntimeBudget():
+                        runtime.charge(runtime_id, accounted)
+                except (BudgetExceededError, RuntimeLimitError, RuntimeStateError) as cap_exc:
+                    accounted = RuntimeBudget()
+                    accounting_error = RuntimeStateError(
+                        f"{exc}; bounded accounting also failed: {cap_exc}"
+                    )
+                self._record_usage_segment(
+                    task,
+                    graph,
+                    node,
+                    run,
+                    outcome.usage,
+                    segment_key=segment_key,
+                    accounted_usage=accounted,
+                    accounting_error=accounting_error,
+                )
+                raise exc
+            self._record_usage_segment(
                 task,
                 graph,
                 node,
@@ -4961,7 +7116,6 @@ class OrchestrationService:
                 outcome.usage,
                 segment_key=segment_key,
             )
-            runtime.charge(runtime_id, measured)
             if outcome.status == "suspended":
                 checkpoint = outcome.output.get("engine_checkpoint")
                 if not outcome.gate_id or not isinstance(checkpoint, Mapping):
@@ -4999,6 +7153,7 @@ class OrchestrationService:
                     claim.lease.fencing_token,
                     error_kind=outcome.error_kind or "agent_failed",
                     error_message=outcome.error_message or "agent run did not complete",
+                    output=outcome.output,
                     command_id=_command("run-fail", run.id, claim.lease.fencing_token),
                 )
                 runtime.finish(runtime_id, RuntimeStatus.FAILED)
@@ -5058,13 +7213,31 @@ class OrchestrationService:
                         "fencing_token": claim.lease.fencing_token,
                     }
             output["evidence_records"] = [dict(item) for item in outcome.evidence]
-            self.store.complete_run(
-                run.id,
-                claim.lease.token,
-                claim.lease.fencing_token,
-                output=output,
-                command_id=_command("run-complete", run.id, claim.lease.fencing_token),
-            )
+            handoff_result = self._explicit_handoff_result(output)
+            if handoff_result is not None:
+                self.store.complete_run_structured(
+                    run.id,
+                    claim.lease.token,
+                    claim.lease.fencing_token,
+                    output=output,
+                    result=handoff_result,
+                    created_by=profile.profile_id,
+                    command_id=_command(
+                        "run-complete-structured",
+                        run.id,
+                        claim.lease.fencing_token,
+                    ),
+                )
+            else:
+                self.store.complete_run(
+                    run.id,
+                    claim.lease.token,
+                    claim.lease.fencing_token,
+                    output=output,
+                    command_id=_command(
+                        "run-complete", run.id, claim.lease.fencing_token
+                    ),
+                )
             await self._finalize_succeeded_run(run.id)
             try:
                 runtime.finish(runtime_id, RuntimeStatus.SUCCEEDED)
@@ -5128,6 +7301,13 @@ class OrchestrationService:
             logger.exception("orchestration run %s failed", run.id)
             self._safe_fail(claim, type(exc).__name__, str(exc))
         finally:
+            if wake_was_delivered:
+                try:
+                    self._complete_delivered_run_wakes(run.task_id, run.id)
+                except Exception:
+                    logger.exception(
+                        "could not settle delivered wakes for run %s", run.id
+                    )
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
@@ -5135,6 +7315,16 @@ class OrchestrationService:
                 self._runtime_for_task(run.task_id, rebuild=True)
             except Exception:
                 logger.exception("could not refresh runtime projection for %s", run.id)
+
+    def _complete_delivered_run_wakes(self, task_id: str, run_id: str) -> None:
+        for wake in self.store.list_wakes(
+            task_id=task_id, statuses=(WakeStatus.DELIVERED,), limit=1_000
+        ):
+            if wake.target_run_id == run_id:
+                self.wakes.mark_completed(wake.id)
+                self.handoff_metrics.increment(
+                    "orchestration_wake_completed_total"
+                )
 
     async def _heartbeat(self, claim: RunClaim) -> None:
         while True:
@@ -5198,7 +7388,31 @@ class OrchestrationService:
         if requested_node_id != parent_run.node_id:
             return {"ok": False, "error": "parent run does not own this plan node"}
         role = str(payload["role"]).strip().lower()
-        objective = str(payload["objective"]).strip()
+        raw_brief = payload.get("brief")
+        structured = isinstance(raw_brief, Mapping)
+        if (
+            not structured
+            and self.handoff_settings.structured_handoff_required_for_new_tasks
+        ):
+            return {
+                "ok": False,
+                "error": "structured handoff is required; use delegate_task with a complete Brief",
+            }
+        if not structured and not self.handoff_settings.legacy_spawn_agent_enabled:
+            return {
+                "ok": False,
+                "error": "legacy spawn_agent is disabled; use delegate_task with a Brief",
+            }
+        brief_draft = (
+            TaskBriefDraft.from_mapping(raw_brief)
+            if structured
+            else None
+        )
+        objective = str(
+            brief_draft.objective
+            if brief_draft is not None
+            else payload.get("objective") or ""
+        ).strip()
         if not role or not objective:
             return {"ok": False, "error": "child role and objective are required"}
         supplied_keys = [
@@ -5218,7 +7432,14 @@ class OrchestrationService:
             graph = self.store.get_plan(parent_run.plan_id)
             parent_node = next(item for item in graph.nodes if item.id == parent_run.node_id)
             parent_profile = self._profile_for_node(parent_node)
-            allowed = {item.value for item in parent_profile.allowed_child_roles}
+            allowed = {
+                item.value for item in parent_profile.allowed_child_roles
+            } & {
+                item.value
+                for item in parent_profile.communication_policy.allowed_child_roles
+            }
+            if not parent_profile.communication_policy.can_delegate:
+                allowed = set()
             if role not in allowed:
                 return {"ok": False, "error": f"child role is not allowed: {role}"}
 
@@ -5248,6 +7469,13 @@ class OrchestrationService:
                     "operation_id": operation_id,
                     "role": role,
                     "objective": objective,
+                    "brief": brief_draft.to_dict() if brief_draft else None,
+                    "context_refs": list(payload.get("context_refs") or ()),
+                    "blocked_by_task_ids": list(
+                        payload.get("blocked_by_task_ids") or ()
+                    ),
+                    "priority": int(payload.get("priority", 0)),
+                    "runtime_preset_id": payload.get("runtime_preset_id"),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -5306,19 +7534,22 @@ class OrchestrationService:
                     return 0
                 return min(available, max(minimum, available // slots))
 
-            child_budget = RuntimeBudget(
-                allocate(remaining.model_calls, minimum_model_calls),
-                allocate(remaining.tool_calls),
-                allocate(remaining.tokens),
-                allocate(remaining.wall_seconds),
-            )
-            if child_budget.model_calls < minimum_model_calls:
-                raise BudgetExceededError(
-                    "parent has insufficient model-call budget for a child lifecycle "
-                    "after reserving settlement headroom"
+            if self.enforce_runtime_budgets:
+                child_budget = RuntimeBudget(
+                    allocate(remaining.model_calls, minimum_model_calls),
+                    allocate(remaining.tool_calls),
+                    allocate(remaining.tokens),
+                    allocate(remaining.wall_seconds),
                 )
-            if child_budget.wall_seconds == 0:
-                raise BudgetExceededError("parent has no executable budget for a child")
+                if child_budget.model_calls < minimum_model_calls:
+                    raise BudgetExceededError(
+                        "parent has insufficient model-call budget for a child lifecycle "
+                        "after reserving settlement headroom"
+                    )
+                if child_budget.wall_seconds == 0:
+                    raise BudgetExceededError("parent has no executable budget for a child")
+            else:
+                child_budget = UNLIMITED_RUNTIME_BUDGET
             child_profile = self.catalog.resolve_profile(role)
             requested_permissions = self._profile_permissions(parent, child_profile)
             preflight = runtime.spawn_child(
@@ -5348,48 +7579,245 @@ class OrchestrationService:
                 "requested_permissions": requested_permissions.as_dict(),
                 "denied_escalations": list(preflight.denied_escalations),
             }
-            # A delegated task must never publish directly into the root user's
-            # workspace.  Its formal workspace is the parent's orchestration-owned
-            # task candidate; nested tasks therefore compose staging layers and only
-            # the root task's final acceptance crosses the user-workspace boundary.
+            # Writable delegated tasks compose isolated staging layers. A read-only
+            # tree can safely share the parent's formal source because every child
+            # inherits the same read-only policy and runtime sandbox.
+            parent_read_only = bool(parent.policy.get("read_only", False))
             parent_candidate = self._ensure_task_snapshot(parent)
             child_workspace = (
-                str(parent_candidate.candidate)
+                str(parent.workspace)
+                if parent_read_only and parent.workspace
+                else str(parent_candidate.candidate)
                 if parent_candidate is not None
                 else None
             )
             runtime_meta["workspace_scope"] = (
-                "parent_task_candidate" if child_workspace else "none"
+                "parent_read_only_source"
+                if parent_read_only and child_workspace
+                else "parent_task_candidate"
+                if child_workspace
+                else "none"
             )
             if parent_candidate is not None:
                 runtime_meta["parent_workspace_snapshot_id"] = (
                     parent_candidate.snapshot_id
                 )
-            detail = self.create_task(
-                {
-                    "idempotency_key": key,
-                    "title": f"{role.title()} child: {objective[:80]}",
-                    "objective": objective,
-                    "domain": parent.domain.value,
-                    "workspace": child_workspace,
-                    "acceptance_criteria": list(parent.acceptance_criteria),
-                    "constraints": list(parent.constraints),
-                    "profile_id": role,
-                    "parent_task_id": parent.id,
-                    "parent_node_id": parent_run.node_id,
-                    "budget": child_budget.as_dict(),
-                    "input": {"_runtime": runtime_meta},
-                    "read_only": bool(parent.policy.get("read_only", False)),
-                    "network": bool(parent.policy.get("network", False)),
-                    "external_writes": bool(parent.policy.get("external_writes", False)),
-                    "auto_start": True,
-                },
-                _parent_context={
-                    "parent_task_id": parent.id,
-                    "parent_run_id": parent_run.id,
-                },
+            if brief_draft is None:
+                legacy_criteria = tuple(
+                    {
+                        "id": f"AC-{index:02d}",
+                        "text": item,
+                        "verification": "legacy",
+                        "required": True,
+                    }
+                    for index, item in enumerate(parent.acceptance_criteria, 1)
+                ) or (
+                    {
+                        "id": "AC-LEGACY-01",
+                        "text": "Complete the bounded child assignment",
+                        "verification": "parent_review",
+                        "required": True,
+                    },
+                )
+                brief_draft = TaskBriefDraft(
+                    title=f"{role.title()} child: {objective[:80]}",
+                    objective=objective,
+                    background="Created through the legacy spawn_agent compatibility wrapper.",
+                    scope={
+                        "whole_task": True,
+                        "reason": "Legacy spawn_agent supplied only a bounded task string.",
+                    },
+                    instructions=(objective,),
+                    constraints=parent.constraints,
+                    acceptance_criteria=legacy_criteria,
+                    deliverables=(
+                        {
+                            "id": "DEL-LEGACY-RESULT",
+                            "kind": "other",
+                            "title": "Structured legacy child result",
+                            "required": True,
+                        },
+                    ),
+                    result_contract={"schema_id": "legacy_result_v1"},
+                )
+            policy = child_profile.communication_policy
+            prepared_refs: list[ContextRefDraft] = []
+            for raw_ref in payload.get("context_refs") or ():
+                if not isinstance(raw_ref, Mapping):
+                    raise ValueError("each context reference must be an object")
+                context_ref = ContextRefDraft.from_mapping(raw_ref)
+                if context_ref.ref_type in {
+                    ContextRefType.FILE,
+                    ContextRefType.FILE_RANGE,
+                    ContextRefType.GIT_DIFF,
+                }:
+                    if not child_workspace:
+                        raise ValueError("file context references require a child workspace")
+                    context_ref = self.context_resolver.prepare_file_ref(
+                        child_workspace, context_ref
+                    )
+                prepared_refs.append(context_ref)
+            allowed_context_types = tuple(
+                item
+                for item in policy.allowed_context_ref_types
+                if item in parent_profile.communication_policy.allowed_context_ref_types
             )
-            child = self.store.get_task(str(detail["id"]))
+            context_policy = ContextPolicy(
+                max_initial_context_tokens=min(
+                    policy.max_initial_context_tokens,
+                    parent_profile.communication_policy.max_initial_context_tokens,
+                    self.handoff_settings.default_context_token_budget,
+                ),
+                max_context_refs=min(
+                    policy.max_context_refs,
+                    parent_profile.communication_policy.max_context_refs,
+                    self.handoff_settings.max_context_refs,
+                ),
+                max_inline_bytes_per_ref=min(
+                    policy.max_inline_bytes_per_ref,
+                    parent_profile.communication_policy.max_inline_bytes_per_ref,
+                    self.handoff_settings.max_inline_bytes_per_ref,
+                ),
+                max_inline_bytes_total=min(
+                    policy.max_inline_bytes_total,
+                    parent_profile.communication_policy.max_inline_bytes_total,
+                    self.handoff_settings.max_inline_bytes_total,
+                ),
+                allowed_context_ref_types=allowed_context_types,
+                allow_full_transcript_reference=(
+                    policy.allow_full_transcript_reference
+                    and parent_profile.communication_policy.allow_full_transcript_reference
+                ),
+                network=bool(parent.policy.get("network", False)),
+                context_read_audit_enabled=self.handoff_settings.context_read_audit_enabled,
+            )
+            context_refs = ContextManifestBuilder(context_policy).normalize(
+                prepared_refs
+            )
+            blocked_by = tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in payload.get("blocked_by_task_ids") or ()
+                    if str(item).strip()
+                )
+            )
+            root_task_id = self._root_task_id(parent.id)
+            tree_ids = {item.id for item in self.store.list_task_tree(root_task_id)}
+            if any(item not in tree_ids for item in blocked_by):
+                raise ValueError("blockers must belong to the same orchestration tree")
+            brief_draft.validate(
+                required_fields=policy.required_brief_fields,
+                informational=False,
+            )
+            child_request = {
+                "objective": objective,
+                "domain": parent.domain.value,
+                "workspace": child_workspace,
+                "acceptance_criteria": [
+                    str(item.get("text") or "")
+                    for item in brief_draft.acceptance_criteria
+                ],
+                "constraints": list(brief_draft.constraints),
+                "profile_id": role,
+                "read_only": bool(parent.policy.get("read_only", False)),
+            }
+            assessment = self._assessment(
+                child_request,
+                parent.domain,
+                bool(brief_draft.acceptance_criteria),
+                workspace=child_workspace,
+            )
+            requested_preset_id = str(
+                payload.get("runtime_preset_id") or ""
+            ).strip()
+            child_preset = (
+                runtime_preset(requested_preset_id)
+                if requested_preset_id
+                else None
+            )
+            if child_preset and parent.domain.value not in child_preset.domains:
+                raise ValueError(
+                    f"runtime preset {child_preset.preset_id} does not support "
+                    f"domain {parent.domain.value}"
+                )
+            child_preset_snapshot = (
+                child_preset.to_dict() if child_preset is not None else None
+            )
+            child_policy = {
+                **assessment.as_dict()["policy"],
+                "assessment": assessment.as_dict(),
+                "profile_id": role,
+                "model_policy_id": child_profile.model_policy,
+                "require_review": False,
+                "require_tests": False,
+                "read_only": bool(parent.policy.get("read_only", False)),
+                "network": bool(parent.policy.get("network", False)),
+                "external_writes": bool(parent.policy.get("external_writes", False)),
+                "structured_handoff": bool(
+                    self.handoff_settings.structured_handoff_enabled
+                ),
+                "legacy_delegation": not structured,
+                "runtime_preset_id": (
+                    child_preset.preset_id if child_preset else None
+                ),
+                "runtime_preset_version": (
+                    child_preset.version if child_preset else None
+                ),
+                "runtime_preset_hash": (
+                    child_preset_snapshot["content_hash"]
+                    if child_preset_snapshot
+                    else None
+                ),
+                "runtime_preset_snapshot": child_preset_snapshot,
+            }
+            result = self.store.create_delegated_task(
+                TaskSpec(
+                    idempotency_key=key,
+                    title=brief_draft.title,
+                    objective=brief_draft.objective,
+                    domain=parent.domain,
+                    workspace=child_workspace,
+                    constraints=brief_draft.constraints,
+                    acceptance_criteria=tuple(
+                        str(item.get("text") or "")
+                        for item in brief_draft.acceptance_criteria
+                    ),
+                    complexity_score=assessment.score,
+                    complexity_level=ComplexityLevel(assessment.level.value),
+                    risk_tier=RiskTier(assessment.risk.value),
+                    budget=child_budget.as_dict(),
+                    policy=child_policy,
+                    input={
+                        "_runtime": runtime_meta,
+                        **(
+                            {"runtime_preset_id": child_preset.preset_id}
+                            if child_preset
+                            else {}
+                        ),
+                    },
+                    priority=int(payload.get("priority", 0)),
+                    max_parallel_runs=parent.max_parallel_runs,
+                    parent_task_id=parent.id,
+                    parent_node_id=parent_run.node_id,
+                ),
+                parent_run_id=parent_run.id,
+                lease_token=str(payload.get("lease_token") or ""),
+                fencing_token=int(payload.get("fencing_token", -1)),
+                brief=brief_draft,
+                context_refs=context_refs,
+                blocked_by_task_ids=blocked_by,
+                command_id=f"delegate:{key}",
+            )
+            child = result["task"]
+            detail = self._task_summary(child)
+            if not structured:
+                self.handoff_metrics.increment(
+                    "orchestration_legacy_delegation_total"
+                )
+            else:
+                self.handoff_metrics.increment(
+                    "orchestration_delegations_total"
+                )
             self._record_child_delegation(
                 parent,
                 parent_run,
@@ -5412,7 +7840,17 @@ class OrchestrationService:
         except (BudgetExceededError, RuntimeLimitError, RuntimeStateError, ValueError) as exc:
             self._runtime_for_task(parent.id, rebuild=True)
             return {"ok": False, "error": str(exc)}
-        return {"ok": True, "task_id": detail["id"], "status": detail["status"]}
+        return {
+            "ok": True,
+            "task_id": detail["id"],
+            "status": detail["status"],
+            "brief_id": child.active_brief_id,
+            "brief_revision": 1,
+            "links": {
+                "task": f"/v1/orchestration/tasks/{child.id}",
+                "brief": f"/v1/orchestration/tasks/{child.id}/briefs/1",
+            },
+        }
 
     def _replay_child_delegation(
         self,
@@ -5839,6 +8277,986 @@ class OrchestrationService:
         )
         return ModelRouter(self.model_candidates(), policy=policy).route(facts).audit_record()
 
+    # -- structured handoff control plane -------------------------------
+    def validate_task_brief(
+        self, task_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        profile = self.catalog.resolve_profile(
+            str(task.policy.get("profile_id") or "worker")
+        )
+        draft = TaskBriefDraft.from_mapping(value)
+        issues = draft.validation_issues(
+            required_fields=profile.communication_policy.required_brief_fields
+        )
+        return {
+            "valid": not issues,
+            "errors": list(issues),
+            "content_hash": draft.content_hash,
+        }
+
+    def list_task_briefs(self, task_id: str) -> list[dict[str, Any]]:
+        return [item.to_dict() for item in self.store.list_briefs(task_id)]
+
+    def get_task_brief(self, task_id: str, revision: int) -> dict[str, Any]:
+        return self.store.get_brief(task_id, revision).to_dict()
+
+    def create_task_brief_draft(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        if task.status in _TERMINAL_TASKS or task.status is TaskStatus.CANCELING:
+            raise ConflictError("a terminal task cannot receive a new Brief revision")
+        try:
+            current = self.store.get_active_brief(task_id)
+        except NotFoundError:
+            current = None
+        record = self.store.create_brief_draft(
+            task_id,
+            TaskBriefDraft.from_mapping(value),
+            copy_context_from_brief_id=(
+                str(
+                    value.get("copy_context_from_brief_id")
+                    or (current.id if current is not None else "")
+                )
+                or None
+            ),
+            command_id=(
+                command_id
+                or _command("brief-create", task_id, _canonical_hash(dict(value)))
+            ),
+        )
+        return record.to_dict()
+
+    def update_task_brief_draft(
+        self,
+        task_id: str,
+        revision: int,
+        value: Mapping[str, Any],
+        *,
+        expected_hash: str,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        normalized_hash = str(expected_hash).strip().strip('"')
+        record = self.store.update_brief_draft(
+            task_id,
+            revision,
+            TaskBriefDraft.from_mapping(value),
+            expected_hash=normalized_hash,
+            command_id=(
+                command_id
+                or _command("brief-update", task_id, revision, normalized_hash)
+            ),
+        )
+        return record.to_dict()
+
+    def publish_task_brief(
+        self,
+        task_id: str,
+        revision: int,
+        *,
+        expected_hash: Optional[str] = None,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        draft = self.store.get_brief(task_id, revision)
+        if expected_hash is not None and draft.content_hash != str(expected_hash):
+            raise ConflictError("task brief draft changed since it was loaded")
+        profile = self.catalog.resolve_profile(
+            str(task.policy.get("profile_id") or "worker")
+        )
+        TaskBriefDraft(
+            title=draft.title,
+            objective=draft.objective,
+            background=draft.background,
+            scope=draft.scope,
+            instructions=draft.instructions,
+            constraints=draft.constraints,
+            non_goals=draft.non_goals,
+            acceptance_criteria=draft.acceptance_criteria,
+            deliverables=draft.deliverables,
+            result_contract=draft.result_contract,
+        ).validate(
+            required_fields=profile.communication_policy.required_brief_fields
+        )
+        record = self.store.publish_brief(
+            task_id,
+            revision,
+            command_id=(
+                command_id
+                or _command("brief-publish", task_id, revision, draft.content_hash)
+            ),
+        )
+        self.handoff_metrics.increment("orchestration_brief_published_total")
+        fresh = self.store.get_task(task_id)
+        if fresh.status in {
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_HUMAN,
+            TaskStatus.WAITING_CHILD,
+            TaskStatus.PAUSED,
+            TaskStatus.BLOCKED,
+        }:
+            self.wakes.enqueue_wake(
+                task_id,
+                WakeReason.BRIEF_REVISION_AVAILABLE,
+                payload={
+                    "brief_id": record.id,
+                    "brief_revision": record.revision,
+                    "content_hash": record.content_hash,
+                },
+                dedupe_key=f"{task_id}:brief_revision:{record.id}",
+            )
+            self.wake()
+        return record.to_dict()
+
+    def list_task_context_refs(
+        self,
+        task_id: str,
+        *,
+        brief_id: Optional[str] = None,
+        requirement: Optional[str] = None,
+        ref_type: Optional[str] = None,
+        limit: int = 1_000,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        rows = self.store.list_context_refs(
+            task_id,
+            brief_id=brief_id,
+            requirement=(ContextRequirement(requirement) if requirement else None),
+            ref_type=(ContextRefType(ref_type) if ref_type else None),
+            limit=limit,
+            offset=offset,
+        )
+        read_events: dict[str, list[Any]] = {}
+        for event in self.store.list_events(task_id=task_id, limit=10_000):
+            if event.event_type == "context_ref_read":
+                read_events.setdefault(event.aggregate_id, []).append(event)
+        return [
+            {
+                **item.to_dict(),
+                "read_count": len(read_events.get(item.id, ())),
+                "last_read_at": (
+                    _iso(read_events[item.id][-1].created_at)
+                    if read_events.get(item.id)
+                    else None
+                ),
+                "last_read_by_run_id": (
+                    read_events[item.id][-1].payload.get("run_id")
+                    if read_events.get(item.id)
+                    else None
+                ),
+            }
+            for item in rows
+        ]
+
+    def add_task_context_ref(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        brief_id = str(value.get("brief_id") or "")
+        if not brief_id:
+            drafts = [
+                item
+                for item in self.store.list_briefs(task_id)
+                if item.status is BriefStatus.DRAFT
+            ]
+            if not drafts:
+                raise ConflictError("a draft Brief is required before adding context")
+            brief_id = drafts[-1].id
+        draft = ContextRefDraft.from_mapping(value.get("context_ref") or value)
+        profile = self.catalog.resolve_profile(
+            str(task.policy.get("profile_id") or "worker")
+        )
+        if draft.ref_type not in profile.communication_policy.allowed_context_ref_types:
+            raise PermissionError(
+                f"context ref type is not permitted: {draft.ref_type.value}"
+            )
+        if draft.ref_type in {
+            ContextRefType.FILE,
+            ContextRefType.FILE_RANGE,
+            ContextRefType.GIT_DIFF,
+        }:
+            if not task.workspace:
+                raise ValueError("file context references require a workspace")
+            draft = self.context_resolver.prepare_file_ref(task.workspace, draft)
+        existing = self.store.list_context_refs(task_id, brief_id=brief_id)
+        if len(existing) >= min(
+            self.handoff_settings.max_context_refs,
+            profile.communication_policy.max_context_refs,
+        ):
+            raise ValueError("context reference limit reached")
+        record = self.store.add_context_ref(
+            task_id,
+            brief_id,
+            draft,
+            command_id=(
+                command_id
+                or _command("context-add", task_id, brief_id, draft.to_dict())
+            ),
+        )
+        return record.to_dict()
+
+    def get_context_ref_metadata(self, ref_id: str) -> dict[str, Any]:
+        return self.store.get_context_ref(ref_id).to_dict()
+
+    def read_context_ref_content(
+        self,
+        ref_id: str,
+        *,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> dict[str, Any]:
+        ref = self.store.get_context_ref(ref_id)
+        task = self.store.get_task(ref.task_id)
+        result = self.context_resolver.read(
+            ref.id,
+            task_id=task.id,
+            run_id=None,
+            workspace=task.workspace,
+            start_line=start_line,
+            end_line=end_line,
+        )
+        self.handoff_metrics.increment("orchestration_context_reads_total")
+        self.handoff_metrics.increment(
+            "orchestration_context_bytes_read_total",
+            int(result.get("byte_size") or 0),
+        )
+        return result
+
+    def verify_context_ref(
+        self, ref_id: str, *, command_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        ref = self.store.get_context_ref(ref_id)
+        task = self.store.get_task(ref.task_id)
+        result = self.context_resolver.verify(ref, workspace=task.workspace)
+        self.store.record_context_ref_verification(
+            ref.id,
+            run_id=None,
+            result=result,
+            command_id=(
+                command_id
+                or _command("context-verify", ref.id, _canonical_hash(result))
+            ),
+        )
+        return {
+            "id": ref.id,
+            "task_id": task.id,
+            **result,
+        }
+
+    def delegate_task(
+        self, parent_task_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        run_id = str(value.get("run_id") or "")
+        run = self.store.get_run(run_id)
+        if run.task_id != parent_task_id:
+            raise PermissionError("delegation run does not own the parent task")
+        result = self._spawn_child(
+            {
+                **dict(value),
+                "task_id": parent_task_id,
+                "node_id": run.node_id,
+            }
+        )
+        if not bool(result.get("ok")):
+            message = str(result.get("error") or "delegation failed")
+            if "not allowed" in message or "cannot delegate" in message:
+                raise PermissionError(message)
+            raise ConflictError(message)
+        self.wake()
+        return dict(result)
+
+    def task_relations(self, task_id: str) -> list[dict[str, Any]]:
+        return [
+            handoff_jsonable(item) for item in self.relations.list_relations(task_id)
+        ]
+
+    def add_task_relation(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        relation_type = TaskRelationType(str(value.get("relation_type") or "related"))
+        from_task_id = str(value.get("from_task_id") or task_id)
+        to_task_id = str(value.get("to_task_id") or task_id)
+        if task_id not in {from_task_id, to_task_id}:
+            raise PermissionError(
+                "a task-scoped relation endpoint must include that task"
+            )
+        record = self.relations.add_relation(
+            from_task_id,
+            to_task_id,
+            relation_type,
+            metadata=dict(value.get("metadata") or {}),
+            created_by_task_id=None,
+            created_by_run_id=None,
+            command_id=command_id,
+        )
+        return handoff_jsonable(record)
+
+    def remove_task_relation(
+        self,
+        task_id: str,
+        relation_id: str,
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        relation = next(
+            (
+                item
+                for item in self.store.list_relations(task_id)
+                if item.id == relation_id
+            ),
+            None,
+        )
+        if relation is None:
+            raise NotFoundError(f"relation not found: {relation_id}")
+        return handoff_jsonable(
+            self.relations.remove_relation(
+                relation_id, actor="local-user", command_id=command_id
+            )
+        )
+
+    def replace_task_blockers(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        command_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        blocker_ids = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in value.get("task_ids") or ()
+                if str(item).strip()
+            )
+        )
+        records = self.relations.replace_blockers(
+            task_id,
+            blocker_ids,
+            reason=str(value.get("reason") or "Operator updated blockers"),
+            owner=str(value.get("owner") or "local-user"),
+            required_action=str(
+                value.get("required_action") or "Complete all blocker tasks"
+            ),
+            command_id=command_id,
+        )
+        self.wake()
+        return [handoff_jsonable(item) for item in records]
+
+    def task_comments(
+        self, task_id: str, *, after_sequence: int = 0
+    ) -> dict[str, Any]:
+        delta = self.communications.delta(
+            task_id, after_sequence=after_sequence
+        )
+        return {
+            **delta,
+            "comments": [handoff_jsonable(item) for item in delta["comments"]],
+        }
+
+    def task_comment(self, task_id: str, comment_id: str) -> dict[str, Any]:
+        comment = self.store.get_task_comment(comment_id)
+        if comment.task_id != task_id:
+            raise NotFoundError(f"comment not found: {comment_id}")
+        return handoff_jsonable(comment)
+
+    def post_operator_comment(
+        self, task_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        body = str(value.get("body_markdown") or value.get("body") or "")
+        metadata = dict(value.get("metadata") or {})
+        metadata["mentions"] = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in metadata.get("mentions", ())
+                if str(item).strip()
+            )
+        )
+        for target in metadata["mentions"]:
+            if target.startswith("task:"):
+                continue
+            target_profile = self.catalog.resolve_profile(target)
+            if not target_profile.communication_policy.can_mention_receive:
+                raise PermissionError(
+                    f"profile cannot receive mentions: {target_profile.profile_id}"
+                )
+        comment = self.communications.post_comment(
+            task_id,
+            body,
+            author_type="operator",
+            author_id="local-user",
+            metadata=metadata,
+            reply_to_comment_id=(
+                str(value["reply_to_comment_id"])
+                if value.get("reply_to_comment_id")
+                else None
+            ),
+            wake_owner=True,
+            command_id=str(
+                value.get("command_id")
+                or _command("comment", task_id, _canonical_hash(dict(value)))
+            ),
+        )
+        self.handoff_metrics.increment("orchestration_comments_total")
+        self.wake()
+        return handoff_jsonable(comment)
+
+    def task_work_products(self, task_id: str) -> list[dict[str, Any]]:
+        products = self.work_products.list(task_id)
+        latest_verification: dict[str, Mapping[str, Any]] = {}
+        for event in self.store.list_events(task_id=task_id, limit=10_000):
+            if event.event_type == "work_product_verified":
+                latest_verification[event.aggregate_id] = event.payload
+        return [
+            {
+                **handoff_jsonable(item),
+                **(
+                    {
+                        "verification_status": str(
+                            latest_verification[item.id].get(
+                                "verification_status", item.verification_status
+                            )
+                        ),
+                        "verification": dict(latest_verification[item.id]),
+                    }
+                    if item.id in latest_verification
+                    else {}
+                ),
+            }
+            for item in products
+        ]
+
+    def _result_question_payload(
+        self, source_task_id: str, question_task: TaskRecord
+    ) -> dict[str, Any]:
+        metadata = dict(question_task.input.get("result_follow_up") or {})
+        products = self.store.list_work_products(question_task.id, limit=1_000)
+        answer_product = next(
+            (
+                item
+                for item in reversed(products)
+                if str(item.metadata.get("deliverable_id") or "") == "answer-1"
+            ),
+            None,
+        )
+        if answer_product is None:
+            answer_product = next(
+                (
+                    item
+                    for item in reversed(products)
+                    if item.kind
+                    not in {
+                        WorkProductKind.PLAN,
+                        WorkProductKind.REVIEW_REPORT,
+                        WorkProductKind.TEST_RESULT,
+                        WorkProductKind.EVALUATION,
+                    }
+                ),
+                None,
+            )
+        stored_result = dict(question_task.output or {}).get("result")
+        fallback_summary = (
+            str(dict(stored_result).get("summary") or "")
+            if isinstance(stored_result, Mapping)
+            else ""
+        )
+        return {
+            "id": question_task.id,
+            "task_id": question_task.id,
+            "source_task_id": source_task_id,
+            "question": str(metadata.get("question") or question_task.objective),
+            "status": question_task.status.value,
+            "terminal_outcome": self._terminal_outcome(question_task).value,
+            "stage": question_task.current_stage.value,
+            "progress": self._task_summary(question_task)["progress"],
+            "answer": (
+                str(answer_product.summary)
+                if answer_product is not None
+                else fallback_summary or None
+            ),
+            "answer_work_product_id": (
+                answer_product.id if answer_product is not None else None
+            ),
+            "answer_artifact_id": (
+                answer_product.artifact_id if answer_product is not None else None
+            ),
+            "source_work_product_ids": list(
+                metadata.get("source_work_product_ids") or ()
+            ),
+            "created_at": _iso(question_task.created_at),
+            "updated_at": _iso(question_task.updated_at),
+        }
+
+    def result_questions(self, task_id: str) -> list[dict[str, Any]]:
+        self.store.get_task(task_id)
+        question_tasks: list[TaskRecord] = []
+        seen: set[str] = set()
+        for relation in self.store.list_relations(task_id):
+            if (
+                relation.from_task_id != task_id
+                or relation.relation_type is not TaskRelationType.RELATED
+                or str(relation.metadata.get("kind") or "") != "result_question"
+                or relation.to_task_id in seen
+            ):
+                continue
+            seen.add(relation.to_task_id)
+            question_tasks.append(self.store.get_task(relation.to_task_id))
+        question_tasks.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        return [
+            self._result_question_payload(task_id, item) for item in question_tasks
+        ]
+
+    def ask_result_question(
+        self,
+        task_id: str,
+        question: str,
+        *,
+        command_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        source = self.store.get_task(task_id)
+        if self._terminal_outcome(source) is not TaskStatus.COMPLETED:
+            raise ConflictError(
+                "result questions are available only after successful completion"
+            )
+        normalized_question = str(question).strip()
+        if not normalized_question:
+            raise ValueError("question is required")
+        if len(normalized_question) > 4_000:
+            raise ValueError("question must be at most 4000 characters")
+
+        products = list(self.store.list_work_products(source.id, limit=1_000))
+        if not products:
+            raise ConflictError("the completed task has no result work products")
+        try:
+            brief = self.store.get_active_brief(source.id)
+            deliverables = tuple(brief.deliverables)
+        except NotFoundError:
+            deliverables = ()
+        declared_ids = {
+            str(item.get("id") or "") for item in deliverables if item.get("id")
+        }
+        selected = [
+            item
+            for item in products
+            if str(item.metadata.get("deliverable_id") or "") in declared_ids
+        ]
+        if not selected:
+            selected = [
+                item
+                for item in products
+                if str(item.metadata.get("node_kind") or "") == NodeKind.EXECUTE.value
+                and item.kind
+                not in {
+                    WorkProductKind.PLAN,
+                    WorkProductKind.REVIEW_REPORT,
+                    WorkProductKind.TEST_RESULT,
+                    WorkProductKind.EVALUATION,
+                }
+            ]
+        if not selected:
+            selected = [
+                item
+                for item in products
+                if item.kind
+                not in {
+                    WorkProductKind.PLAN,
+                    WorkProductKind.REVIEW_REPORT,
+                    WorkProductKind.TEST_RESULT,
+                    WorkProductKind.EVALUATION,
+                }
+            ]
+        if not selected:
+            selected = [products[-1]]
+
+        max_refs = max(1, min(self.handoff_settings.max_context_refs, 20))
+        selected = selected[-max_refs:]
+        context_refs: list[dict[str, Any]] = []
+        for product in selected:
+            artifact_id = str(product.artifact_id or product.uri or "")
+            content_hash = str(product.content_hash or "")
+            mime_type = "application/json"
+            if not artifact_id.startswith("sha256:"):
+                artifact = self.blobs.put_json(
+                    {
+                        "schema_version": 1,
+                        "source_task_id": source.id,
+                        "work_product": handoff_jsonable(product),
+                    }
+                )
+                artifact_id = artifact.uri
+                content_hash = f"sha256:{artifact.sha256}"
+                mime_type = artifact.mime_type
+            context_refs.append(
+                {
+                    "requirement": "required",
+                    "ref_type": ContextRefType.ARTIFACT.value,
+                    "display_name": product.title,
+                    "selection_reason": (
+                        "Declared final result used to answer the operator's "
+                        "follow-up question"
+                    ),
+                    "locator": {"artifact_id": artifact_id},
+                    "delivery_mode": "on_demand",
+                    "summary": f"Result work product {product.id}",
+                    "mime_type": mime_type,
+                    "content_hash": content_hash or artifact_id,
+                    "provenance": {
+                        "source_task_id": source.id,
+                        "source_work_product_id": product.id,
+                    },
+                    "trust_level": "agent_generated",
+                }
+            )
+
+        operation = str(command_id or uuid.uuid4().hex)
+        idempotency_digest = hashlib.sha256(operation.encode("utf-8")).hexdigest()
+        title_question = " ".join(normalized_question.split())
+        follow_up = self.create_task(
+            {
+                "idempotency_key": (
+                    f"result-question:{source.id}:{idempotency_digest}"
+                ),
+                "title": f"Follow-up: {title_question[:150]}",
+                "objective": normalized_question,
+                "domain": TaskDomain.KNOWLEDGE.value,
+                "read_only": True,
+                "profile_id": "worker",
+                "model_policy_id": str(
+                    source.policy.get("model_policy_id") or "quality-first"
+                ),
+                "acceptance_criteria": [
+                    "The answer directly addresses the operator's question.",
+                    "Every factual claim is grounded in the supplied result artifact.",
+                ],
+                "require_review": False,
+                "require_tests": False,
+                "complexity_factors": {
+                    "scope": 0,
+                    "uncertainty": 0,
+                    "dependencies": 0,
+                    "side_effects": 0,
+                    "parallelism": 0,
+                    "verification": 0,
+                },
+                "brief": {
+                    "title": f"Result follow-up for {source.title}"[:200],
+                    "objective": normalized_question,
+                    "background": (
+                        f"Answer a question about completed task {source.id}. "
+                        "The source task remains immutable and is not restarted."
+                    ),
+                    "scope": {
+                        "components": ["declared result artifacts"],
+                        "source_task_id": source.id,
+                    },
+                    "instructions": [
+                        "Read the required result artifact context before answering.",
+                        "Answer only from the supplied result; clearly label any inference or missing information.",
+                        "Preserve and cite file paths, line references, evidence identifiers, or artifact identifiers when relevant.",
+                        "Return a concise standalone answer to the operator's question.",
+                    ],
+                    "constraints": [
+                        "Read-only follow-up: do not modify the source task or workspace.",
+                        "Do not claim evidence that is absent from the supplied result.",
+                    ],
+                    "non_goals": [
+                        "Do not re-run or replace the completed source task."
+                    ],
+                    "acceptance_criteria": [
+                        {
+                            "id": "AC-01",
+                            "text": "The answer directly addresses the question.",
+                            "required": True,
+                        },
+                        {
+                            "id": "AC-02",
+                            "text": "Claims are traceable to the supplied result evidence.",
+                            "required": True,
+                        },
+                    ],
+                    "deliverables": [
+                        {
+                            "id": "answer-1",
+                            "kind": WorkProductKind.ARTIFACT.value,
+                            "title": "Answer",
+                            "required": True,
+                        }
+                    ],
+                    "result_contract": {
+                        "schema_id": "openworker.result_question_answer.v1"
+                    },
+                },
+                "context_refs": context_refs,
+                "input": {
+                    "result_follow_up": {
+                        "source_task_id": source.id,
+                        "question": normalized_question,
+                        "source_work_product_ids": [item.id for item in selected],
+                    }
+                },
+                "publish_brief": True,
+                "auto_start": True,
+                "command_id": _command(
+                    "result-question-create", source.id, operation
+                ),
+            }
+        )
+        follow_up_id = str(follow_up["id"])
+        self.relations.add_relation(
+            source.id,
+            follow_up_id,
+            TaskRelationType.RELATED,
+            metadata={
+                "kind": "result_question",
+                "question": normalized_question,
+            },
+            created_by_task_id=None,
+            created_by_run_id=None,
+            command_id=_command(
+                "result-question-relation", source.id, follow_up_id
+            ),
+        )
+        return self._result_question_payload(
+            source.id, self.store.get_task(follow_up_id)
+        )
+
+    def create_operator_work_product(
+        self, task_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        product = self.work_products.create(
+            task_id,
+            kind=str(value.get("kind") or "other"),
+            title=str(value.get("title") or ""),
+            summary=str(value.get("summary") or ""),
+            workspace=task.workspace,
+            uri=(str(value["uri"]) if value.get("uri") else None),
+            evidence_id=(
+                str(value["evidence_id"]) if value.get("evidence_id") else None
+            ),
+            artifact_id=(
+                str(value["artifact_id"]) if value.get("artifact_id") else None
+            ),
+            content_hash=(
+                str(value["content_hash"]) if value.get("content_hash") else None
+            ),
+            metadata=dict(value.get("metadata") or {}),
+            verification_status=str(
+                value.get("verification_status") or "unverified"
+            ),
+            created_by="local-user",
+            command_id=str(
+                value.get("command_id")
+                or _command("work-product", task_id, _canonical_hash(dict(value)))
+            ),
+        )
+        self.handoff_metrics.increment("orchestration_work_products_total")
+        return handoff_jsonable(product)
+
+    def get_work_product(self, product_id: str) -> dict[str, Any]:
+        product = self.store.get_work_product(product_id)
+        return next(
+            item
+            for item in self.task_work_products(product.task_id)
+            if item["id"] == product_id
+        )
+
+    def verify_work_product(
+        self, product_id: str, *, command_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        product = self.store.get_work_product(product_id)
+        task = self.store.get_task(product.task_id)
+        available = True
+        actual_hash: Optional[str] = None
+        try:
+            if product.uri and product.uri.startswith("workspace:"):
+                if not task.workspace:
+                    raise FileNotFoundError("task has no workspace")
+                relative = product.uri.removeprefix("workspace:").lstrip("/")
+                path = ContextRefResolver.canonical_workspace_path(
+                    task.workspace, relative
+                )
+                actual_hash = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+            elif product.artifact_id:
+                data = self.blobs.get(product.artifact_id)
+                actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+            elif product.uri and product.uri.startswith("sha256:"):
+                data = self.blobs.get(product.uri)
+                actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+            else:
+                raise ConflictError(
+                    "work product has no locally verifiable workspace or artifact content"
+                )
+        except (OSError, ValueError, BlobIntegrityError):
+            available = False
+            actual_hash = None
+        return self.work_products.verify(
+            product_id,
+            available=available,
+            actual_hash=actual_hash,
+            actor="local-user",
+            command_id=command_id,
+        )
+
+    def task_wakes(self, task_id: str) -> list[dict[str, Any]]:
+        self.store.get_task(task_id)
+        return [
+            handoff_jsonable(item)
+            for item in self.wakes.list_wakes(task_id=task_id, limit=1_000)
+        ]
+
+    def list_wakes(
+        self, *, status: Optional[str] = None, limit: int = 1_000, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        statuses = (WakeStatus(status),) if status else None
+        return [
+            handoff_jsonable(item)
+            for item in self.wakes.list_wakes(
+                statuses=statuses, limit=limit, offset=offset
+            )
+        ]
+
+    def retry_wake(
+        self, wake_id: str, *, command_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        record = self.store.retry_wake(wake_id, command_id=command_id)
+        self.wake()
+        return handoff_jsonable(record)
+
+    def cancel_wake(
+        self, wake_id: str, *, command_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        return handoff_jsonable(
+            self.store.cancel_wake(wake_id, command_id=command_id)
+        )
+
+    def heartbeat_context(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int = 0,
+        run_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        try:
+            brief = self.store.get_active_brief(task_id)
+        except NotFoundError:
+            revisions = self.store.list_briefs(task_id)
+            if not revisions:
+                raise
+            # Draft tasks still need an inspectable heartbeat envelope even
+            # though no execution is permitted until a Brief is published.
+            brief = revisions[-1]
+        refs = self.store.list_context_refs(task_id, brief_id=brief.id)
+        relations = self.store.list_relations(task_id)
+        comments = self.communications.delta(
+            task_id, after_sequence=after_sequence
+        )
+        ancestors: list[dict[str, Any]] = []
+        cursor = task
+        for _ in range(16):
+            if not cursor.parent_task_id:
+                break
+            cursor = self.store.get_task(cursor.parent_task_id)
+            ancestors.append(
+                {
+                    "task_id": cursor.id,
+                    "title": cursor.title,
+                    "objective_summary": cursor.objective[:500],
+                }
+            )
+        groups: dict[str, list[dict[str, Any]]] = {
+            "children": [],
+            "blocked_by": [],
+            "blocks": [],
+            "reviews": [],
+            "related": [],
+        }
+        for relation in relations:
+            payload = handoff_jsonable(relation)
+            if relation.relation_type is TaskRelationType.PARENT:
+                key = "children" if relation.from_task_id == task_id else "parent"
+            elif relation.relation_type is TaskRelationType.BLOCKS:
+                key = "blocks" if relation.from_task_id == task_id else "blocked_by"
+            elif relation.relation_type is TaskRelationType.REVIEWS:
+                key = "reviews"
+            else:
+                key = "related"
+            groups.setdefault(key, []).append(payload)
+        wakes = self.store.list_wakes(task_id=task_id, limit=100)
+        selected_wake = next(
+            (
+                item
+                for item in reversed(wakes)
+                if run_id is None or item.target_run_id in {None, run_id}
+            ),
+            None,
+        )
+        products = self.store.list_work_products(task_id, limit=100)
+        children = [
+            item for item in self.store.list_task_tree(task_id, max_depth=1, max_rows=101)
+            if item.parent_task_id == task_id
+        ]
+        child_results = [
+            {
+                "task_id": child.id,
+                "status": child.status.value,
+                "summary": str(
+                    dict(child.output or {}).get("result", {}).get("summary")
+                    if isinstance(dict(child.output or {}).get("result"), Mapping)
+                    else dict(child.output or {}).get("summary") or ""
+                )[:2_000],
+                "work_product_refs": [
+                    item.id for item in self.store.list_work_products(child.id, limit=100)
+                ],
+            }
+            for child in children
+            if child.status in _TERMINAL_TASKS
+        ]
+        manifest = ContextBudgetCalculator.manifest(refs)
+        return {
+            "schema_version": 1,
+            "task": {
+                "id": task.id,
+                "title": task.title,
+                "status": task.status.value,
+                "stage": task.current_stage.value,
+                "parent_task_id": task.parent_task_id,
+            },
+            "brief": brief.to_dict(),
+            "ancestors": ancestors,
+            "relations": groups,
+            "context_manifest": {
+                "count": manifest["ref_count"],
+                "required": manifest["required_count"],
+                "estimated_tokens": manifest["estimated_tokens"],
+            },
+            "comments": {
+                "latest_sequence": comments["latest_sequence"],
+                "after_sequence": comments["after_sequence"],
+                "new_count": comments["new_count"],
+                "inline_batch": [
+                    handoff_jsonable(item) for item in comments["comments"]
+                ],
+                "fallback_fetch_needed": comments["fallback_fetch_needed"],
+            },
+            "child_results": child_results,
+            "work_products": [handoff_jsonable(item) for item in products],
+            "wake": handoff_jsonable(selected_wake) if selected_wake else None,
+        }
+
     # -- read model ------------------------------------------------------
     def list_tasks(
         self,
@@ -5859,10 +9277,18 @@ class OrchestrationService:
     def get_blob(self, digest: str) -> tuple[bytes, str]:
         normalized = str(digest).strip().lower().removeprefix("sha256:")
         match = self.store.find_evidence_blob(normalized)
-        if match is None:
+        product = (
+            None
+            if match is not None
+            else self.store.find_work_product_artifact(normalized)
+        )
+        if match is None and product is None:
             raise NotFoundError(f"evidence blob not found: {normalized}")
         try:
-            return self.blobs.get(normalized), match.mime_type
+            return (
+                self.blobs.get(normalized),
+                match.mime_type if match is not None else "application/octet-stream",
+            )
         except FileNotFoundError as exc:
             raise NotFoundError(f"evidence blob file is missing: {normalized}") from exc
 
@@ -5950,6 +9376,11 @@ class OrchestrationService:
                 loaded_runtime = runtime.snapshot()
                 runtime_truncated = len(loaded_runtime) > _DETAIL_RUNTIME_LIMIT
                 runtime_snapshot = list(loaded_runtime[:_DETAIL_RUNTIME_LIMIT])
+                if not self.enforce_runtime_budgets:
+                    runtime_snapshot = [
+                        {**item, "budget": None, "budget_mode": "unlimited"}
+                        for item in runtime_snapshot
+                    ]
         stage_items = []
         for stage in OrchestrationStage:
             visits = [item for item in history if item.stage is stage]
@@ -5988,8 +9419,72 @@ class OrchestrationService:
             self._run_payload(run, parent_run_id=parent_run_id) for run in runs
         ]
         run_payloads_by_id = {item["id"]: item for item in run_payloads}
+        try:
+            active_brief = self.store.get_active_brief(task.id)
+        except NotFoundError:
+            revisions = self.store.list_briefs(task.id)
+            if not revisions:
+                raise
+            active_brief = revisions[-1]
+        if include_runtime:
+            handoff_refs = self.store.list_context_refs(
+                task.id, brief_id=active_brief.id, limit=1_000
+            )
+            handoff_relations = self.store.list_relations(task.id)
+            handoff_comments = self.store.list_task_comments(
+                task.id, after_sequence=0, limit=1_000
+            )
+            handoff_products = self.store.list_work_products(task.id, limit=1_000)
+            handoff_wakes = self.store.list_wakes(task_id=task.id, limit=1_000)
+        else:
+            handoff_refs = ()
+            handoff_relations = ()
+            handoff_comments = ()
+            handoff_products = ()
+            handoff_wakes = ()
+        stored_result = dict(task.output or {}).get("result")
         return {
             **summary,
+            "result": (
+                dict(stored_result)
+                if isinstance(stored_result, Mapping)
+                else None
+            ),
+            "brief": active_brief.to_dict(),
+            "handoff_summary": {
+                "protocol": (
+                    "structured"
+                    if bool(task.policy.get("structured_handoff"))
+                    else "legacy"
+                ),
+                "loaded": include_runtime,
+                "context": ContextBudgetCalculator.manifest(handoff_refs),
+                "relations": {
+                    item.value: sum(
+                        relation.relation_type is item
+                        for relation in handoff_relations
+                    )
+                    for item in TaskRelationType
+                },
+                "comments": {
+                    "count": len(handoff_comments),
+                    "latest_sequence": (
+                        handoff_comments[-1].sequence if handoff_comments else 0
+                    ),
+                    "content_included": False,
+                },
+                "work_products": {"count": len(handoff_products)},
+                "wakes": {
+                    "count": len(handoff_wakes),
+                    "pending": sum(
+                        item.status in {WakeStatus.PENDING, WakeStatus.DEFERRED}
+                        for item in handoff_wakes
+                    ),
+                    "failed": sum(
+                        item.status is WakeStatus.FAILED for item in handoff_wakes
+                    ),
+                },
+            },
             "stages": stage_items,
             "attention": [self._gate_payload(gate) for gate in gates],
             "attention_page": {
@@ -6091,6 +9586,9 @@ class OrchestrationService:
                 "activity": event_page_size,
             },
             "runtime": runtime_snapshot,
+            "runtime_budget_mode": (
+                "enforced" if self.enforce_runtime_budgets else "unlimited"
+            ),
             "runtime_page": {
                 "truncated": runtime_truncated,
                 "returned": len(runtime_snapshot),
@@ -6373,6 +9871,56 @@ class OrchestrationService:
                 return value
         return "orchestration-system"
 
+    @classmethod
+    def _event_observability_fields(cls, event: Any) -> dict[str, Any]:
+        """Derive a content-free trace projection for API/log consumers."""
+
+        payload = dict(event.payload)
+
+        def first(*keys: str) -> Optional[str]:
+            for key in keys:
+                value = str(payload.get(key) or "").strip()
+                if value:
+                    return value
+            return None
+
+        aggregate_type = str(event.aggregate_type)
+        aggregate_id = str(event.aggregate_id)
+        run_id = first(
+            "run_id", "source_run_id", "parent_run_id", "created_by_run_id"
+        )
+        if run_id is None and aggregate_type == "run":
+            run_id = aggregate_id
+        return {
+            "actor": cls._event_actor(event),
+            "task_id": event.task_id,
+            "run_id": run_id,
+            "brief_id": (
+                first("brief_id")
+                or (aggregate_id if aggregate_type == "task_brief" else None)
+            ),
+            "brief_revision": payload.get("brief_revision"),
+            "wake_id": (
+                aggregate_id if aggregate_type == "wake_request" else first("wake_id")
+            ),
+            "wake_reason": first("reason", "wake_reason"),
+            "context_ref_id": (
+                aggregate_id
+                if aggregate_type == "context_ref"
+                else first("context_ref_id", "ref_id")
+            ),
+            "relation_id": (
+                aggregate_id if aggregate_type == "task_relation" else first("relation_id")
+            ),
+            "work_product_id": (
+                aggregate_id if aggregate_type == "work_product" else first("work_product_id")
+            ),
+            "correlation_id": first("correlation_id") or event.task_id,
+            "causation_id": (
+                first("causation_id", "source_event_id") or event.command_id
+            ),
+        }
+
     def _activity_payload(
         self,
         event: Any,
@@ -6390,6 +9938,7 @@ class OrchestrationService:
             "stage": self._event_stage(event, history, current_stage),
             "sequence": event.sequence,
             "event_hash": event.event_hash,
+            **self._event_observability_fields(event),
         }
         if event.aggregate_type == "run" and event.event_type in {
             "run.failed",
@@ -6468,9 +10017,37 @@ class OrchestrationService:
         output = dict(run.output or {})
         route = dict(output.get("routing") or {})
         error_message = str(run.error_message or "")[:_RUN_ERROR_MESSAGE_LIMIT]
+        task = self.store.get_task(run.task_id)
         if parent_run_id is _UNSET:
-            task = self.store.get_task(run.task_id)
             parent_run_id = (task.input.get("_runtime") or {}).get("parent_run_id")
+        attempt_budget: Optional[RuntimeBudget] = None
+        try:
+            graph = self.store.get_plan(run.plan_id)
+            node = next(item for item in graph.nodes if item.id == run.node_id)
+            allocation = self._run_budget(task, graph, node)
+            spent = RuntimeBudget()
+            prior_runs = sorted(
+                (
+                    item
+                    for item in self.store.list_runs(task.id)
+                    if item.plan_id == run.plan_id
+                    and item.node_id == run.node_id
+                    and (item.created_at, item.attempt, item.id)
+                    < (run.created_at, run.attempt, run.id)
+                    and item.status is not RunStatus.QUEUED
+                ),
+                key=lambda item: (item.created_at, item.attempt, item.id),
+            )
+            for prior in prior_runs:
+                available = allocation - spent
+                spent += self._bounded_budget(
+                    self._usage_for_run(prior), available
+                )
+            attempt_budget = allocation - spent
+        except (BudgetExceededError, NotFoundError, StopIteration):
+            # Legacy/corrupt rows remain inspectable even when their original
+            # attempt allocation cannot be reconstructed.
+            attempt_budget = None
         return {
             "id": run.id,
             "node_id": run.node_id,
@@ -6488,6 +10065,11 @@ class OrchestrationService:
             "error_kind": run.error_kind,
             "error_message": error_message,
             "parent_run_id": parent_run_id,
+            "budget": (
+                attempt_budget.as_dict()
+                if self.enforce_runtime_budgets and attempt_budget is not None
+                else None
+            ),
         }
 
     @staticmethod
@@ -6540,11 +10122,22 @@ class OrchestrationService:
                     continue
                 label = action_id.replace("_", " ").title()
                 tone = ""
-                requires_response = action_id in {"submit", "request_changes"}
+                requires_response = action_id in {
+                    "accept_current",
+                    "submit",
+                    "request_changes",
+                }
             if tone not in {"primary", "neutral", "danger"}:
                 tone = (
                     "primary"
-                    if action_id in {"approve", "accept", "submit", "retry"}
+                    if action_id
+                    in {
+                        "accept_current",
+                        "approve",
+                        "accept",
+                        "submit",
+                        "retry",
+                    }
                     else "danger"
                     if action_id in {"reject", "cancel"}
                     else "neutral"

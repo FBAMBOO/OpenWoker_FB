@@ -35,6 +35,7 @@ def test_task_status_is_independent_and_rejects_invalid_transitions():
     validate_task_transition(TaskStatus.WAITING_HUMAN, TaskStatus.WAITING_CHILD)
     validate_task_transition(TaskStatus.WAITING_CHILD, TaskStatus.WAITING_HUMAN)
     validate_task_transition(TaskStatus.COMPLETED, TaskStatus.ARCHIVED)
+    validate_task_transition(TaskStatus.ARCHIVED, TaskStatus.COMPLETED)
     assert is_terminal_task_status(TaskStatus.COMPLETED)
     assert not is_terminal_task_status(TaskStatus.RUNNING)
 

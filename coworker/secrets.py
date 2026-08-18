@@ -77,12 +77,15 @@ def _restrict_to_user(path: Path, *, is_dir: bool) -> None:
         # empty DACL → sqlite3 "unable to open database file", crashing the server on launch.
         grant = f"{account}:(OI)(CI)F" if is_dir else f"{account}:F"
         try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             subprocess.run(
                 ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
                 capture_output=True,
                 check=False,
+                timeout=5,
+                creationflags=creation_flags,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             pass
         return
     os.chmod(path, 0o700 if is_dir else 0o600)
@@ -91,11 +94,17 @@ def _restrict_to_user(path: Path, *, is_dir: bool) -> None:
 def write_private_text(path: str | Path, content: str) -> Path:
     """Atomically write a user-only text file using the SecretStore's OS protections."""
     target = Path(path).expanduser()
+    parent_existed = target.parent.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _restrict_to_user(target.parent, is_dir=True)
-    except OSError:
-        pass
+    # Re-applying an inheritable DACL to an established Windows state directory can
+    # trigger expensive ACL propagation across every database, blob, and transcript.
+    # Secure a directory when this call creates it; otherwise only secure the new
+    # temporary file below. The atomic replacement carries that file DACL forward.
+    if not parent_existed:
+        try:
+            _restrict_to_user(target.parent, is_dir=True)
+        except OSError:
+            pass
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     _restrict_to_user(tmp, is_dir=False)

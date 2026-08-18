@@ -6,6 +6,7 @@ import type {
   AgentProfileSpec,
   AgentProfileSummary,
   AgentRole,
+  AgentCommunicationPolicy,
   ModelPolicySummary,
   ValidationReport,
 } from "./types";
@@ -45,12 +46,21 @@ export function createBlankAgentProfile(
   policy?: ModelPolicySummary,
 ): AgentProfileSpec {
   return {
-    schema_version: 1,
+    schema_version: 2,
     profile_id: profileId,
     display_name: "Untitled profile",
     role: "worker",
     instructions: "Complete the scoped assignment and return structured evidence.",
-    allowed_tools: [],
+    allowed_tools: [
+      "get_task_context",
+      "list_context_refs",
+      "read_context_ref",
+      "post_task_comment",
+      "list_task_comments",
+      "create_work_product",
+      "complete_task",
+      "fail_task",
+    ],
     allowed_child_roles: [],
     permission_mode: "interactive",
     model_policy: policy?.id || "quality-first",
@@ -58,13 +68,41 @@ export function createBlankAgentProfile(
     max_children: 0,
     base: null,
     metadata: {
-      token_budget: null,
-      tool_call_budget: null,
-      timeout_seconds: 1800,
       evidence_required: true,
       tests_required: false,
       review_required: true,
     },
+    communication_policy: defaultCommunicationPolicy("worker", []),
+  };
+}
+
+function defaultCommunicationPolicy(role: AgentRole, allowedChildRoles: AgentRole[]): AgentCommunicationPolicy {
+  const resultContracts: Record<AgentRole, string> = {
+    orchestrator: "orchestration_summary_v1",
+    planner: "planner_result_v1",
+    worker: "implementation_result_v1",
+    reviewer: "review_result_v1",
+    tester: "test_result_v1",
+    evaluator: "evaluation_result_v1",
+    scorer: "review_result_v1",
+    explorer: "evidence_bundle_v1",
+    integrator: "implementation_result_v1",
+  };
+  return {
+    can_delegate: allowedChildRoles.length > 0,
+    allowed_child_roles: allowedChildRoles,
+    required_brief_fields: ["objective", "scope", "acceptance_criteria", "deliverables"],
+    max_initial_context_tokens: 8_000,
+    max_context_refs: 50,
+    max_inline_bytes_per_ref: 8_192,
+    max_inline_bytes_total: 32_768,
+    allowed_context_ref_types: ["file", "file_range", "git_diff", "artifact", "work_product", "task_output", "task_comment", "event_range", "url", "workspace_query"],
+    allow_full_transcript_reference: false,
+    allowed_relation_types: ["parent", "blocks", "reviews", "related"],
+    can_comment: true,
+    can_mention: ["orchestrator", "planner"].includes(role),
+    can_mention_receive: true,
+    result_contract_id: resultContracts[role],
   };
 }
 
@@ -345,33 +383,50 @@ function ProfileEditor({ spec, editable, isNew, policies, onChange }: { spec: Ag
   const metadata = spec.metadata || {};
   const patchMetadata = (value: Partial<AgentProfileSpec["metadata"]>) => patch({ metadata: { ...metadata, ...value } });
   const roleAllowed = (role: AgentRole) => spec.allowed_child_roles.includes(role);
+  const communication = spec.communication_policy || defaultCommunicationPolicy(spec.role, spec.allowed_child_roles);
+  const patchCommunication = (value: Partial<AgentCommunicationPolicy>) => patch({
+    schema_version: 2,
+    communication_policy: { ...communication, ...value },
+  });
   return (
     <div className="space-y-4">
       <EditorSection title="Identity and behavior" detail="Profile IDs are stable; instructions and every published field are copied into the task snapshot.">
         <Field label="Profile ID"><input className={`${INPUT} font-mono`} disabled={!editable || !isNew} value={spec.profile_id} onChange={(event) => patch({ profile_id: slugify(event.target.value) })} /></Field>
         <Field label="Display name"><input className={INPUT} disabled={!editable} value={spec.display_name} onChange={(event) => patch({ display_name: event.target.value })} /></Field>
-        <Field label="Role"><select className={INPUT} disabled={!editable} value={spec.role} onChange={(event) => patch({ role: event.target.value as AgentRole })}>{AGENT_ROLES.map((role) => <option key={role} value={role}>{humanize(role)}</option>)}</select></Field>
+        <Field label="Role"><select className={INPUT} disabled={!editable} value={spec.role} onChange={(event) => { const role = event.target.value as AgentRole; patch({ role, schema_version: 2, communication_policy: { ...communication, result_contract_id: defaultCommunicationPolicy(role, communication.allowed_child_roles).result_contract_id } }); }}>{AGENT_ROLES.map((role) => <option key={role} value={role}>{humanize(role)}</option>)}</select></Field>
         <Field label="Permission mode"><select className={INPUT} disabled={!editable} value={spec.permission_mode} onChange={(event) => patch({ permission_mode: event.target.value as AgentProfileSpec["permission_mode"] })}>{["discuss", "plan", "interactive", "custom", "auto"].map((mode) => <option key={mode} value={mode}>{humanize(mode)}</option>)}</select></Field>
         <Field label="Instructions" wide><textarea className={`${INPUT} min-h-32 resize-y font-mono text-[12px]`} disabled={!editable} value={spec.instructions} onChange={(event) => patch({ instructions: event.target.value })} /></Field>
       </EditorSection>
 
       <EditorSection title="Tool ceiling" detail="The runtime intersects this allow-list with parent and session permissions; a profile can never grant a new tool.">
         <Field label="Allowed tool IDs" wide><textarea className={`${INPUT} min-h-20 resize-y font-mono text-[12px]`} disabled={!editable} placeholder="read_file, grep, run_shell" value={spec.allowed_tools.join(", ")} onChange={(event) => patch({ allowed_tools: csv(event.target.value) })} /></Field>
-        <NumberField label="Max iterations" value={spec.max_iterations} min={1} max={200} disabled={!editable} onChange={(max_iterations) => patch({ max_iterations })} />
-        <NumberField label="Tool-call budget · 0 = unset" value={numberMeta(metadata.tool_call_budget)} min={0} max={10000} disabled={!editable} onChange={(value) => patchMetadata({ tool_call_budget: value || null })} />
       </EditorSection>
 
       <EditorSection title="Delegation ceiling" detail="Choose the child roles this agent may create. Zero children requires an empty role list.">
-        <NumberField label="Max children" value={spec.max_children} min={0} max={8} disabled={!editable} onChange={(max_children) => patch({ max_children, allowed_child_roles: max_children ? spec.allowed_child_roles : [] })} />
+        <NumberField label="Max children" value={spec.max_children} min={0} max={8} disabled={!editable} onChange={(max_children) => { const roles = max_children ? spec.allowed_child_roles : []; patch({ schema_version: 2, max_children, allowed_child_roles: roles, communication_policy: { ...communication, can_delegate: max_children > 0 && roles.length > 0, allowed_child_roles: roles } }); }} />
         <div className="md:col-span-2 grid grid-cols-2 gap-2 lg:grid-cols-3">
-          {AGENT_ROLES.map((role) => <CheckField key={role} label={humanize(role)} checked={roleAllowed(role)} disabled={!editable || spec.max_children === 0} onChange={(checked) => patch({ allowed_child_roles: checked ? [...spec.allowed_child_roles, role] : spec.allowed_child_roles.filter((item) => item !== role) })} />)}
+          {AGENT_ROLES.map((role) => <CheckField key={role} label={humanize(role)} checked={roleAllowed(role)} disabled={!editable || spec.max_children === 0} onChange={(checked) => { const roles = checked ? [...spec.allowed_child_roles, role] : spec.allowed_child_roles.filter((item) => item !== role); patch({ schema_version: 2, allowed_child_roles: roles, communication_policy: { ...communication, can_delegate: roles.length > 0, allowed_child_roles: roles } }); }} />)}
         </div>
       </EditorSection>
 
-      <EditorSection title="Routing and run limits" detail="The profile stores a policy ID. Task creation snapshots the exact published profile and routing decision inputs.">
+      <EditorSection title="Communication policy" detail="This versioned policy controls task Brief completeness, bounded context, delegation, relations, comments, mentions, and the required structured result contract.">
+        <CheckField label="Can delegate" checked={communication.can_delegate} disabled={!editable || spec.max_children === 0} onChange={(can_delegate) => patchCommunication({ can_delegate, allowed_child_roles: can_delegate ? spec.allowed_child_roles : [] })} />
+        <CheckField label="Allow full transcript reference" checked={communication.allow_full_transcript_reference} disabled={!editable} onChange={(allow_full_transcript_reference) => patchCommunication({ allow_full_transcript_reference })} />
+        <Field label="Required Brief fields" wide><textarea className={`${INPUT} min-h-16 resize-y font-mono text-[12px]`} disabled={!editable} value={communication.required_brief_fields.join(", ")} onChange={(event) => patchCommunication({ required_brief_fields: csv(event.target.value) })} /></Field>
+        <NumberField label="Initial context token budget" value={communication.max_initial_context_tokens} min={0} max={1_000_000} disabled={!editable} onChange={(max_initial_context_tokens) => patchCommunication({ max_initial_context_tokens })} />
+        <NumberField label="Max context refs" value={communication.max_context_refs} min={0} max={10_000} disabled={!editable} onChange={(max_context_refs) => patchCommunication({ max_context_refs })} />
+        <NumberField label="Inline bytes per ref" value={communication.max_inline_bytes_per_ref} min={0} max={1_000_000} disabled={!editable} onChange={(max_inline_bytes_per_ref) => patchCommunication({ max_inline_bytes_per_ref })} />
+        <NumberField label="Inline bytes total" value={communication.max_inline_bytes_total} min={0} max={10_000_000} disabled={!editable} onChange={(max_inline_bytes_total) => patchCommunication({ max_inline_bytes_total })} />
+        <Field label="Allowed context ref types" wide><textarea className={`${INPUT} min-h-20 resize-y font-mono text-[12px]`} disabled={!editable} value={communication.allowed_context_ref_types.join(", ")} onChange={(event) => patchCommunication({ allowed_context_ref_types: csv(event.target.value) })} /></Field>
+        <Field label="Allowed relation types" wide><textarea className={`${INPUT} min-h-16 resize-y font-mono text-[12px]`} disabled={!editable} value={communication.allowed_relation_types.join(", ")} onChange={(event) => patchCommunication({ allowed_relation_types: csv(event.target.value) })} /></Field>
+        <CheckField label="Can comment" checked={communication.can_comment} disabled={!editable} onChange={(can_comment) => patchCommunication({ can_comment })} />
+        <CheckField label="Can mention" checked={communication.can_mention} disabled={!editable} onChange={(can_mention) => patchCommunication({ can_mention })} />
+        <CheckField label="Can receive mentions" checked={communication.can_mention_receive} disabled={!editable} onChange={(can_mention_receive) => patchCommunication({ can_mention_receive })} />
+        <Field label="Result contract"><input className={`${INPUT} font-mono`} disabled={!editable} value={communication.result_contract_id} onChange={(event) => patchCommunication({ result_contract_id: event.target.value })} /></Field>
+      </EditorSection>
+
+      <EditorSection title="Routing and evidence" detail="The profile stores a policy ID. Task creation snapshots the exact published profile and routing decision inputs; runtime usage is recorded without a fixed run cap.">
         <Field label="Model policy"><select className={INPUT} disabled={!editable} value={spec.model_policy} onChange={(event) => patch({ model_policy: event.target.value })}>{policies.map((policy) => <option key={policy.id} value={policy.id}>{policy.name || policy.id}{policy.current_version ? ` · v${policy.current_version}` : ""}</option>)}{!policies.some((policy) => policy.id === spec.model_policy) && <option value={spec.model_policy}>{spec.model_policy}</option>}</select></Field>
-        <NumberField label="Timeout (seconds) · 0 = unset" value={numberMeta(metadata.timeout_seconds)} min={0} max={86400} disabled={!editable} onChange={(value) => patchMetadata({ timeout_seconds: value || null })} />
-        <NumberField label="Token budget · 0 = unset" value={numberMeta(metadata.token_budget)} min={0} max={10000000} disabled={!editable} onChange={(value) => patchMetadata({ token_budget: value || null })} />
         <CheckField label="Require evidence" checked={boolMeta(metadata.evidence_required, true)} disabled={!editable} onChange={(value) => patchMetadata({ evidence_required: value })} />
         <CheckField label="Require tests" checked={boolMeta(metadata.tests_required)} disabled={!editable} onChange={(value) => patchMetadata({ tests_required: value })} />
         <CheckField label="Require review" checked={boolMeta(metadata.review_required, true)} disabled={!editable} onChange={(value) => patchMetadata({ review_required: value })} />
@@ -406,10 +461,8 @@ function CheckField({ label, checked, disabled, onChange }: { label: string; che
 }
 
 const csv = (value: string) => value.split(",").map((item) => item.trim()).filter(Boolean);
-const numberMeta = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : 0;
 const boolMeta = (value: unknown, fallback = false) => typeof value === "boolean" ? value : fallback;
 
 export function ValidationSummary({ report }: { report: ValidationReport }) {
   return <div className={`mt-4 rounded-xl border p-3.5 ${report.valid ? "border-okLine bg-okSoft" : "border-danger/20 bg-dangerSoft"}`} data-testid="validation-summary"><div className={`text-[12.5px] font-medium ${report.valid ? "text-ok" : "text-danger"}`}>{report.valid ? "Validation passed" : `${report.errors.length} validation error${report.errors.length === 1 ? "" : "s"}`}</div>{[...report.errors, ...report.warnings].map((issue) => <div key={`${issue.code}:${issue.path}`} className="mt-1.5 text-[11.5px] text-muted"><span className="font-mono text-[10px] text-faint">{issue.path}</span> · {issue.message}</div>)}</div>;
 }
-

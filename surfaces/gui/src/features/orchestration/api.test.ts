@@ -31,6 +31,7 @@ describe("orchestration API contracts", () => {
     await api.resumeTask("task-control");
     await api.cancelTask("task-control");
     await api.archiveTask("task-control");
+    await api.restoreTask("task-control");
 
     expect(calls.map((call) => [call.path, call.init?.method])).toEqual([
       ["/v1/orchestration/tasks/task-control/submit", "POST"],
@@ -38,7 +39,40 @@ describe("orchestration API contracts", () => {
       ["/v1/orchestration/tasks/task-control/resume", "POST"],
       ["/v1/orchestration/tasks/task-control/cancel", "POST"],
       ["/v1/orchestration/tasks/task-control/archive", "POST"],
+      ["/v1/orchestration/tasks/task-control/restore", "POST"],
     ]);
+  });
+
+  it("creates and lists result-grounded follow-up questions", async () => {
+    const calls: RequestCall[] = [];
+    const request: ApiRequest = async <T,>(path: string, init?: RequestInit) => {
+      calls.push({ path, init });
+      const question = {
+        id: "question-task-1",
+        task_id: "question-task-1",
+        source_task_id: "task-1",
+        question: "Which file supports the conclusion?",
+        status: "queued",
+        stage: "intake",
+        progress: 0,
+        source_work_product_ids: ["wp-1"],
+        created_at: "2026-08-18T00:00:00Z",
+        updated_at: "2026-08-18T00:00:00Z",
+      };
+      return (init?.method === "POST" ? question : [question]) as T;
+    };
+    const api = createOrchestrationApi(request);
+
+    const created = await api.askResultQuestion("task-1", "Which file supports the conclusion?");
+    const listed = await api.listResultQuestions("task-1");
+
+    expect(created.source_work_product_ids).toEqual(["wp-1"]);
+    expect(listed).toHaveLength(1);
+    expect(calls.map((call) => [call.path, call.init?.method || "GET"])).toEqual([
+      ["/v1/orchestration/tasks/task-1/result-questions", "POST"],
+      ["/v1/orchestration/tasks/task-1/result-questions", "GET"],
+    ]);
+    expect(calls[0].init?.headers).toMatchObject({ "Idempotency-Key": expect.any(String) });
   });
 
   it("preserves normalized gate actions and canonicalizes key-based DAG dependencies", async () => {
@@ -686,5 +720,50 @@ describe("orchestration API contracts", () => {
         }),
       ],
     })]);
+  });
+
+  it("normalizes incremental per-run Agent activity", async () => {
+    const request: ApiRequest = async <T,>(path: string) => {
+      expect(path).toBe(
+        "/v1/orchestration/tasks/task%2Fone/runs/run%2Fone/activity?limit=25&latest=false&after_sequence=7",
+      );
+      return {
+        task_id: "task/one",
+        run_id: "run/one",
+        activity: [{
+          sequence: "8",
+          id: "activity-8",
+          event_key: "tool:completed",
+          source_id: "tool-1",
+          kind: "tool",
+          status: "completed",
+          title: "Command",
+          summary: "pytest",
+          detail: { exit_code: 0 },
+          created_at: "2026-08-17T06:00:00Z",
+        }],
+        has_more: false,
+        next_sequence: null,
+        order: "oldest_to_newest",
+        privacy: { reasoning: "provider_summary_only", tool_output: "metadata_only" },
+      } as T;
+    };
+
+    const page = await createOrchestrationApi(request).getRunActivity(
+      "task/one",
+      "run/one",
+      { afterSequence: 7, latest: false, limit: 25 },
+    );
+
+    expect(page.activity).toEqual([expect.objectContaining({
+      sequence: 8,
+      kind: "tool",
+      status: "completed",
+      detail: { exit_code: 0 },
+    })]);
+    expect(page.privacy).toEqual({
+      reasoning: "provider_summary_only",
+      tool_output: "metadata_only",
+    });
   });
 });

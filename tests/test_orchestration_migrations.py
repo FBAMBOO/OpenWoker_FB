@@ -13,6 +13,7 @@ from coworker.orchestration.migrations import (
     apply_migrations,
     load_migrations,
 )
+from coworker.orchestration.store import OrchestrationStore
 
 
 def _migration(version: int, name: str, sql: str) -> Migration:
@@ -69,6 +70,19 @@ def test_database_at_0001_upgrades_to_current_bundle(tmp_path) -> None:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'orch_gates'"
         ).fetchone()[0]
         assert "'preparing'" in gate_schema
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("orch_run_activity",),
+        ).fetchone() == ("orch_run_activity",)
+        assert {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'trigger' AND tbl_name = 'orch_run_activity'
+                """
+            ).fetchall()
+        } == {"orch_run_activity_no_update", "orch_run_activity_no_delete"}
     finally:
         connection.close()
 
@@ -110,7 +124,7 @@ def test_0006_preserves_historical_gates_and_marks_them_published(tmp_path) -> N
             )
         connection.commit()
 
-        assert apply_migrations(connection, bundle) == (6,)
+        assert apply_migrations(connection, bundle) == (6, 7, 8, 9, 10)
         rows = connection.execute(
             """
             SELECT id, status, opened_at, published_at
@@ -133,6 +147,84 @@ def test_0006_preserves_historical_gates_and_marks_them_published(tmp_path) -> N
         ).fetchone() == ("orch_gates_task_publication",)
     finally:
         connection.close()
+
+
+def test_0006_store_upgrade_backfills_briefs_and_parent_relations_idempotently(
+    tmp_path,
+) -> None:
+    database = tmp_path / "from-0006-with-task-tree.db"
+    bundle = load_migrations()
+    connection = sqlite3.connect(database)
+    try:
+        assert apply_migrations(connection, bundle[:6]) == (1, 2, 3, 4, 5, 6)
+        now = "2026-08-17T00:00:00.000000Z"
+        connection.execute(
+            """
+            INSERT INTO orch_tasks(
+                id, idempotency_key, creation_hash, title, objective, domain,
+                risk_tier, status, current_stage, created_at, updated_at
+            ) VALUES ('legacy-parent', 'legacy-parent-key', 'parent-hash',
+                      'Legacy parent', 'Coordinate legacy work', 'knowledge',
+                      'low', 'draft', 'intake', ?, ?)
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO orch_tasks(
+                id, idempotency_key, creation_hash, title, objective, domain,
+                risk_tier, status, current_stage, parent_task_id,
+                created_at, updated_at
+            ) VALUES ('legacy-child', 'legacy-child-key', 'child-hash',
+                      'Legacy child', 'Perform legacy work', 'knowledge',
+                      'low', 'draft', 'intake', 'legacy-parent', ?, ?)
+            """,
+            (now, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = OrchestrationStore(database)
+    try:
+        assert first.backfill_legacy_briefs() == 0
+        diagnostic = first.connect()
+        try:
+            assert diagnostic.execute(
+                "SELECT COUNT(*) FROM orch_task_briefs"
+            ).fetchone()[0] == 2
+            assert diagnostic.execute(
+                "SELECT COUNT(*) FROM orch_task_relations WHERE relation_type='parent'"
+            ).fetchone()[0] == 1
+            assert diagnostic.execute(
+                "SELECT COUNT(*) FROM orch_events WHERE event_type='relation_added'"
+            ).fetchone()[0] == 1
+            assert diagnostic.execute("PRAGMA foreign_key_check").fetchall() == []
+        finally:
+            diagnostic.close()
+    finally:
+        first.close()
+
+    reopened = OrchestrationStore(database)
+    try:
+        diagnostic = reopened.connect()
+        try:
+            assert diagnostic.execute(
+                "SELECT COUNT(*) FROM orch_task_briefs"
+            ).fetchone()[0] == 2
+            assert diagnostic.execute(
+                "SELECT COUNT(*) FROM orch_task_relations WHERE relation_type='parent'"
+            ).fetchone()[0] == 1
+            assert tuple(
+                row[0]
+                for row in diagnostic.execute(
+                    "SELECT version FROM orch_schema_migrations ORDER BY version"
+                )
+            ) == tuple(range(1, 11))
+        finally:
+            diagnostic.close()
+    finally:
+        reopened.close()
 
 
 def test_bundle_with_migration_hole_is_rejected_before_schema_changes(tmp_path) -> None:

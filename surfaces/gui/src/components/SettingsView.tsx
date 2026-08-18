@@ -44,7 +44,7 @@ import { PersonasTab } from "./PersonasTab";
 import { SkillsTab } from "./SkillsTab";
 import { showPersonas } from "../flags";
 import { apiRequest } from "../api";
-import { AgentProfilesSettings, ModelRoutingSettings } from "../features/orchestration";
+import { AgentProfilesSettings, ModelRoutingSettings, RuntimeCommunicationSettings } from "../features/orchestration";
 
 // Settings, restructured (Option 2) into a full-page surface that mirrors IntegrationsView's shell:
 // a left sub-nav (Appearance · Files · Models · Personas) + centered panel, replacing the old
@@ -53,7 +53,7 @@ import { AgentProfilesSettings, ModelRoutingSettings } from "../features/orchest
 // Models + Personas host the existing tab components inside the page shell (field re-skin to follow).
 // "appearance" is the General tab's stable key — callers deep-link with it, so the
 // rename (UX-021) changed only the label. "files" folded into General as a card.
-type SetTab = "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing";
+type SetTab = "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing" | "runtime_communication";
 
 const CARD = "rounded-xl2 border border-line bg-panel";
 const FIELD_LABEL = "text-[12.5px] font-medium text-ink";
@@ -72,6 +72,7 @@ const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" |
   { key: "personas", label: "Personas", icon: "sparkle" },
   { key: "agent_profiles", label: "Agent profiles", icon: "sparkle" },
   { key: "model_routing", label: "Model routing", icon: "code" },
+  { key: "runtime_communication", label: "Agent communication", icon: "sliders" },
 ];
 
 export function SettingsView({
@@ -146,6 +147,8 @@ export function SettingsView({
             <AgentProfilesSettings apiRequest={apiRequest} initialProfileId={initialAgentProfileId} />
           ) : tab === "model_routing" ? (
             <ModelRoutingSettings apiRequest={apiRequest} initialPolicyId={initialModelPolicyId} />
+          ) : tab === "runtime_communication" ? (
+            <RuntimeCommunicationSettings apiRequest={apiRequest} />
           ) : (
             <PersonasSection onOpenPersona={onOpenPersona} />
           )}

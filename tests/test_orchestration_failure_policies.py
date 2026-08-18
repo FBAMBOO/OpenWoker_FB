@@ -6,6 +6,7 @@ from pathlib import Path
 from coworker.orchestration.models import (
     GateKind,
     GateStatus,
+    OrchestrationStage,
     RunStatus,
     TaskStatus,
 )
@@ -78,6 +79,23 @@ def _fail_next(service: OrchestrationService, expected_key: str) -> None:
         claim.lease.fencing_token,
         error_kind="test_failure",
         error_message=f"{expected_key} failed by design",
+    )
+
+
+def _complete_next(service: OrchestrationService, expected_key: str) -> None:
+    claim = service.store.claim_next_run(f"worker-{expected_key}-complete")
+    assert claim is not None
+    assert claim.run.node_key == expected_key
+    service.store.start_run(
+        claim.run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+    )
+    service.store.complete_run(
+        claim.run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        output={"summary": f"{expected_key} completed"},
     )
 
 
@@ -239,6 +257,196 @@ def test_fail_fast_retries_then_suppresses_all_not_started_work(tmp_path: Path) 
             "queued_branch",
             "failure_handler",
         }
+        assert service.store.verify_event_chain() is True
+    finally:
+        service.store.close()
+
+
+def test_explicit_retry_reopens_unstarted_fail_fast_descendants(tmp_path: Path) -> None:
+    service = OrchestrationService(FakeManager(), tmp_path / "data", executor=object())
+    try:
+        task_id = _create_running_plan(
+            service,
+            {
+                "nodes": [
+                    {
+                        "key": "fails",
+                        "failure_policy": "fail_fast",
+                        "priority": 100,
+                        "retry_policy": {
+                            "max_attempts": 2,
+                            "initial_delay_seconds": 0,
+                            "jitter": 0,
+                        },
+                    },
+                    {"key": "downstream", "retry_policy": {"max_attempts": 1}},
+                    {"key": "final", "retry_policy": {"max_attempts": 1}},
+                ],
+                "edges": [
+                    {"from": "fails", "to": "downstream", "condition": "success"},
+                    {"from": "downstream", "to": "final", "condition": "success"},
+                ],
+            },
+            key="explicit-retry-reopens-policy-skips",
+        )
+        claim = service.store.claim_next_run("worker-cleanup-unknown")
+        assert claim is not None and claim.run.node_key == "fails"
+        service.store.start_run(
+            claim.run.id, claim.lease.token, claim.lease.fencing_token
+        )
+        service.store.fail_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+            error_kind="process_tree_cleanup_failed",
+            error_message="cleanup state is unknown",
+        )
+
+        service._advance_task(task_id)
+        skipped = _latest(service, task_id)
+        downstream_id = skipped["downstream"].id
+        final_id = skipped["final"].id
+        assert skipped["downstream"].status is RunStatus.SKIPPED
+        assert skipped["final"].status is RunStatus.SKIPPED
+        service._advance_task(task_id)
+        gate = next(
+            item
+            for item in service.store.list_gates(task_id, statuses=(GateStatus.OPEN,))
+            if item.kind is GateKind.RECONCILIATION
+        )
+        service.resolve_gate(
+            task_id,
+            gate.id,
+            decision="retry",
+            expected_version=gate.version,
+            idempotency_key="retry-cleanup-unknown-source",
+        )
+        service._advance_task(task_id)
+        _complete_next(service, "fails")
+
+        service._advance_task(task_id)
+        after_source = _latest(service, task_id)
+        assert after_source["downstream"].id == downstream_id
+        assert after_source["downstream"].attempt == 1
+        assert after_source["downstream"].status is RunStatus.QUEUED
+        assert after_source["final"].id == final_id
+        assert after_source["final"].status is RunStatus.SKIPPED
+
+        _complete_next(service, "downstream")
+        service._advance_task(task_id)
+        after_downstream = _latest(service, task_id)
+        assert after_downstream["final"].id == final_id
+        assert after_downstream["final"].attempt == 1
+        assert after_downstream["final"].status is RunStatus.QUEUED
+        reopened = [
+            event
+            for event in service.store.list_events(task_id=task_id)
+            if event.event_type == "run.reopened"
+        ]
+        assert [event.payload["node_key"] for event in reopened] == [
+            "downstream",
+            "final",
+        ]
+        assert service.store.verify_event_chain() is True
+    finally:
+        service.store.close()
+
+
+def test_startup_repairs_stale_reconciliation_gate_after_successful_retry(
+    tmp_path: Path,
+) -> None:
+    service = OrchestrationService(FakeManager(), tmp_path / "data", executor=object())
+    try:
+        task_id = _create_running_plan(
+            service,
+            {
+                "nodes": [
+                    {
+                        "key": "fails",
+                        "failure_policy": "fail_fast",
+                        "priority": 100,
+                        "retry_policy": {
+                            "max_attempts": 2,
+                            "initial_delay_seconds": 0,
+                            "jitter": 0,
+                        },
+                    },
+                    {"key": "downstream", "retry_policy": {"max_attempts": 1}},
+                ],
+                "edges": [
+                    {"from": "fails", "to": "downstream", "condition": "success"}
+                ],
+            },
+            key="repair-stale-policy-skip-gate",
+        )
+        claim = service.store.claim_next_run("worker-stale-gate-source")
+        assert claim is not None and claim.run.node_key == "fails"
+        service.store.start_run(
+            claim.run.id, claim.lease.token, claim.lease.fencing_token
+        )
+        service.store.fail_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+            error_kind="process_tree_cleanup_failed",
+            error_message="cleanup state is unknown",
+        )
+        service._advance_task(task_id)
+        service._advance_task(task_id)
+        retry_gate = next(
+            item
+            for item in service.store.list_gates(task_id, statuses=(GateStatus.OPEN,))
+            if item.kind is GateKind.RECONCILIATION
+        )
+        service.resolve_gate(
+            task_id,
+            retry_gate.id,
+            decision="retry",
+            expected_version=retry_gate.version,
+            idempotency_key="retry-before-stale-gate-repair",
+        )
+        service._advance_task(task_id)
+        _complete_next(service, "fails")
+
+        task = service.store.get_task(task_id)
+        service._transition_stage(
+            task,
+            OrchestrationStage.INTER_STEP_EVALUATION,
+            "simulate-legacy-premature-evaluation",
+        )
+        task = service.store.get_task(task_id)
+        skipped = _latest(service, task_id)["downstream"]
+        stale_gate = service._open_lifecycle_gate(
+            task,
+            GateKind.RECONCILIATION,
+            f"{task.id}:reconciliation:{task.active_plan_id}:legacy-stale-skip",
+            {
+                "title": "Execution needs reconciliation",
+                "failed_runs": [],
+                "workspace_commit_failures": [],
+                "failed_children": [],
+                "verification": [
+                    {
+                        "node_key": "downstream",
+                        "run_id": skipped.id,
+                        "status": "unknown",
+                    }
+                ],
+                "actions": ["request_changes", "cancel"],
+            },
+        )
+        assert service.store.get_task(task_id).status is TaskStatus.WAITING_HUMAN
+
+        assert service._repair_superseded_policy_skip_gates() == 1
+        repaired_task = service.store.get_task(task_id)
+        repaired_gate = service.store.get_gate(stale_gate.id)
+        assert repaired_task.status is TaskStatus.RUNNING
+        assert repaired_task.current_stage.value == "execution_review_test"
+        assert repaired_gate.status is GateStatus.APPROVED
+        assert repaired_gate.resolution["decision"] == "resume_policy_skips"
+
+        service._advance_task(task_id)
+        assert _latest(service, task_id)["downstream"].status is RunStatus.QUEUED
         assert service.store.verify_event_chain() is True
     finally:
         service.store.close()

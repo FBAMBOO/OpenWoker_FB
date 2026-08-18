@@ -24,6 +24,7 @@ from coworker.orchestration.routing import (
     ModelRouter,
     RoutingRequest,
 )
+from coworker.orchestration.runtime import RuntimeBudget
 from coworker.orchestration.store import OrchestrationStore
 from coworker.orchestration.subscription_runtime import (
     CLAUDE_OPUS_5_HIGH,
@@ -269,6 +270,25 @@ class _CodexStdin:
                     "result": {"userAgent": "codex-cli/0.146.0"},
                 }
             )
+        elif method == "command/exec":
+            self.stdout.push(
+                {
+                    "id": request_id,
+                    "result": {"exitCode": 0, "stdout": "", "stderr": ""},
+                }
+            )
+        elif method == "windowsSandbox/setupStart":
+            self.stdout.push({"id": request_id, "result": {"started": True}})
+            self.stdout.push(
+                {
+                    "method": "windowsSandbox/setupCompleted",
+                    "params": {
+                        "mode": "unelevated",
+                        "success": True,
+                        "error": None,
+                    },
+                }
+            )
         elif method == "thread/start":
             self.stdout.push(
                 {
@@ -287,6 +307,62 @@ class _CodexStdin:
                     "id": request_id,
                     "result": {
                         "turn": {"id": "codex-turn-1", "status": "inProgress"}
+                    },
+                }
+            )
+            self.stdout.push(
+                {
+                    "method": "item/reasoning/summaryTextDelta",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "itemId": "reasoning-1",
+                        "delta": "Checking the implementation plan; api_key=reasoning-secret",
+                    },
+                }
+            )
+            self.stdout.push(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "item": {"id": "reasoning-1", "type": "reasoning"},
+                    },
+                }
+            )
+            self.stdout.push(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "python -m pytest",
+                            "cwd": "C:/workspace",
+                            "status": "inProgress",
+                        },
+                    },
+                }
+            )
+            self.stdout.push(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "python -m pytest",
+                            "cwd": "C:/workspace",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "durationMs": 125,
+                            "aggregatedOutput": "RAW TOOL OUTPUT MUST NOT ENTER ACTIVITY",
+                        },
                     },
                 }
             )
@@ -337,6 +413,117 @@ class _FakeCodexProcess:
 
     def poll(self) -> int | None:
         return self.return_code
+
+
+class _DynamicToolCodexStdin(_CodexStdin):
+    def _respond(self, message: Mapping[str, Any]) -> None:
+        if message.get("method") == "turn/start":
+            self.stdout.push(
+                {
+                    "id": "dynamic-tool-request-1",
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "callId": "dynamic-call-1",
+                        "tool": "list_files",
+                        "arguments": {"path": ".", "max_depth": 1},
+                    },
+                }
+            )
+        super()._respond(message)
+
+
+class _FakeDynamicToolCodexProcess(_FakeCodexProcess):
+    def __init__(self) -> None:
+        self.stdout = _QueueStdout()
+        self.stdin = _DynamicToolCodexStdin(self.stdout)
+        self.stderr = io.StringIO("")
+        self.return_code: int | None = None
+
+
+class _RepairingWindowsSandboxCodexStdin(_CodexStdin):
+    def __init__(self, stdout: _QueueStdout) -> None:
+        super().__init__(stdout)
+        self.preflight_count = 0
+
+    def _respond(self, message: Mapping[str, Any]) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "command/exec":
+            self.preflight_count += 1
+            if self.preflight_count < 3:
+                self.stdout.push(
+                    {
+                        "id": request_id,
+                        "error": {
+                            "code": -32000,
+                            "message": (
+                                "windows sandbox failed: helper_unknown_error: "
+                                "apply deny-read ACLs"
+                            ),
+                        },
+                    }
+                )
+            else:
+                self.stdout.push(
+                    {
+                        "id": request_id,
+                        "result": {"exitCode": 0, "stdout": "", "stderr": ""},
+                    }
+                )
+            return
+        super()._respond(message)
+
+
+class _FakeRepairingWindowsSandboxCodexProcess(_FakeCodexProcess):
+    def __init__(self) -> None:
+        self.stdout = _QueueStdout()
+        self.stdin = _RepairingWindowsSandboxCodexStdin(self.stdout)
+        self.stderr = io.StringIO("")
+        self.return_code: int | None = None
+
+
+class _FailingWindowsSandboxCodexStdin(_CodexStdin):
+    def _respond(self, message: Mapping[str, Any]) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "command/exec":
+            self.stdout.push(
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": (
+                            "windows sandbox failed: helper_unknown_error: "
+                            "apply deny-read ACLs"
+                        ),
+                    },
+                }
+            )
+            return
+        if method == "windowsSandbox/setupStart":
+            self.stdout.push({"id": request_id, "result": {"started": True}})
+            self.stdout.push(
+                {
+                    "method": "windowsSandbox/setupCompleted",
+                    "params": {
+                        "mode": "unelevated",
+                        "success": False,
+                        "error": "ACL setup failed",
+                    },
+                }
+            )
+            return
+        super()._respond(message)
+
+
+class _FakeFailingWindowsSandboxCodexProcess(_FakeCodexProcess):
+    def __init__(self) -> None:
+        self.stdout = _QueueStdout()
+        self.stdin = _FailingWindowsSandboxCodexStdin(self.stdout)
+        self.stderr = io.StringIO("")
+        self.return_code: int | None = None
 
 
 class _PromptStdin(io.StringIO):
@@ -781,6 +968,46 @@ def test_v2_checkpoint_requires_exact_prompt_and_schema_bindings(
         claude._load_checkpoint(mutated_context)
 
 
+def test_current_subscription_prompt_excludes_raw_upstream_but_accepts_frozen_v2_hash(
+    harness: _Harness,
+) -> None:
+    marker = "RAW-UPSTREAM-MUST-NOT-REACH-A-NEW-TURN"
+    context = replace(
+        harness.context,
+        node=replace(
+            harness.context.node,
+            input={"upstream": {"payload": marker}},
+        ),
+        upstream_context=({"durable_result": marker},),
+    )
+    prompt = runtime_module._prompt(context)
+    assert marker not in prompt
+    assert "Raw upstream output" in prompt
+    assert len(prompt.encode("utf-8")) <= 32_768
+    assert marker in runtime_module._v2_legacy_prompt(context)
+
+    claude = _runtime(ClaudeCodeSubscriptionRuntime, CLAUDE_OPUS_5_HIGH, harness)
+    checkpoint = claude._checkpoint(
+        context,
+        external_session_id="pre-tchp-v2-session",
+        state="session_reserved",
+    )
+    checkpoint["prompt_sha256"] = runtime_module.hashlib.sha256(
+        runtime_module._v2_legacy_prompt(context).encode("utf-8")
+    ).hexdigest()
+    recovered_context = replace(
+        context,
+        claim=replace(
+            context.claim,
+            run=replace(
+                context.claim.run,
+                output={"subscription_runtime_checkpoint": checkpoint},
+            ),
+        ),
+    )
+    assert claude._load_checkpoint(recovered_context) == checkpoint
+
+
 def test_subscription_environment_scrubs_api_and_model_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1059,10 +1286,38 @@ async def test_codex_jsonl_protocol_persists_thread_and_turn_checkpoint(
     assert outcome.summary == _STRUCTURED_RESULT["summary"]
     assert outcome.usage == {
         "model_calls": 1,
-        "tool_calls": 0,
+        "tool_calls": 1,
         "tokens": 30,
         "wall_seconds": 1,
     }
+    activity = harness.store.list_run_activity(
+        harness.context.task.id, harness.context.claim.run.id
+    )
+    assert {item.kind for item in activity} >= {
+        "lifecycle",
+        "reasoning_summary",
+        "tool",
+        "message",
+        "usage",
+    }
+    assert activity[-1].title == "Agent run completed"
+    assert activity[-1].status == "completed"
+    reasoning = next(item for item in activity if item.kind == "reasoning_summary")
+    assert "Checking the implementation plan" in reasoning.summary
+    assert "reasoning-secret" not in reasoning.summary
+    command_rows = [item for item in activity if item.kind == "tool"]
+    assert [item.status for item in command_rows] == ["running", "completed"]
+    assert command_rows[-1].detail == {
+        "provider_item_type": "commandExecution",
+        "command": "python -m pytest",
+        "cwd": "C:/workspace",
+        "duration_ms": 125,
+        "exit_code": 0,
+    }
+    serialized_activity = json.dumps(
+        [dict(item.detail) for item in activity], sort_keys=True
+    )
+    assert "RAW TOOL OUTPUT" not in serialized_activity
     assert launches[0][0][1:] == ["app-server", "--stdio", "--strict-config"]
     sent = process.stdin.messages
     assert sent[0]["method"] == "initialize"
@@ -1102,6 +1357,226 @@ async def test_codex_jsonl_protocol_persists_thread_and_turn_checkpoint(
     # The protocol path performs a bounded reap before publishing the outcome and
     # the finally block defensively repeats it. Both calls are idempotent.
     assert active.tree.terminate_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_codex_stops_streaming_turn_when_reported_token_budget_is_crossed(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
+    monkeypatch.setattr(
+        codex,
+        "probe",
+        lambda: _healthy(
+            CODEX_GPT_5_6_SOL_MAX, "codex-subscription", "codex-cli 0.147.0"
+        ),
+    )
+    process = _FakeCodexProcess()
+    active = _FakeActive(process)
+    monkeypatch.setattr(codex, "_spawn", lambda *_args, **_kwargs: active)
+    context = replace(
+        harness.context,
+        runtime_budget=RuntimeBudget(
+            model_calls=1,
+            tool_calls=5,
+            tokens=20,
+            wall_seconds=60,
+        ),
+    )
+
+    outcome = await codex.execute(context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "runtime_budget_exceeded"
+    assert outcome.usage["tokens"] == 30
+    assert active.tree.terminate_calls >= 1
+    activity = harness.store.list_run_activity(
+        harness.context.task.id, harness.context.claim.run.id
+    )
+    assert any(item.title == "Run token budget reached" for item in activity)
+    assert any(item.title == "Agent stopped at run budget" for item in activity)
+
+
+@pytest.mark.asyncio
+async def test_codex_read_only_dynamic_tools_bypass_broken_shell_sandbox_safely(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (harness.context.workspace / "dbt_project.yml").write_text(
+        "name: safe_reader\n", encoding="utf-8"
+    )
+    context = replace(
+        harness.context,
+        task=replace(
+            harness.context.task,
+            policy={**dict(harness.context.task.policy), "read_only": True},
+        ),
+    )
+    codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
+    monkeypatch.setattr(
+        codex,
+        "probe",
+        lambda: _healthy(
+            CODEX_GPT_5_6_SOL_MAX, "codex-subscription", "codex-cli 0.147.0"
+        ),
+    )
+    process = _FakeDynamicToolCodexProcess()
+    active = _FakeActive(process)
+    monkeypatch.setattr(codex, "_spawn", lambda *_args, **_kwargs: active)
+
+    outcome = await codex.execute(context)
+
+    assert outcome.status == "succeeded"
+    initialize = next(
+        item for item in process.stdin.messages if item.get("method") == "initialize"
+    )
+    assert initialize["params"]["capabilities"]["experimentalApi"] is True
+    thread_start = next(
+        item for item in process.stdin.messages if item.get("method") == "thread/start"
+    )
+    assert {item["name"] for item in thread_start["params"]["dynamicTools"]} == {
+        "list_files",
+        "read_file",
+        "grep",
+        "get_task_context",
+        "list_context_refs",
+        "read_context_ref",
+    }
+    response = next(
+        item
+        for item in process.stdin.messages
+        if item.get("id") == "dynamic-tool-request-1" and "result" in item
+    )
+    assert response["result"]["success"] is True
+    payload = json.loads(response["result"]["contentItems"][0]["text"])
+    assert any(item["path"] == "dbt_project.yml" for item in payload["entries"])
+
+    escaped, escaped_output = runtime_module._execute_readonly_dynamic_tool(
+        context.workspace, "read_file", {"path": "../outside.txt"}
+    )
+    assert escaped is False
+    assert "escapes the workspace" in escaped_output
+
+
+def test_subscription_handoff_dynamic_context_exposes_work_product_not_transcript(
+    harness: _Harness,
+) -> None:
+    claim = harness.context.claim
+    product = harness.store.create_work_product(
+        harness.context.task.id,
+        kind="artifact",
+        title="Candidate report",
+        summary="The immutable candidate body is available for review.",
+        run_id=claim.run.id,
+        metadata={"deliverable_id": "deliverable-1"},
+        created_by="worker",
+        lease_token=claim.lease.token,
+        fencing_token=claim.lease.fencing_token,
+        command_id="subscription-handoff-context-product",
+    )
+
+    success, output = runtime_module._execute_handoff_read_dynamic_tool(
+        harness.store,
+        harness.blob_store,
+        harness.context,
+        "get_task_context",
+        {},
+    )
+
+    assert success is True
+    payload = json.loads(output)
+    assert [item["id"] for item in payload["work_products"]] == [product.id]
+    assert payload["work_products"][0]["summary"] == product.summary
+    assert "transcript" not in payload
+
+
+@pytest.mark.asyncio
+async def test_codex_repairs_windows_read_only_sandbox_before_model_turn(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = replace(
+        harness.context,
+        task=replace(
+            harness.context.task,
+            policy={**dict(harness.context.task.policy), "read_only": True},
+        ),
+    )
+    codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
+    monkeypatch.setattr(runtime_module, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        codex,
+        "probe",
+        lambda: _healthy(
+            CODEX_GPT_5_6_SOL_MAX, "codex-subscription", "codex-cli 0.147.0"
+        ),
+    )
+    process = _FakeRepairingWindowsSandboxCodexProcess()
+    active = _FakeActive(process)
+    monkeypatch.setattr(codex, "_spawn", lambda *_args, **_kwargs: active)
+
+    outcome = await codex.execute(context)
+
+    assert outcome.status == "succeeded"
+    methods = [
+        item.get("method")
+        for item in process.stdin.messages
+        if item.get("method") is not None
+    ]
+    assert methods.count("command/exec") == 3
+    assert methods.count("windowsSandbox/setupStart") == 1
+    assert methods.index("windowsSandbox/setupStart") < methods.index("thread/start")
+    assert methods.index("thread/start") < methods.index("turn/start")
+    activity = harness.store.list_run_activity(
+        harness.context.task.id, harness.context.claim.run.id
+    )
+    assert any(item.title == "Checking Windows read-only sandbox" for item in activity)
+    assert any(item.title == "Repairing Windows read-only sandbox" for item in activity)
+    assert any(item.title == "Windows read-only sandbox ready" for item in activity)
+
+
+@pytest.mark.asyncio
+async def test_codex_windows_sandbox_setup_failure_stops_before_model_tokens(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = replace(
+        harness.context,
+        task=replace(
+            harness.context.task,
+            policy={**dict(harness.context.task.policy), "read_only": True},
+        ),
+    )
+    codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
+    monkeypatch.setattr(runtime_module, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        codex,
+        "probe",
+        lambda: _healthy(
+            CODEX_GPT_5_6_SOL_MAX, "codex-subscription", "codex-cli 0.147.0"
+        ),
+    )
+    process = _FakeFailingWindowsSandboxCodexProcess()
+    active = _FakeActive(process)
+    monkeypatch.setattr(codex, "_spawn", lambda *_args, **_kwargs: active)
+
+    outcome = await codex.execute(context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "windows_sandbox_unavailable"
+    assert outcome.usage == {
+        "model_calls": 0,
+        "tool_calls": 0,
+        "tokens": 0,
+        "wall_seconds": 1,
+    }
+    assert not any(
+        item.get("method") in {"thread/start", "turn/start"}
+        for item in process.stdin.messages
+    )
+    activity = harness.store.list_run_activity(
+        harness.context.task.id, harness.context.claim.run.id
+    )
+    assert any(
+        item.title == "Windows read-only sandbox unavailable" for item in activity
+    )
 
 
 @pytest.mark.asyncio
@@ -1170,6 +1645,12 @@ async def test_claude_stream_jsonl_is_parsed_without_invoking_a_real_cli(
 
     assert outcome.status == "succeeded"
     assert outcome.output["structured_result"] == _STRUCTURED_RESULT
+    products = harness.store.list_work_products(harness.context.task.id)
+    assert len(products) == 1
+    assert products[0].run_id == harness.context.claim.run.id
+    assert products[0].kind.value == "artifact"
+    assert products[0].metadata["source"] == "subscription_structured_result"
+    assert outcome.output["work_product_refs"] == [products[0].id]
     assert outcome.usage["tokens"] == 50
     assert outcome.usage["tool_calls"] == 1
     assert process.stdin.getvalue().startswith(
@@ -1209,6 +1690,7 @@ async def test_claude_stream_jsonl_is_parsed_without_invoking_a_real_cli(
 
     assert recovered.status == "succeeded"
     assert recovered.output["structured_result"] == _STRUCTURED_RESULT
+    assert len(harness.store.list_work_products(harness.context.task.id)) == 1
 
 
 @pytest.mark.asyncio
@@ -1271,3 +1753,45 @@ async def test_dispatcher_interrupt_targets_the_inflight_subscription_runtime(
     assert outcome.error_kind == "interrupted_for_test"
     assert subscription.interrupts == [harness.context.claim.run.id]
     assert native.interrupts == []
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_rejects_zero_budget_before_starting_any_runtime(
+    harness: _Harness,
+) -> None:
+    class MustNotStartRuntime:
+        def __init__(self) -> None:
+            self.spec = _spec(CLAUDE_OPUS_5_HIGH)
+            self.calls = 0
+
+        async def execute(self, _context: RunExecutionContext) -> ExecutionOutcome:
+            self.calls += 1
+            raise AssertionError("zero-budget run must not reach a runtime")
+
+        def interrupt(self, _run_id: str) -> None:
+            return None
+
+    runtime = MustNotStartRuntime()
+    registry = SubscriptionRuntimeRegistry(
+        harness.manager,
+        harness.store,
+        harness.blob_store,
+        harness.state_dir,
+        runtimes=(runtime,),
+    )
+    dispatcher = SubscriptionDispatchExecutor(runtime, registry)
+    context = replace(
+        harness.context,
+        runtime_budget=RuntimeBudget(
+            model_calls=0,
+            tool_calls=0,
+            tokens=0,
+            wall_seconds=0,
+        ),
+    )
+
+    outcome = await dispatcher.execute(context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "runtime_limit"
+    assert runtime.calls == 0

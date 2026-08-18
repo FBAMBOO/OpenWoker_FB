@@ -8,7 +8,8 @@ import subprocess
 import sys
 import time
 
-from coworker.secrets import SecretStore
+import coworker.secrets as secrets_module
+from coworker.secrets import SecretStore, write_private_text
 
 
 def test_put_get_round_trip(tmp_path):
@@ -77,6 +78,39 @@ def test_secrets_file_is_restricted(tmp_path):
         assert "BUILTIN\\Administrators" not in out
     else:
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_private_write_does_not_reapply_acl_to_existing_parent(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        secrets_module,
+        "_restrict_to_user",
+        lambda path, *, is_dir: calls.append((path, is_dir)),
+    )
+
+    target = tmp_path / "sidecar.token"
+    write_private_text(target, "token")
+
+    assert calls == [(target.with_name("sidecar.token.tmp"), False)]
+
+
+def test_private_write_secures_parent_only_when_it_creates_it(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        secrets_module,
+        "_restrict_to_user",
+        lambda path, *, is_dir: calls.append((path, is_dir)),
+    )
+
+    target = tmp_path / "new-state" / "sidecar.token"
+    write_private_text(target, "token")
+
+    assert calls == [
+        (target.parent, True),
+        (target.with_name("sidecar.token.tmp"), False),
+    ]
 
 
 def test_delete(tmp_path):
