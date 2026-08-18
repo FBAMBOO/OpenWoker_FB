@@ -137,6 +137,12 @@ _GLOBAL_HEALTH_LOCK = threading.RLock()
 _GLOBAL_HEALTH_CACHE: dict[str, tuple[float, "SubscriptionRuntimeHealth"]] = {}
 
 
+def _is_windows_host() -> bool:
+    """Return the actual host family behind Windows-only runtime behavior."""
+
+    return sys.platform == "win32"
+
+
 @dataclass(frozen=True, slots=True)
 class SubscriptionRuntimeSpec:
     runtime_id: str
@@ -1560,14 +1566,14 @@ class _BaseSubscriptionRuntime:
             "bufsize": 1,
             "shell": False,
         }
-        if sys.platform == "win32":
+        if _is_windows_host():
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
         proc = subprocess.Popen(list(argv), **kwargs)
         tree = _ProcessTree(
             proc,
-            windows_job=_create_windows_kill_job(proc) if sys.platform == "win32" else None,
+            windows_job=_create_windows_kill_job(proc) if _is_windows_host() else None,
         )
         return _ActiveProcess("", proc, tree)
 
@@ -2825,7 +2831,7 @@ class CodexSubscriptionRuntime(_BaseSubscriptionRuntime):
             """Repair Codex's Windows ACL helper before any model tokens are used."""
 
             nonlocal windows_sandbox_setup_result
-            if sys.platform != "win32" or thread_mode != "read-only":
+            if not _is_windows_host() or thread_mode != "read-only":
                 return
             source = f"codex:attempt-{context.claim.run.attempt}:windows-sandbox"
             self._activity(

@@ -1501,7 +1501,7 @@ async def test_codex_repairs_windows_read_only_sandbox_before_model_turn(
         ),
     )
     codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
-    monkeypatch.setattr(runtime_module.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_module, "_is_windows_host", lambda: True)
     monkeypatch.setattr(
         codex,
         "probe",
@@ -1545,7 +1545,7 @@ async def test_codex_windows_sandbox_setup_failure_stops_before_model_tokens(
         ),
     )
     codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
-    monkeypatch.setattr(runtime_module.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_module, "_is_windows_host", lambda: True)
     monkeypatch.setattr(
         codex,
         "probe",

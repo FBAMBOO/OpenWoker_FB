@@ -8,7 +8,7 @@ import mimetypes
 import subprocess
 import uuid
 from dataclasses import dataclass
-from pathlib import Path, PurePath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -182,13 +182,24 @@ class ContextRefResolver:
         raw = str(relative_path).strip()
         if not raw or "\x00" in raw:
             raise ValueError("context path is empty or contains NUL")
-        pure = PurePath(raw)
-        if pure.is_absolute() or raw.startswith(("\\\\", "//", "\\?\\", "\\.\\")):
+        posix_path = PurePosixPath(raw)
+        windows_path = PureWindowsPath(raw)
+        if (
+            posix_path.is_absolute()
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+            or bool(windows_path.root)
+            or raw.startswith(("\\\\", "//", "\\?\\", "\\.\\"))
+        ):
             raise ValueError("context path must be workspace-relative")
-        if any(part == ".." for part in pure.parts):
+        if any(
+            part == ".."
+            for path in (posix_path, windows_path)
+            for part in path.parts
+        ):
             raise ValueError("context path cannot escape through '..'")
         root = Path(workspace).expanduser().resolve(strict=True)
-        candidate = (root / Path(*pure.parts)).resolve(strict=must_exist)
+        candidate = (root / Path(raw)).resolve(strict=must_exist)
         try:
             candidate.relative_to(root)
         except ValueError as exc:
