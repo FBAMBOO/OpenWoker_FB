@@ -121,6 +121,14 @@ _TERMINAL_RUN_STATUSES = frozenset(
         RunStatus.SKIPPED,
     }
 )
+_FAILED_RUN_STATUSES = frozenset(
+    {
+        RunStatus.FAILED,
+        RunStatus.TIMED_OUT,
+        RunStatus.CANCELED,
+        RunStatus.LOST,
+    }
+)
 _MENTION_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MAX_MENTIONS_PER_COMMENT = 10
 _MAX_LIVE_MENTION_WAKES_PER_TASK = 100
@@ -5138,6 +5146,59 @@ class OrchestrationStore:
             ).fetchall()
         return tuple(self._run_from_row(row) for row in rows)
 
+    @staticmethod
+    def _queued_run_dependencies_ready(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> bool:
+        """Recheck the latest durable predecessors before granting a run lease.
+
+        The coordinator normally enqueues a node only after its dependencies settle.
+        A human-approved retry can enqueue several disputed verification attempts in
+        one pass, though, so a downstream retry may coexist briefly with its upstream
+        retry.  Claiming both in the same scheduler tick races the runtime projection
+        and can start the downstream verifier against stale evidence.
+        """
+
+        edges = connection.execute(
+            """
+            SELECT condition, required, from_node_id
+            FROM orch_edges
+            WHERE plan_id = ? AND to_node_id = ?
+            ORDER BY id
+            """,
+            (row["plan_id"], row["node_id"]),
+        ).fetchall()
+        if not edges:
+            return True
+        required = [edge for edge in edges if bool(edge["required"])]
+        applicable = required or edges
+        matches: list[bool] = []
+        for edge in applicable:
+            predecessor = connection.execute(
+                """
+                SELECT status
+                FROM orch_runs
+                WHERE plan_id = ? AND node_id = ?
+                ORDER BY attempt DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (row["plan_id"], edge["from_node_id"]),
+            ).fetchone()
+            if predecessor is None:
+                matches.append(False)
+                continue
+            status = RunStatus(predecessor["status"])
+            condition = EdgeCondition(edge["condition"])
+            if condition in {EdgeCondition.ALWAYS, EdgeCondition.TERMINAL}:
+                matches.append(status in _TERMINAL_RUN_STATUSES)
+            elif condition is EdgeCondition.SUCCESS:
+                matches.append(status is RunStatus.SUCCEEDED)
+            else:
+                matches.append(status in _FAILED_RUN_STATUSES)
+        if JoinPolicy(row["join_policy"]) is JoinPolicy.ALL:
+            return all(matches)
+        return any(matches)
+
     def claim_next_run(
         self,
         worker_id: str,
@@ -5164,10 +5225,10 @@ class OrchestrationStore:
             if replay is not None:
                 claim_payload = replay.get("claim")
                 return self._claim_from_payload(claim_payload) if claim_payload else None
-            row = connection.execute(
+            candidates = connection.execute(
                 """
                 SELECT r.*, n.node_key, n.concurrency_key, t.priority AS task_priority,
-                       t.max_parallel_runs
+                       t.max_parallel_runs, n.join_policy
                 FROM orch_runs r
                 JOIN orch_nodes n ON n.id = r.node_id
                 JOIN orch_tasks t ON t.id = r.task_id
@@ -5208,10 +5269,17 @@ class OrchestrationStore:
                 -- SQLite rowid preserves the committed insertion order for those ties.
                 ORDER BY r.priority DESC, t.priority DESC, r.ready_at, r.created_at,
                          r.rowid, r.id
-                LIMIT 1
                 """,
                 (_stamp(chosen_now),),
-            ).fetchone()
+            )
+            row = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if self._queued_run_dependencies_ready(connection, candidate)
+                ),
+                None,
+            )
             if row is None:
                 self._finish_command(connection, command_id, {"claim": None})
                 return None

@@ -888,6 +888,92 @@ def test_claim_next_run_preserves_fifo_when_enqueue_timestamps_tie(
         store.close()
 
 
+def test_claim_next_run_waits_for_latest_predecessor_attempt(tmp_path):
+    store = OrchestrationStore(tmp_path / "retry-dependency.db")
+    try:
+        task = _create_task(store, "retry-dependency")
+        graph = store.create_plan_revision(
+            task.id,
+            PlanSpec(
+                nodes=(
+                    NodeSpec(
+                        "review",
+                        kind=NodeKind.REVIEW,
+                        retry_policy=RetryPolicy(max_attempts=2),
+                    ),
+                    NodeSpec(
+                        "evaluate",
+                        kind=NodeKind.EVALUATE,
+                        priority=100,
+                        retry_policy=RetryPolicy(max_attempts=2),
+                    ),
+                ),
+                edges=(EdgeSpec("review", "evaluate"),),
+            ),
+            expected_task_version=task.version,
+            created_by="test",
+        )
+        task = _start_task(store, _queue_task(store, store.get_task(task.id)))
+
+        review_one = store.enqueue_run(task.id, "review", plan_id=graph.plan.id)
+        review_one_claim = store.claim_next_run("review-one")
+        assert review_one_claim is not None
+        store.start_run(
+            review_one.id,
+            review_one_claim.lease.token,
+            review_one_claim.lease.fencing_token,
+        )
+        store.complete_run(
+            review_one.id,
+            review_one_claim.lease.token,
+            review_one_claim.lease.fencing_token,
+            output={"summary": "review one"},
+        )
+        evaluate_one = store.enqueue_run(task.id, "evaluate", plan_id=graph.plan.id)
+        evaluate_one_claim = store.claim_next_run("evaluate-one")
+        assert evaluate_one_claim is not None
+        store.start_run(
+            evaluate_one.id,
+            evaluate_one_claim.lease.token,
+            evaluate_one_claim.lease.fencing_token,
+        )
+        store.complete_run(
+            evaluate_one.id,
+            evaluate_one_claim.lease.token,
+            evaluate_one_claim.lease.fencing_token,
+            output={"summary": "evaluate one"},
+        )
+
+        review_two = store.enqueue_run(
+            task.id, "review", plan_id=graph.plan.id, attempt=2
+        )
+        evaluate_two = store.enqueue_run(
+            task.id, "evaluate", plan_id=graph.plan.id, attempt=2
+        )
+
+        review_two_claim = store.claim_next_run("review-two")
+        assert review_two_claim is not None
+        assert review_two_claim.run.id == review_two.id
+        store.start_run(
+            review_two.id,
+            review_two_claim.lease.token,
+            review_two_claim.lease.fencing_token,
+        )
+        assert store.claim_next_run("blocked-evaluate-two") is None
+
+        store.complete_run(
+            review_two.id,
+            review_two_claim.lease.token,
+            review_two_claim.lease.fencing_token,
+            output={"summary": "review two"},
+        )
+        evaluate_two_claim = store.claim_next_run("evaluate-two")
+        assert evaluate_two_claim is not None
+        assert evaluate_two_claim.run.id == evaluate_two.id
+    finally:
+        store.close()
+
+
 def test_sibling_can_commit_success_while_another_run_waits_at_gate(tmp_path):
     store = OrchestrationStore(tmp_path / "sibling-success.db")
     try:
