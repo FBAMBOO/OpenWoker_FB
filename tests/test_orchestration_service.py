@@ -252,7 +252,7 @@ def test_failed_run_detail_gate_and_activity_expose_bounded_error_message(
 
 
 @pytest.mark.asyncio
-async def test_low_risk_task_runs_all_eight_stages_and_archives(tmp_path):
+async def test_low_risk_task_runs_all_eight_stages_and_remains_completed(tmp_path):
     executor = SuccessfulExecutor()
     service = OrchestrationService(FakeManager(), tmp_path / "data", executor=executor)
     await service.start()
@@ -265,7 +265,7 @@ async def test_low_risk_task_runs_all_eight_stages_and_archives(tmp_path):
             }
         )
         task_id = created["id"]
-        await wait_until(lambda: service.store.get_task(task_id).status is TaskStatus.ARCHIVED)
+        await wait_until(lambda: service.store.get_task(task_id).status is TaskStatus.COMPLETED)
         detail = service.task_detail(task_id)
         assert detail["stage"] == "archive"
         assert [item["stage"] for item in detail["stages"]] == [
@@ -338,7 +338,7 @@ async def test_code_task_requires_plan_and_final_gates_with_isolated_roles(tmp_p
         assert not (workspace / "orchestrated.txt").exists()
 
         service.resolve_gate(task_id, final_gate.id, decision="accept")
-        await wait_until(lambda: service.store.get_task(task_id).status is TaskStatus.ARCHIVED)
+        await wait_until(lambda: service.store.get_task(task_id).status is TaskStatus.COMPLETED)
         assert (workspace / "orchestrated.txt").read_text(encoding="utf-8") == "delivered"
         detail = service.task_detail(task_id)
         assert detail["attention_count"] == 0

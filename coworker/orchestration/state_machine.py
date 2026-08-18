@@ -38,6 +38,7 @@ _TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.RUNNING,
             TaskStatus.PAUSED,
             TaskStatus.BLOCKED,
+            TaskStatus.NEEDS_RECONCILIATION,
             TaskStatus.CANCELING,
             TaskStatus.FAILED,
         }
@@ -60,6 +61,7 @@ _TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.WAITING_CHILD,
             TaskStatus.PAUSED,
             TaskStatus.BLOCKED,
+            TaskStatus.NEEDS_RECONCILIATION,
             TaskStatus.CANCELING,
             TaskStatus.FAILED,
         }
@@ -70,12 +72,18 @@ _TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.WAITING_HUMAN,
             TaskStatus.PAUSED,
             TaskStatus.BLOCKED,
+            TaskStatus.NEEDS_RECONCILIATION,
             TaskStatus.CANCELING,
             TaskStatus.FAILED,
         }
     ),
     TaskStatus.PAUSED: frozenset(
-        {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.CANCELING}
+        {
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+            TaskStatus.NEEDS_RECONCILIATION,
+            TaskStatus.CANCELING,
+        }
     ),
     TaskStatus.BLOCKED: frozenset(
         {
@@ -99,7 +107,10 @@ _TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.FAILED: frozenset({TaskStatus.ARCHIVED}),
     TaskStatus.CANCELED: frozenset({TaskStatus.ARCHIVED}),
     TaskStatus.COMPLETED: frozenset({TaskStatus.ARCHIVED}),
-    TaskStatus.ARCHIVED: frozenset(),
+    # Archiving is an operator filing action, not an irreversible lifecycle
+    # verdict. A successfully completed task may be restored so its result can
+    # remain in the active Completed view for follow-up questions.
+    TaskStatus.ARCHIVED: frozenset({TaskStatus.COMPLETED}),
 }
 
 

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AgentProfilesSettings } from "./AgentProfilesSettings";
 import { ModelRoutingSettings } from "./ModelRoutingSettings";
+import { RuntimeCommunicationSettings } from "./RuntimeCommunicationSettings";
 import type { ApiRequest } from "./api";
 import type { AgentProfileSpec, ModelRoutingPolicySpec } from "./types";
 
@@ -155,9 +156,13 @@ describe("AgentProfilesSettings", () => {
     expect(displayName.disabled).toBe(false);
     const versionSelect = screen.getByLabelText("Profile version") as HTMLSelectElement;
     expect([...versionSelect.options].map((option) => option.value)).toEqual(["draft", "v1"]);
+    expect(screen.queryByLabelText(/Tool-call budget/)).toBeNull();
+    expect(screen.queryByLabelText(/^Token budget/)).toBeNull();
+    expect(screen.queryByLabelText(/^Timeout/)).toBeNull();
+    expect(screen.queryByLabelText("Max iterations")).toBeNull();
 
     fireEvent.change(displayName, { target: { value: "Release specialist" } });
-    fireEvent.change(screen.getByLabelText(/Tool-call budget/), { target: { value: "42" } });
+    fireEvent.change(screen.getByLabelText("Allowed tool IDs"), { target: { value: "read_file, grep" } });
     fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
 
     await waitFor(() => {
@@ -166,7 +171,7 @@ describe("AgentProfilesSettings", () => {
       expect(save?.body).toMatchObject({
         spec: {
           display_name: "Release specialist",
-          metadata: { tool_call_budget: 42, evidence_required: true, tests_required: true, review_required: true },
+          allowed_tools: ["read_file", "grep"],
         },
       });
     });
@@ -304,5 +309,52 @@ describe("ModelRoutingSettings", () => {
         requested_model: null,
       },
     });
+  });
+});
+
+describe("RuntimeCommunicationSettings", () => {
+  it("loads, validates through numeric controls, and applies the full live policy", async () => {
+    const calls: RequestCall[] = [];
+    const current = {
+      structured_handoff_enabled: true,
+      structured_handoff_required_for_new_tasks: false,
+      legacy_spawn_agent_enabled: true,
+      default_context_token_budget: 8000,
+      max_context_refs: 50,
+      max_inline_bytes_per_ref: 8192,
+      max_inline_bytes_total: 32768,
+      max_comment_batch: 100,
+      wake_coalesce_window_ms: 1000,
+      wake_max_attempts: 5,
+      wake_backoff_seconds: 1,
+      context_read_audit_enabled: true,
+      transcript_sharing_default: false,
+    };
+    const apiRequest: ApiRequest = async <T,>(path: string, init?: RequestInit) => {
+      const method = (init?.method || "GET").toUpperCase();
+      const body = parseBody(init);
+      calls.push({ path, method, body, headers: init?.headers });
+      if (path === "/v1/orchestration/handoff-settings" && method === "GET") return current as T;
+      if (path === "/v1/orchestration/handoff-settings" && method === "PUT") return body as T;
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    };
+
+    render(<RuntimeCommunicationSettings apiRequest={apiRequest} />);
+    const refs = await screen.findByLabelText("Maximum ContextRefs") as HTMLInputElement;
+    expect(refs.value).toBe("50");
+    fireEvent.change(refs, { target: { value: "75" } });
+    fireEvent.click(screen.getByLabelText("Require structured handoff for new Agent tasks"));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(calls).toContainEqual(expect.objectContaining({
+      path: "/v1/orchestration/handoff-settings",
+      method: "PUT",
+      body: expect.objectContaining({
+        max_context_refs: 75,
+        structured_handoff_required_for_new_tasks: true,
+        transcript_sharing_default: false,
+      }),
+    })));
+    expect((await screen.findByRole("status")).textContent).toContain("saved and applied");
   });
 });

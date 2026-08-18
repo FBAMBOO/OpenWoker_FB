@@ -17,6 +17,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
+from .handoff_models import ContextRefType, TaskRelationType
+
 
 _PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PERMISSION_MODES = frozenset({"discuss", "plan", "interactive", "custom", "auto"})
@@ -36,6 +38,136 @@ class AgentRole(str, Enum):
     SCORER = "scorer"
     EXPLORER = "explorer"
     INTEGRATOR = "integrator"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCommunicationPolicy:
+    can_delegate: bool = False
+    allowed_child_roles: tuple[AgentRole | str, ...] = ()
+    required_brief_fields: tuple[str, ...] = (
+        "objective",
+        "scope",
+        "acceptance_criteria",
+        "deliverables",
+    )
+    max_initial_context_tokens: int = 8_000
+    max_context_refs: int = 50
+    max_inline_bytes_per_ref: int = 8_192
+    max_inline_bytes_total: int = 32_768
+    allowed_context_ref_types: tuple[ContextRefType | str, ...] = tuple(ContextRefType)
+    allow_full_transcript_reference: bool = False
+    allowed_relation_types: tuple[TaskRelationType | str, ...] = (
+        TaskRelationType.PARENT,
+        TaskRelationType.BLOCKS,
+        TaskRelationType.REVIEWS,
+        TaskRelationType.RELATED,
+    )
+    can_comment: bool = True
+    can_mention: bool = False
+    can_mention_receive: bool = True
+    result_contract_id: str = "implementation_result_v1"
+
+    def __post_init__(self) -> None:
+        child_roles = tuple(dict.fromkeys(_role(item) for item in self.allowed_child_roles))
+        context_types = tuple(
+            dict.fromkeys(ContextRefType(str(item)) for item in self.allowed_context_ref_types)
+        )
+        relation_types = tuple(
+            dict.fromkeys(TaskRelationType(str(item)) for item in self.allowed_relation_types)
+        )
+        required = _ordered_unique(self.required_brief_fields)
+        for name in (
+            "max_initial_context_tokens",
+            "max_context_refs",
+            "max_inline_bytes_per_ref",
+            "max_inline_bytes_total",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ProfileValidationError(f"{name} cannot be negative")
+        if self.can_delegate and not child_roles:
+            raise ProfileValidationError("can_delegate requires allowed_child_roles")
+        if not self.can_delegate and child_roles:
+            raise ProfileValidationError("allowed_child_roles requires can_delegate=true")
+        if not str(self.result_contract_id).strip():
+            raise ProfileValidationError("communication result_contract_id is required")
+        object.__setattr__(self, "can_delegate", bool(self.can_delegate))
+        object.__setattr__(self, "allowed_child_roles", child_roles)
+        object.__setattr__(self, "required_brief_fields", required)
+        object.__setattr__(self, "allowed_context_ref_types", context_types)
+        object.__setattr__(self, "allowed_relation_types", relation_types)
+        object.__setattr__(self, "result_contract_id", str(self.result_contract_id).strip())
+        object.__setattr__(self, "can_comment", bool(self.can_comment))
+        object.__setattr__(self, "can_mention", bool(self.can_mention))
+        object.__setattr__(self, "can_mention_receive", bool(self.can_mention_receive))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "can_delegate": self.can_delegate,
+            "allowed_child_roles": [item.value for item in self.allowed_child_roles],
+            "required_brief_fields": list(self.required_brief_fields),
+            "max_initial_context_tokens": self.max_initial_context_tokens,
+            "max_context_refs": self.max_context_refs,
+            "max_inline_bytes_per_ref": self.max_inline_bytes_per_ref,
+            "max_inline_bytes_total": self.max_inline_bytes_total,
+            "allowed_context_ref_types": [item.value for item in self.allowed_context_ref_types],
+            "allow_full_transcript_reference": self.allow_full_transcript_reference,
+            "allowed_relation_types": [item.value for item in self.allowed_relation_types],
+            "can_comment": self.can_comment,
+            "can_mention": self.can_mention,
+            "can_mention_receive": self.can_mention_receive,
+            "result_contract_id": self.result_contract_id,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        role: AgentRole,
+        legacy_child_roles: tuple[AgentRole, ...] = (),
+    ) -> "AgentCommunicationPolicy":
+        default = default_communication_policy(role, legacy_child_roles)
+        return cls(
+            can_delegate=bool(value.get("can_delegate", default.can_delegate)),
+            allowed_child_roles=tuple(value.get("allowed_child_roles", default.allowed_child_roles)),
+            required_brief_fields=tuple(value.get("required_brief_fields", default.required_brief_fields)),
+            max_initial_context_tokens=int(value.get("max_initial_context_tokens", default.max_initial_context_tokens)),
+            max_context_refs=int(value.get("max_context_refs", default.max_context_refs)),
+            max_inline_bytes_per_ref=int(value.get("max_inline_bytes_per_ref", default.max_inline_bytes_per_ref)),
+            max_inline_bytes_total=int(value.get("max_inline_bytes_total", default.max_inline_bytes_total)),
+            allowed_context_ref_types=tuple(value.get("allowed_context_ref_types", default.allowed_context_ref_types)),
+            allow_full_transcript_reference=bool(value.get("allow_full_transcript_reference", False)),
+            allowed_relation_types=tuple(value.get("allowed_relation_types", default.allowed_relation_types)),
+            can_comment=bool(value.get("can_comment", default.can_comment)),
+            can_mention=bool(value.get("can_mention", default.can_mention)),
+            can_mention_receive=bool(value.get("can_mention_receive", default.can_mention_receive)),
+            result_contract_id=str(value.get("result_contract_id") or default.result_contract_id),
+        )
+
+
+def default_communication_policy(
+    role: AgentRole | str,
+    allowed_child_roles: tuple[AgentRole | str, ...] = (),
+) -> AgentCommunicationPolicy:
+    chosen_role = _role(role)
+    children = tuple(_role(item) for item in allowed_child_roles)
+    contracts = {
+        AgentRole.ORCHESTRATOR: "orchestration_summary_v1",
+        AgentRole.PLANNER: "planner_result_v1",
+        AgentRole.WORKER: "implementation_result_v1",
+        AgentRole.REVIEWER: "review_result_v1",
+        AgentRole.TESTER: "test_result_v1",
+        AgentRole.EVALUATOR: "evaluation_result_v1",
+        AgentRole.SCORER: "review_result_v1",
+        AgentRole.EXPLORER: "evidence_bundle_v1",
+        AgentRole.INTEGRATOR: "implementation_result_v1",
+    }
+    return AgentCommunicationPolicy(
+        can_delegate=bool(children),
+        allowed_child_roles=children,
+        can_mention=chosen_role in {AgentRole.ORCHESTRATOR, AgentRole.PLANNER},
+        result_contract_id=contracts[chosen_role],
+    )
 
 
 def _role(value: AgentRole | str) -> AgentRole:
@@ -164,6 +296,9 @@ class AgentProfileDraft:
     max_children: int = 0
     base: Optional[ProfileRef] = None
     metadata: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    communication_policy: AgentCommunicationPolicy | Mapping[str, Any] | None = field(
+        default=None, hash=False
+    )
 
     def __post_init__(self) -> None:
         profile_id = str(self.profile_id).strip()
@@ -194,6 +329,21 @@ class AgentProfileDraft:
             )
         if self.base is not None and not isinstance(self.base, ProfileRef):
             raise ProfileValidationError("base must be a ProfileRef")
+        communication = self.communication_policy
+        if communication is None:
+            communication = default_communication_policy(role, children)
+        elif isinstance(communication, Mapping):
+            communication = AgentCommunicationPolicy.from_dict(
+                communication, role=role, legacy_child_roles=children
+            )
+        elif not isinstance(communication, AgentCommunicationPolicy):
+            raise ProfileValidationError("communication_policy is invalid")
+        undeclared_children = set(communication.allowed_child_roles) - set(children)
+        if undeclared_children:
+            raise ProfileValidationError(
+                "communication policy cannot delegate beyond profile child roles: "
+                + ", ".join(sorted(item.value for item in undeclared_children))
+            )
         object.__setattr__(self, "profile_id", profile_id)
         object.__setattr__(self, "display_name", str(self.display_name).strip())
         object.__setattr__(self, "role", role)
@@ -205,6 +355,7 @@ class AgentProfileDraft:
         object.__setattr__(self, "max_iterations", max_iterations)
         object.__setattr__(self, "max_children", max_children)
         object.__setattr__(self, "metadata", _freeze(dict(self.metadata)))
+        object.__setattr__(self, "communication_policy", communication)
 
     def publish(self, version: int, *, builtin: bool = False) -> "AgentProfile":
         return AgentProfile(
@@ -222,11 +373,12 @@ class AgentProfileDraft:
             builtin=builtin,
             cloned_from=self.base,
             metadata=self.metadata,
+            communication_policy=self.communication_policy,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile_id": self.profile_id,
             "display_name": self.display_name,
             "role": self.role.value,
@@ -239,6 +391,7 @@ class AgentProfileDraft:
             "max_children": self.max_children,
             "base": self.base.to_dict() if self.base else None,
             "metadata": _jsonable(self.metadata),
+            "communication_policy": self.communication_policy.to_dict(),
         }
 
     @classmethod
@@ -257,6 +410,11 @@ class AgentProfileDraft:
             max_children=int(value.get("max_children", 0)),
             base=ProfileRef.from_dict(base) if isinstance(base, Mapping) else None,
             metadata=dict(value.get("metadata", {})),
+            communication_policy=(
+                dict(value["communication_policy"])
+                if isinstance(value.get("communication_policy"), Mapping)
+                else None
+            ),
         )
 
 
@@ -276,6 +434,9 @@ class AgentProfile:
     builtin: bool = False
     cloned_from: Optional[ProfileRef] = None
     metadata: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    communication_policy: AgentCommunicationPolicy | Mapping[str, Any] | None = field(
+        default=None, hash=False
+    )
 
     def __post_init__(self) -> None:
         version = int(self.version)
@@ -294,6 +455,7 @@ class AgentProfile:
             max_children=self.max_children,
             base=self.cloned_from,
             metadata=self.metadata,
+            communication_policy=self.communication_policy,
         )
         for name in (
             "profile_id",
@@ -307,6 +469,7 @@ class AgentProfile:
             "max_iterations",
             "max_children",
             "metadata",
+            "communication_policy",
         ):
             object.__setattr__(self, name, getattr(draft, name))
         object.__setattr__(self, "version", version)
@@ -330,12 +493,13 @@ class AgentProfile:
             max_children=self.max_children,
             base=self.ref,
             metadata=self.metadata,
+            communication_policy=self.communication_policy,
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the exact published snapshot without mutable references."""
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile_id": self.profile_id,
             "version": self.version,
             "display_name": self.display_name,
@@ -350,6 +514,7 @@ class AgentProfile:
             "builtin": self.builtin,
             "cloned_from": self.cloned_from.to_dict() if self.cloned_from else None,
             "metadata": _jsonable(self.metadata),
+            "communication_policy": self.communication_policy.to_dict(),
         }
 
     @classmethod
@@ -374,6 +539,11 @@ class AgentProfile:
                 else None
             ),
             metadata=dict(value.get("metadata", {})),
+            communication_policy=(
+                dict(value["communication_policy"])
+                if isinstance(value.get("communication_policy"), Mapping)
+                else None
+            ),
         )
 
     @property
@@ -418,6 +588,7 @@ def clone_profile(
         "max_iterations": source.max_iterations,
         "max_children": source.max_children,
         "metadata": source.metadata,
+        "communication_policy": source.communication_policy,
     }
     values.update(overrides)
     return AgentProfileDraft(
@@ -588,42 +759,91 @@ _BOUNDED_CODE_COMMANDS = [
     "./gradlew build",
 ]
 
+_HANDOFF_READ_TOOLS = (
+    "get_task_context",
+    "list_context_refs",
+    "read_context_ref",
+    "list_task_comments",
+)
+_HANDOFF_WRITE_TOOLS = (
+    "post_task_comment",
+    "create_work_product",
+    "complete_task",
+    "fail_task",
+)
+_HANDOFF_DELEGATION_TOOLS = (
+    "delegate_task",
+    "add_task_blockers",
+    "remove_task_blocker",
+)
+
 
 _BUILTINS = {
     AgentRole.ORCHESTRATOR.value: _builtin(
         AgentRole.ORCHESTRATOR,
-        instructions="Decompose work, delegate bounded tasks, and synthesize verified results.",
-        tools=("spawn_agent", "wait_agent", "cancel_agent", "ask_user", "todo_write"),
+        instructions=(
+            "Decompose work into complete bounded Task Briefs, select only necessary "
+            "ContextRefs, never copy an entire workspace or another role transcript, "
+            "and synthesize only verified Work Products and result envelopes."
+        ),
+        tools=("spawn_agent", "wait_agent", "cancel_agent", "ask_user", "todo_write")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS
+        + _HANDOFF_DELEGATION_TOOLS,
         children=tuple(AgentRole),
         max_iterations=8,
     ),
     AgentRole.PLANNER.value: _builtin(
         AgentRole.PLANNER,
-        instructions="Inspect evidence and produce a dependency-aware implementation plan.",
-        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log", "spawn_agent", "wait_agent", "cancel_agent"),
-        children=(AgentRole.WORKER,),
+        instructions=(
+            "Inspect selected evidence, produce a dependency-aware implementation plan, "
+            "and give every executable child a complete bounded Task Brief with explicit "
+            "scope, criteria, deliverables, and ContextRefs."
+        ),
+        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log", "spawn_agent", "wait_agent", "cancel_agent")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS
+        + _HANDOFF_DELEGATION_TOOLS,
+        children=(AgentRole.WORKER, AgentRole.EXPLORER),
         mode="plan",
         max_iterations=6,
     ),
     AgentRole.WORKER.value: _builtin(
         AgentRole.WORKER,
-        instructions="Complete one scoped assignment and return structured evidence.",
-        tools=("list_files", "read_file", "grep", "write_file", "apply_patch", "run_shell", "git_status", "git_diff", "todo_write", "spawn_agent", "wait_agent", "cancel_agent"),
+        instructions=(
+            "Complete only the Published Brief scope, report progress as comment deltas, "
+            "and return immutable Work Products with structured criterion results."
+        ),
+        tools=("list_files", "read_file", "grep", "write_file", "apply_patch", "run_shell", "git_status", "git_diff", "todo_write", "spawn_agent", "wait_agent", "cancel_agent")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS
+        + _HANDOFF_DELEGATION_TOOLS,
         children=(AgentRole.WORKER, AgentRole.TESTER),
         max_iterations=12,
         metadata={"allowed_commands": _BOUNDED_CODE_COMMANDS},
     ),
     AgentRole.REVIEWER.value: _builtin(
         AgentRole.REVIEWER,
-        instructions="Review changes read-only and report prioritized, evidence-backed findings.",
-        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log", "submit_verdict"),
+        instructions=(
+            "Review the declared candidate in a fresh read-only session using selected "
+            "diff and Work Product references, never the Worker's private transcript, "
+            "and submit prioritized findings plus a structured verdict."
+        ),
+        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log", "submit_verdict")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         mode="plan",
         max_iterations=6,
     ),
     AgentRole.TESTER.value: _builtin(
         AgentRole.TESTER,
-        instructions="Run the bounded verification commands and report reproducible results.",
-        tools=("list_files", "read_file", "grep", "run_shell", "git_status", "git_diff", "submit_verdict"),
+        instructions=(
+            "Run only the bounded verification scope in a fresh session, publish "
+            "reproducible test evidence as a Work Product, and submit a structured verdict."
+        ),
+        tools=("list_files", "read_file", "grep", "run_shell", "git_status", "git_diff", "submit_verdict")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         max_iterations=8,
         metadata={
             # This is a hard runtime ceiling, not merely an auto-approval list.
@@ -634,29 +854,43 @@ _BUILTINS = {
     ),
     AgentRole.EVALUATOR.value: _builtin(
         AgentRole.EVALUATOR,
-        instructions="Compare results with acceptance criteria and recommend accept, retry, replan, or escalate.",
-        tools=("list_files", "read_file", "grep", "git_diff", "submit_verdict"),
+        instructions=(
+            "Compare structured results and verified Work Products with every acceptance "
+            "criterion, then explicitly recommend accept, retry, replan, or escalate."
+        ),
+        tools=("list_files", "read_file", "grep", "git_diff", "submit_verdict")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         mode="plan",
         max_iterations=4,
     ),
     AgentRole.SCORER.value: _builtin(
         AgentRole.SCORER,
         instructions="Score candidate results against explicit criteria and cite the supporting evidence.",
-        tools=("list_files", "read_file", "grep", "git_diff", "submit_verdict"),
+        tools=("list_files", "read_file", "grep", "git_diff", "submit_verdict")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         mode="plan",
         max_iterations=4,
     ),
     AgentRole.EXPLORER.value: _builtin(
         AgentRole.EXPLORER,
         instructions="Explore the scoped code and evidence, then return concise findings and open questions.",
-        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log"),
+        tools=("list_files", "read_file", "grep", "git_status", "git_diff", "git_log")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         mode="plan",
         max_iterations=8,
     ),
     AgentRole.INTEGRATOR.value: _builtin(
         AgentRole.INTEGRATOR,
-        instructions="Integrate accepted candidates, resolve bounded conflicts, and verify the combined result.",
-        tools=("list_files", "read_file", "grep", "write_file", "apply_patch", "run_shell", "git_status", "git_diff"),
+        instructions=(
+            "Integrate only accepted Work Products, resolve conflicts within the Brief "
+            "boundary, and publish a combined candidate with reproducible verification."
+        ),
+        tools=("list_files", "read_file", "grep", "write_file", "apply_patch", "run_shell", "git_status", "git_diff")
+        + _HANDOFF_READ_TOOLS
+        + _HANDOFF_WRITE_TOOLS,
         max_iterations=10,
         metadata={"allowed_commands": _BOUNDED_CODE_COMMANDS},
     ),

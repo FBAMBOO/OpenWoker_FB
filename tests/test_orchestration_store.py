@@ -128,6 +128,7 @@ def test_independent_wal_schema_and_checksummed_migration_ledger(tmp_path):
             "orch_outbox",
             "orch_leases",
             "orch_commands",
+            "orch_run_activity",
             "orch_schema_migrations",
         } <= tables
         ledger = connection.execute(
@@ -381,6 +382,46 @@ def test_approved_clarification_updates_contract_idempotently_and_is_audited(tmp
     }
 
 
+def test_open_task_gate_prompt_can_be_amended_with_audited_cas(tmp_path):
+    store = OrchestrationStore(tmp_path / "orch.db")
+    task = _start_task(store, _queue_task(store, _create_task(store)))
+    gate = store.open_task_gate(
+        task.id,
+        kind=GateKind.RECONCILIATION,
+        source_key=f"{task.id}:legacy-reconciliation",
+        prompt={"actions": ["request_changes", "cancel"]},
+    )
+
+    amended = store.amend_task_gate_prompt(
+        gate.id,
+        {"actions": ["retry", "request_changes", "cancel"]},
+        expected_version=gate.version,
+        command_id="amend-legacy-gate",
+    )
+    replay = store.amend_task_gate_prompt(
+        gate.id,
+        {"actions": ["retry", "request_changes", "cancel"]},
+        expected_version=gate.version,
+        command_id="amend-legacy-gate",
+    )
+
+    assert amended.version == gate.version + 1
+    assert replay == amended
+    assert amended.prompt["actions"][0] == "retry"
+    assert any(
+        event.event_type == "gate.prompt_amended"
+        and event.aggregate_id == gate.id
+        for event in store.list_events(task_id=task.id)
+    )
+    with pytest.raises(GateConflict):
+        store.amend_task_gate_prompt(
+            gate.id,
+            {"actions": ["cancel"]},
+            expected_version=gate.version,
+            command_id="stale-amend-legacy-gate",
+        )
+
+
 def test_plan_revisions_and_evidence_are_database_immutable(tmp_path):
     store = OrchestrationStore(tmp_path / "orch.db")
     task = _create_task(store)
@@ -487,6 +528,113 @@ def test_atomic_run_claim_fencing_and_completion(tmp_path):
         output={"result": "ok"},
         command_id="complete-run",
     ).status is RunStatus.SUCCEEDED
+
+
+def test_run_activity_is_fenced_idempotent_redacted_and_immutable(
+    tmp_path, monkeypatch
+):
+    store = OrchestrationStore(tmp_path / "activity.db")
+    task = _create_task(store, "activity-task")
+    _, task = _create_plan(store, task)
+    task = _queue_task(store, task)
+    task = _start_task(store, task)
+    run = store.enqueue_run(task.id, "implement", command_id="enqueue-activity")
+    claim = store.claim_next_run("activity-worker", command_id="claim-activity")
+    assert claim is not None
+    store.start_run(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        command_id="start-activity",
+    )
+
+    first = store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="tool-1:started",
+        source_id="tool-1",
+        kind="tool",
+        status="running",
+        title="Command",
+        summary="curl -H 'Authorization: Bearer super-secret-token' /health",
+        detail={
+            "command": "deploy --api-key=private-value",
+            "access_token": "must-never-persist",
+            "input_tokens": 42,
+        },
+    )
+    replay = store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="tool-1:started",
+        source_id="tool-1",
+        kind="tool",
+        status="running",
+        title="Changed title is ignored by idempotency",
+    )
+    second = store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="tool-1:completed",
+        source_id="tool-1",
+        kind="tool",
+        status="completed",
+        title="Command",
+        detail={"exit_code": 0},
+    )
+
+    assert replay == first
+    assert second.sequence > first.sequence
+    page = store.list_run_activity(task.id, run.id, limit=10)
+    assert [item.event_key for item in page] == ["tool-1:started", "tool-1:completed"]
+    assert "super-secret-token" not in page[0].summary
+    assert "private-value" not in page[0].detail["command"]
+    assert page[0].detail["access_token"] == "[REDACTED]"
+    assert page[0].detail["input_tokens"] == 42
+    assert store.list_run_activity(
+        task.id, run.id, after_sequence=first.sequence, limit=10
+    ) == (second,)
+
+    with pytest.raises(LeaseConflict):
+        store.append_run_activity(
+            run.id,
+            "stale-token",
+            claim.lease.fencing_token,
+            event_key="stale",
+            source_id="stale",
+            kind="lifecycle",
+            status="running",
+            title="Stale worker",
+        )
+
+    monkeypatch.setattr(store_module, "MAX_RUN_ACTIVITY_ROWS", 2)
+    marker = store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="too-many-events",
+        source_id="noisy-provider",
+        kind="lifecycle",
+        status="running",
+        title="This row is replaced by the cap marker",
+    )
+    assert marker.event_key == "openworker:activity_truncated"
+    assert marker.detail == {"retained_limit": 2}
+
+    connection = store.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="run activity is immutable"):
+            connection.execute(
+                "UPDATE orch_run_activity SET title = 'tampered' WHERE id = ?",
+                (first.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="run activity is immutable"):
+            connection.execute("DELETE FROM orch_run_activity WHERE id = ?", (first.id,))
+    finally:
+        connection.close()
 
 
 def test_gate_compare_and_swap_requeues_same_attempt(tmp_path):

@@ -177,16 +177,24 @@ class SessionManager:
         self._mcp_errors: dict[str, str] = {}
         self.gateway: Optional[Gateway] = None
         self._data_base = base
+        # Load non-secret preferences before constructing orchestration: its runtime
+        # communication policy is part of the manager settings snapshot consumed at
+        # service startup.
+        self._prefs = self._load_prefs()
+        if self._prefs.get("default_model"):
+            self.model = self._prefs["default_model"]
         # Hierarchical orchestration is an additive control plane with its own WAL DB,
         # migrations, scheduler, and hidden Agent sessions.  Keeping it behind one
         # manager-owned service is the only lifecycle seam required in upstream code.
         from ..orchestration.service import OrchestrationService
 
-        self.orchestration = OrchestrationService(self, base / "orchestration")
-        # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
-        self._prefs = self._load_prefs()
-        if self._prefs.get("default_model"):
-            self.model = self._prefs["default_model"]
+        self.orchestration = OrchestrationService(
+            self,
+            base / "orchestration",
+            # Usage remains auditable, but a fixed model/tool/token/time allowance
+            # must not terminate a run merely because it was divided across the DAG.
+            enforce_runtime_budgets=False,
+        )
         # Seed the PDF-fallback module global from prefs so engines see the user's
         # choice from the first turn (set_pdf_settings keeps it in sync after).
         from ..pdf_support import set_fallback_mode
@@ -2029,6 +2037,7 @@ class SessionManager:
             "context_bar": self.context_bar(),
             "scratch_base": self._prefs.get("scratch_base")
             or self.DEFAULT_SCRATCH_BASE,
+            "orchestration_handoff": self.orchestration_handoff_settings(),
             # Real on-disk secrets location, so the UI shows the OS-native path instead of a
             # hardcoded POSIX one (Windows -> %APPDATA%\coworker, macOS/Linux -> ~/.config).
             "secrets_path": str(self.secrets.path),
@@ -2095,6 +2104,30 @@ class SessionManager:
         self._prefs["context_bar"] = bool(shown)
         self._save_prefs()
         return {"ok": True, "context_bar": self.context_bar()}
+
+    def orchestration_handoff_settings(self) -> dict[str, Any]:
+        """Return a validated, non-secret structured-handoff runtime policy."""
+
+        from ..orchestration.handoff_settings import HandoffRuntimeSettings
+
+        raw = self._prefs.get("orchestration_handoff")
+        return HandoffRuntimeSettings.from_mapping(
+            raw if isinstance(raw, dict) else {}
+        ).to_dict()
+
+    def set_orchestration_handoff_settings(
+        self, value: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist and atomically publish communication limits to the live service."""
+
+        from ..orchestration.handoff_settings import HandoffRuntimeSettings
+
+        normalized = HandoffRuntimeSettings.from_mapping(value).to_dict()
+        self._prefs["orchestration_handoff"] = normalized
+        self._save_prefs()
+        if hasattr(self, "orchestration"):
+            self.orchestration.update_handoff_settings(normalized)
+        return {"ok": True, "settings": normalized}
 
     # -- PDF attachments / token savings (owner ask, 2026-07-17) ----------------
     DEFAULT_PDF_MAX_PAGES = 20

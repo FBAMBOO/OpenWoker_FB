@@ -12,6 +12,7 @@ from coworker.orchestration.runtime import (
     DEFAULT_TASK_BUDGET,
     DEFAULT_TOOL_CALL_LIMIT,
     DEFAULT_WORK_UNIT_LIMIT,
+    UNLIMITED_RUNTIME_BUDGET,
     PermissionEscalationError,
     PermissionSet,
     RootPermission,
@@ -58,6 +59,33 @@ def test_locked_defaults_are_public_and_applied():
         DEFAULT_REPORTED_TOKEN_LIMIT,
         DEFAULT_ACTIVE_SECONDS_LIMIT,
     )
+
+
+def test_unlimited_budget_keeps_accounting_without_creating_a_ceiling():
+    usage = RuntimeBudget(50, 500, 5_000_000, 50_000)
+
+    assert UNLIMITED_RUNTIME_BUDGET.is_unlimited is True
+    assert (UNLIMITED_RUNTIME_BUDGET - usage).is_unlimited is True
+    assert (UNLIMITED_RUNTIME_BUDGET + usage).is_unlimited is True
+    assert usage.fits_within(UNLIMITED_RUNTIME_BUDGET) is True
+
+    manager = RuntimeManager()
+    root = manager.add_root(
+        spec(
+            "unlimited-root",
+            budget=UNLIMITED_RUNTIME_BUDGET,
+            permissions=delegating_permissions(),
+        )
+    )
+    manager.spawn_child(
+        root.runtime_id,
+        spec("unlimited-child-a", budget=UNLIMITED_RUNTIME_BUDGET),
+    )
+    manager.spawn_child(
+        root.runtime_id,
+        spec("unlimited-child-b", budget=UNLIMITED_RUNTIME_BUDGET),
+    )
+    assert root.remaining_budget.is_unlimited is True
 
 
 def test_permission_intersection_denies_and_audits_every_escalation(tmp_path):

@@ -11,6 +11,7 @@ from coworker.events import Event, EventType
 from coworker.orchestration.blobs import ContentAddressedBlobStore
 from coworker.orchestration.errors import GateConflict, LeaseConflict
 from coworker.orchestration.executor import OpenWorkerExecutor, RunExecutionContext
+from coworker.orchestration.handoff_models import WakeReason
 from coworker.orchestration.models import (
     GateStatus,
     NodeSpec,
@@ -162,6 +163,10 @@ async def test_completed_turn_fails_when_shell_containment_was_not_reaped(
                 return SimpleNamespace(disposition="clean", pending_tools=[])
 
             async def run(self, _prompt):
+                yield Event(
+                    EventType.REASONING_DELTA,
+                    {"delta": "PRIVATE REASONING MUST NEVER BE PERSISTED"},
+                )
                 yield Event(EventType.TURN_END, {"status": "completed"})
 
         engine = CompletedEngine()
@@ -183,6 +188,13 @@ async def test_completed_turn_fails_when_shell_containment_was_not_reaped(
         assert outcome.status == "failed"
         assert outcome.error_kind == "process_tree_cleanup_failed"
         assert "requires reconciliation" in (outcome.error_message or "")
+        activity = store.list_run_activity(task.id, run.id)
+        assert activity[0].title == "Agent runtime started"
+        assert activity[-1].title == "Agent run failed"
+        assert activity[-1].status == "failed"
+        assert "requires reconciliation" in activity[-1].summary
+        assert any(item.title == "Reasoning step completed" for item in activity)
+        assert "PRIVATE REASONING" not in str(activity)
     finally:
         store.close()
 
@@ -489,6 +501,16 @@ async def test_permission_gate_releases_and_resumes_the_same_hidden_session(tmp_
             resolved_by="tester",
             expected_version=gate.version,
         )
+        gate_wake = next(
+            wake
+            for wake in store.list_wakes(task_id=task.id)
+            if wake.reason is WakeReason.GATE_RESOLVED
+        )
+        assert gate_wake.target_run_id == run.id
+        assert gate_wake.payload["response_delta"] == {"decision": "approve"}
+        assert gate_wake.payload["checkpoint_ref"] == suspended.output[
+            "engine_checkpoint"
+        ]["blob_uri"]
         resumed_claim = store.claim_next_run("worker-two")
         assert resumed_claim and resumed_claim.run.id == run.id
         store.start_run(

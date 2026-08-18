@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestration Handoff"
+  short_description: "Operate and diagnose structured agent handoffs"
+  default_prompt: "Use $orchestration-handoff to inspect and safely operate this task handoff."

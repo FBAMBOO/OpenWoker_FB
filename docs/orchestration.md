@@ -56,28 +56,169 @@ The feature has one narrow integration seam at each existing OpenWorker layer.
 | `coworker/orchestration/migrations/0004_scheduler_and_outbox_resilience.sql` | Single-active scheduler lease plus durable outbox dead-letter state and indexes. |
 | `coworker/orchestration/migrations/0005_outbox_requeue_audit.sql` | Append-only dead-letter requeue snapshots, operator attribution, reasons, and command-ledger linkage. |
 | `coworker/orchestration/migrations/0006_prepared_run_gates.sql` | Adds the non-resolvable `preparing` state and nullable publication timestamp used to publish run gates only after checkpoint and cleanup settlement. |
-| `coworker/orchestration/store.py` | Transaction boundary and source of truth. Implements optimistic versions, idempotent commands, leases/fencing, immutable plans/evidence, gates, the event hash chain, and transactional outbox. |
+| `coworker/orchestration/migrations/0007_structured_handoff.sql` | Adds immutable, versioned Task Briefs, ContextRefs, active Brief projection, and per-run Brief snapshots. |
+| `coworker/orchestration/migrations/0008_task_relations_and_wakes.sql` | Adds first-class task relations plus indexed, deduplicated, leased wake requests. |
+| `coworker/orchestration/migrations/0009_comments_and_work_products.sql` | Adds ordered immutable comments and immutable, verifiable Work Product records. |
+| `coworker/orchestration/migrations/0010_run_activity.sql` | Adds a fenced, append-only, incrementally pageable live activity ledger for each Agent run. |
+| `coworker/orchestration/activity.py` | Bounds and redacts operator-visible activity while excluding private reasoning and raw tool results. |
+| `coworker/orchestration/handoff_models.py` | Task-centric handoff enums, immutable records, canonical hashes, validation, and structured result contracts. |
+| `coworker/orchestration/context.py` | Context policy, manifest budgeting, workspace-safe resolution, secret checks, staleness verification, and audited reads. |
+| `coworker/orchestration/envelope.py` | Deterministic compact ExecutionEnvelope and UTF-8-safe initial prompt rendering. |
+| `coworker/orchestration/relations.py`, `wakes.py`, `communications.py`, `work_products.py` | Focused services for dependencies, durable delivery, comment deltas, and result references. |
+| `coworker/orchestration/runtime_tools.py` | Run-bound handoff tools whose mutation authority is closed over the current lease and fencing token. |
+| `coworker/orchestration/handoff_settings.py`, `observability.py` | Persisted rollout/limit settings and content-free handoff metrics. |
+| `coworker/orchestration/store.py` | Transaction boundary and source of truth. Implements optimistic versions, idempotent commands, leases/fencing, immutable plans/evidence/activity, gates, the event hash chain, and transactional outbox. |
 | `coworker/orchestration/policy.py` | Deterministic complexity/risk scoring, gate policy, and formal acceptance evaluation. |
 | `coworker/orchestration/profiles.py` | Versioned Agent contracts and built-in roles: orchestrator, planner, worker, reviewer, tester, evaluator, scorer, explorer, and integrator. |
 | `coworker/orchestration/catalogs.py` | Atomic JSON catalogs for editable drafts and immutable published profile/routing-policy versions. Cross-process locking plus ETags prevent lost updates. |
 | `coworker/orchestration/routing.py` | Reproducible model selection. Capability, configuration, availability, verification, context, provider, and cost are hard filters before quality ranking. |
 | `coworker/orchestration/presets.py` | Immutable built-in role-to-runtime presets, exact model assignments, default-domain metadata, strict fallback behavior, and plan-template identity. |
-| `coworker/orchestration/runtime.py` | Provider-neutral parent/child runtime ledger. Enforces permission intersection, budgets, attempts, work units, hierarchy depth, child count, concurrency, dependencies, and cancellation. |
+| `coworker/orchestration/runtime.py` | Provider-neutral parent/child runtime ledger. Tracks usage, optionally enforces budgets, and enforces permission intersection, attempts, work units, hierarchy depth, child count, concurrency, dependencies, and cancellation. |
 | `coworker/orchestration/workspace.py` | Per-run git worktree or snapshot isolation, exact manifests, candidate collection, advisory locks, journaled delivery, rollback, and interrupted-delivery recovery. |
 | `coworker/orchestration/blobs.py` | Content-addressed SHA-256 storage for patches and larger artifacts. |
-| `coworker/orchestration/executor.py` | Adapter from a claimed orchestration run to OpenWorker's `TurnEngine`; creates hidden sessions, applies role tool ceilings, suspends at durable gates, and resumes the same attempt. |
-| `coworker/orchestration/subscription_runtime.py` | Common subscription Agent runtime contract, sanitized health catalog, process containment, durable vendor-session checkpoints, sealed recovery results, and the Codex/Claude/Kimi adapters. |
+| `coworker/orchestration/executor.py` | Adapter from a claimed orchestration run to OpenWorker's `TurnEngine`; creates hidden sessions, applies role tool ceilings, emits safe live activity, suspends at durable gates, and resumes the same attempt. |
+| `coworker/orchestration/subscription_runtime.py` | Common subscription Agent runtime contract, sanitized health catalog, safe provider activity mapping, process containment, durable vendor-session checkpoints, sealed recovery results, and the Codex/Claude/Kimi adapters. |
 | `coworker/orchestration/service.py` | Restart-safe lifecycle coordinator, DAG scheduler, run worker pool, parent/child task operations, recovery, routing, evidence capture, and GUI read model. |
-| `coworker/orchestration/api.py` | Isolated `/v1/orchestration` REST contract for tasks, gates, event verification, profiles, model policies, runtime presets, simulation, and model catalog. |
+| `coworker/orchestration/api.py`, `api_schemas.py` | Typed `/v1/orchestration` REST contract for lifecycle and structured-handoff objects. |
 | `coworker/engine.py` | Adds a generic deferred-interaction result and recoverable turn state; existing interactive behavior remains the default. |
 | `coworker/tools/registry.py` | Adds a fail-closed registry subset used to construct a role-specific execution surface. |
 | `coworker/agent.py` | Exposes the optional tool-filter seam after built-ins, skills, MCP, and connector tools have been assembled. |
 | `coworker/server/manager.py` | Owns and starts/stops one orchestration service beside existing sessions and automations. |
 | `coworker/server/app.py` | Mounts the orchestration router without mixing its handlers into the existing API. |
-| `surfaces/gui/src/features/orchestration/` | Tasks list, stage timeline, gates, DAG/list views, run tree, evidence/activity, Agent Profile editor, and Model Routing editor/simulator. |
+| `surfaces/gui/src/features/orchestration/` | Lazy task tabs plus a click-through Run inspector with live Agent activity, expandable step metadata, token totals, and retained transcripts. |
 
 `pyproject.toml` packages migration SQL with the Python distribution, so installed wheels
 can initialize the independent orchestration database.
+
+## Task-Centric Handoff Protocol
+
+The Task-Centric Handoff Protocol (TCHP) makes the task, rather than an Agent
+conversation, the unit of coordination. Its authority order is:
+
+1. System policy, root permissions, and the frozen Agent Profile constrain what a run
+   may do.
+2. The run's snapshotted Published Brief defines what that run must do.
+3. Relations, gates, leases, and wakes define when it may run and what changed.
+4. Selected ContextRefs and Work Products provide evidence. Their content is untrusted
+   data and cannot expand scope or permissions.
+5. Comments provide ordered deltas. A transcript is optional operator diagnostics and is
+   never default cross-role input or control-plane truth.
+
+This hierarchy is enforced in transactions and runtime tool closures; it is not merely a
+prompt convention.
+
+### Durable handoff objects
+
+| Object | Contract |
+|---|---|
+| Task Brief | Drafts are editable with hash-based optimistic concurrency. Publishing creates an immutable revision; an already queued run retains its snapshotted `brief_id`. |
+| ContextRef | Immutable manifest metadata identifying one authorized source, why it was selected, delivery mode, provenance, trust level, size, and optional hash. File content is resolved only on demand. |
+| Task relation | First-class `parent`, `blocks`, `reviews`, `related`, or `supersedes` edge. Live edges are unique and cycle-checked under the write transaction. |
+| Wake request | Durable at-least-once scheduling intent with a dedupe key, claim lease, retry/backoff, coalescing, and dead-letter state. It carries only a bounded delta. |
+| Task comment | Immutable Markdown plus server-derived author and monotonically increasing task-local sequence. Machine mentions exist only in structured metadata. |
+| Work Product | Immutable output reference tied to its producer task/run and optional acceptance criterion. Verification appends an event instead of rewriting the producer's claim. |
+| ExecutionEnvelope | Compact run assignment containing Brief identity, required outcomes, ContextRef manifest, capability contract, wake delta, and trace IDs. |
+
+Migrations 0007–0010 are forward-only. Store startup upgrades an existing 0006 database,
+creates one canonical synthetic Published Brief for each legacy task, reconstructs missing
+parent relations, and can repeat both backfills without creating duplicates. New parent
+writes update the compatibility `parent_task_id` projection and first-class `PARENT` edge
+in one transaction; startup rejects projection drift, multiple live parents, and
+`PARENT`/`BLOCKS` cycles before scheduling work.
+
+### Dispatch and result flow
+
+1. Create a root task with a complete `brief`, or save it with `publish_brief=false` and
+   `auto_start=false`. A structured draft cannot be submitted until a valid revision is
+   published.
+2. Draft publication freezes the Brief and ContextRefs. Moving a draft task to `queued`
+   atomically creates its assignment wake.
+3. The scheduler claims a wake, derives or finds exactly one runnable run, binds the wake
+   to it, and atomically claims the run with a lease and monotonically increasing fencing
+   token.
+4. The executor creates a fresh role session and renders a prompt capped at 32 KiB by
+   default and 64 KiB absolutely. The prompt has manifest summaries but no unselected
+   repository body, upstream input, or role transcript.
+5. The Agent lists metadata and reads only authorized ContextRefs. Every content read can
+   append a `context_ref_read` event. Workspace paths are canonicalized, escaping
+   symlinks are rejected, secret-like inline content is blocked, and a URL never grants
+   ambient network authority.
+6. `delegate_task` atomically creates the child, its Published Brief and ContextRefs,
+   parent/blocker relations, audit events, and assignment wake. The operation ID makes a
+   lost-response retry safe.
+7. Comments wake an owner with an ordered, coalesced delta. Structured mentions create
+   notice-only wakes but never change the task owner or run lease. Raw `@Name` text does
+   not produce a machine wake, and task mentions cannot cross the orchestration tree.
+   A body larger than 65,536 UTF-8 bytes is stored as a content-addressed Markdown
+   artifact and the comment contains only its immutable Work Product reference. A
+   secret-shaped body is rejected before the artifact write.
+8. A parent waiting for children, a blocked task, or a suspended gate releases execution
+   authority. Child completion, resolution of all successful blockers, or gate resolution
+   creates the durable wake that resumes work; no model busy-polling is needed. A canceled
+   blocker remains unresolved and opens attention for replacement or removal.
+9. The Agent registers immutable Work Products, then calls `complete_task` with criterion
+   results and remaining risks, or `fail_task`. Required deliverables and criteria are
+   validated before run/task/result events commit together. Parent wakes contain only
+   bounded result summaries and references, never child transcripts.
+
+The run-bound tool surface is `get_task_context`, `list_context_refs`,
+`read_context_ref`, `delegate_task`, `post_task_comment`, `list_task_comments`,
+`add_task_blockers`, `remove_task_blocker`, `create_work_product`, `complete_task`, and
+`fail_task`. The runtime supplies task/run/lease/fencing identity; the model cannot choose
+another principal. Compatibility tools `spawn_agent`, `wait_agent`, and `cancel_agent`
+remain available subject to profile and rollout policy. Legacy spawn creates a minimal
+Brief and emits `legacy_delegation_used`; it never restores raw upstream prompt copying.
+
+### Communication policy and runtime settings
+
+Published Profile schema v2 contains `communication_policy`: delegation permission,
+allowed child roles, required Brief fields, ContextRef types and limits, transcript
+reference policy, comment/mention permissions, relation permissions, and result contract.
+Schema v1 profiles receive conservative defaults at load time. Built-ins remain immutable;
+clone one before changing policy.
+
+The default deployment is Stage C: structured handoff is enabled for new explicit Briefs,
+it is not yet mandatory for every Agent-created child, and the legacy wrapper remains
+enabled. Configure it in **Settings → Agent communication** or with
+`GET/PUT /v1/orchestration/handoff-settings`.
+
+| Setting | Default | Valid range or behavior |
+|---|---:|---|
+| `structured_handoff_enabled` | `true` | Enables structured root-task execution and compact envelopes. |
+| `structured_handoff_required_for_new_tasks` | `false` | Rejects child delegation without a complete Brief; cannot be true while structured handoff is disabled. |
+| `legacy_spawn_agent_enabled` | `true` | Retains the compatibility adapter during rollout. |
+| `default_context_token_budget` | `8000` | 0–1,000,000, intersected with the Profile limit. |
+| `max_context_refs` | `50` | 0–1,000, intersected with the Profile limit. |
+| `max_inline_bytes_per_ref` | `8192` | 0–65,536; oversized excerpts downgrade to on-demand. |
+| `max_inline_bytes_total` | `32768` | 0–65,536 across initial excerpts. |
+| `max_comment_batch` | `100` | 1–1,000 ordered comments per delta. |
+| `wake_coalesce_window_ms` | `1000` | 0–60,000; zero disables time-window coalescing. |
+| `wake_max_attempts` | `5` | 1–100 delivery attempts before dead-letter. |
+| `wake_backoff_seconds` | `1` | 1–3,600 exponential-backoff base, capped at five minutes. |
+| `context_read_audit_enabled` | `true` | Appends content-read audit events. |
+| `transcript_sharing_default` | `false` | High-risk compatibility preference; the current initial-prompt path still never injects ambient transcripts. |
+
+Setting updates are validated, persisted in manager preferences, and applied live to the
+context resolver, comment batching/coalescing, and wake retry policy. Health includes the
+effective settings and the complete content-free metric contract:
+`orchestration_handoff_initial_prompt_bytes`,
+`orchestration_handoff_context_refs`,
+`orchestration_handoff_context_tokens_estimated`,
+`orchestration_context_reads_total`,
+`orchestration_context_bytes_read_total`, `orchestration_wakes_pending`,
+`orchestration_wake_coalesced_total`,
+`orchestration_wake_delivery_latency_seconds`,
+`orchestration_wake_failures_total`,
+`orchestration_task_blocked_duration_seconds`,
+`orchestration_work_products_total`,
+`orchestration_legacy_delegation_total`, and
+`orchestration_transcript_cross_role_reads_total`. A fresh process exposes zero values
+instead of omitting never-observed metrics.
+
+The task detail UI loads Briefs, Context Manifest, dependencies, Communication, Work
+Products, and Wake diagnostics only when their tabs are opened. It does not load a
+transcript or ContextRef body by default. Failed wakes can be retried explicitly after
+their cause is corrected.
 
 ## Durable truth and recovery
 
@@ -116,15 +257,18 @@ action from records in `orchestration.db`.
    and its run id, attempt, fencing token, session, gate, and pending-call list. The
    former single-phase run/child Gate entry points fail closed and cannot release a
    lease without this protocol.
-7. Before recovery, the service acquires and heartbeats the single-active scheduler
-   lease. Its epoch is monotonic across graceful release, and every ordinary write
+7. Startup first acquires and heartbeats the single-active scheduler lease so a canceled
+   recovery cannot overlap a replacement process. Event-chain verification is the first
+   recovery action under that fence, and no scheduler work starts before it succeeds.
+   The lease epoch is monotonic across graceful release, and every ordinary write
    verifies owner, token, epoch, and expiry inside the same `BEGIN IMMEDIATE`
    transaction as the mutation. Expired leaders cannot resurrect their epoch. Shutdown
    keeps heartbeating while cancellation-resistant filesystem/database threads drain,
    then releases leadership. A stopped store is tombstoned while retaining its stale
    scheduler identity, so a delayed API worker or accidental reuse cannot fall back to
    unfenced writes. Restart creates a new service/store instance. At startup, the full
-   event hash chain and exact migration prefix are verified, expired claims are reaped,
+   exact migration prefix is verified, expired run leases and wake claims are reaped,
+   prepared gates are reconciled, relation projections and cycles are checked,
    interrupted workspace deliveries and pending candidate commits are
    recovered, and runtime ledgers are reconstructed from durable task/run state. Each
    runtime-tree projection reads its task hierarchy, runs, immutable plan topology, and
@@ -159,6 +303,12 @@ states this verification scope and tip hash explicitly. Evidence also stores con
 hashes, actor, task/plan/node/run linkage, and timestamps. Plans, nodes,
 edges, and evidence are append-only at the database level.
 
+Each event API row also exposes a content-free observability projection: `task_id`,
+`run_id`, Brief id/revision, wake id/reason, ContextRef id, relation id, Work Product id,
+`correlation_id`, `causation_id`, actor, timestamp, and the hash-chain fields. Missing
+resource identities remain explicit nulls; raw comment, context, artifact, transcript,
+and secret bodies are never copied into these trace fields.
+
 Published Gate history is ordered by `published_at`, not by an internal preparation's
 creation time. Its dedicated endpoint uses bounded SQL `LIMIT/OFFSET` pages without an
 artificial 10,001-row completion boundary, so `has_more=false` means that the requested
@@ -180,20 +330,23 @@ attempt to:
 - a logical work unit and attempt number;
 - a parent runtime and dependency runtimes;
 - a profile id/version/content hash;
-- a reserved model/tool/token/wall-time budget;
+- model/tool/token/wall-time usage accounting (with an optional finite budget);
 - an effective permission set; and
 - an immutable metadata snapshot.
 
 Default hard rails are depth 3, concurrency 8, eight direct children per Agent, 64 logical
-work units per task tree, and three attempts per work unit. The default root budget is 20
-model calls, 100 tool calls, one million reported tokens, and 7,200 active seconds; task
-input may choose smaller limits.
+work units per task tree, and three attempts per work unit. The desktop product starts the
+service with `runtime_budget_mode=unlimited`: model calls, tool calls, reported tokens,
+profile iterations, and run wall time are recorded but do not terminate a run. Historical
+task budget values remain durable audit data and are ignored while this mode is active.
+Finite-budget behavior remains available to tests and embedders through
+`OrchestrationService(..., enforce_runtime_budgets=True)`.
 
 Child permissions are always the intersection of parent ceiling and child request.
 Requested-but-denied capabilities are recorded. The executable child spec contains only
 the effective grant, preventing an executor from accidentally treating the request as
-authority. A parent must explicitly have `can_delegate`, and a child cannot reserve more
-than the parent's remaining budget.
+authority. A parent must explicitly have `can_delegate`. In finite-budget compatibility
+mode, a child also cannot reserve more than the parent's remaining budget.
 
 Dynamic delegation uses three run tools:
 
@@ -761,8 +914,10 @@ $task = Invoke-RestMethod `
 This production preset requires both independent review and independent testing. The
 example spells out `require_review=true` and `require_tests=true` for readability, but
 omitting them (or sending `false`) cannot weaken the preset's required verifier roles.
-The server also verifies that the task budget can admit all seven template nodes before
-creating the task, so an undersized request fails without leaving a partial workflow.
+The `budget` object in this example is retained for compatibility and audit replay, but
+the desktop product does not enforce it while `runtime_budget_mode=unlimited`. An embedder
+that explicitly enables finite budgets verifies that the task budget can admit all seven
+template nodes before creating the task.
 
 Do not put top-level `requested_model` in the same request: it means "use one runtime"
 and is therefore incompatible with a role-based mixed preset. Omitting
@@ -955,6 +1110,16 @@ The result schema is mandatory. Every runtime must return `summary`, overall
 `pass|fail|unknown`, per-criterion verdicts, touched files, checks, and remaining risks.
 Reviewer, Tester, Evaluator, and Scorer results are mapped into formal verdict evidence;
 a missing or malformed verdict fails the node and is never treated as approval.
+This provider-neutral Subscription Agent payload is stored as `structured_result`. It is
+not a `complete_task` submission: only an explicit `handoff_result` (or the legacy
+`criterion_results` plus `work_products` shape) enters atomic Brief/deliverable
+settlement. Keeping those contracts distinct prevents criterion text from being
+misread as a missing Brief criterion ID.
+
+The task wizard defaults writable tasks to an `implementation_patch` deliverable and
+read-only tasks to an `artifact` report. The backend rejects a read-only Brief that
+requires a patch, commit, branch, or pull request instead of allowing an impossible
+contract to fail after model execution.
 
 ### 6. Recovery, cancellation, and audit behavior
 
@@ -986,7 +1151,38 @@ GET /v1/orchestration/blobs/<sha256>
 
 Use the task, run, transcript, evidence, and event endpoints from the REST section below
 to audit the full chain. Subscription usage is reported into the same model-call,
-tool-call, token, and wall-time budget ledger as native runs.
+tool-call, token, and wall-time usage ledger as native runs; in the desktop product this
+ledger is observational rather than an interruption ceiling.
+
+### Live per-run Agent activity
+
+Clicking **Progress** beside a Run opens a live inspector. The GUI loads the newest
+bounded page and then polls incremental rows every 1.5 seconds, so a long subscription
+turn is visible before its final `turn/completed` event. Rows with the same provider
+source identity are grouped into an expandable step: a tool's start and completion form
+one card, and streamed reasoning-summary chunks form one readable summary. The inspector
+also shows the latest cumulative input, cached-input, output, and total token counts.
+
+This stream is an operator diagnostic, not chain-of-thought storage. Codex contributes
+only its explicit `item/reasoning/summaryTextDelta` summary channel. Native
+`REASONING_DELTA` text, vendor thinking blocks, raw tool results, command stdout/stderr,
+patch bodies, and file contents are never written to `orch_run_activity`. Native runs
+may show a content-free “model is reasoning” lifecycle marker while reasoning is in
+progress, but never its text. Tool rows may
+contain bounded, credential-redacted metadata such as the tool name, command preview,
+working directory, duration, exit code, and terminal status. Every append requires the
+current lease and fencing token, is idempotent by `(run_id, event_key)`, is immutable at
+the database layer, and is capped at 5,000 retained rows plus one truncation marker.
+
+The endpoint supports both newest-page and forward-delta reads:
+
+```text
+GET /v1/orchestration/tasks/<task-id>/runs/<run-id>/activity?latest=true&limit=500
+GET /v1/orchestration/tasks/<task-id>/runs/<run-id>/activity?after_sequence=<cursor>&latest=false&limit=500
+```
+
+The response carries `privacy.reasoning=provider_summary_only` and
+`privacy.tool_output=metadata_only` so other clients do not mistake it for a raw trace.
 
 ### 7. Kimi Code compliance boundary
 
@@ -1039,13 +1235,26 @@ Idempotency-Key: release-audit-2026-08-03
   "objective": "Inspect the repository, implement the repair, independently review and test it, then formally accept the result.",
   "domain": "code",
   "workspace": "C:/work/repository",
+  "brief": {
+    "title": "Audit and repair release candidate",
+    "objective": "Inspect the repository, implement the repair, independently review and test it, then formally accept the result.",
+    "background": "A release candidate needs an isolated implementation and independent verification.",
+    "scope": {"whole_task": true, "reason": "The release-candidate workspace is the explicit task subject."},
+    "instructions": ["Locate the regression", "Implement the smallest repair", "Review and test the final candidate"],
+    "constraints": ["Do not modify generated files", "Do not publish externally"],
+    "non_goals": ["Do not redesign unrelated modules"],
+    "acceptance_criteria": [
+      {"id": "AC-01", "text": "The regression test fails before and passes after the repair", "required": true},
+      {"id": "AC-02", "text": "Reviewer finds no blocking issue", "required": true},
+      {"id": "AC-03", "text": "The complete targeted test suite passes", "required": true}
+    ],
+    "deliverables": [
+      {"id": "DEL-01", "kind": "implementation_patch", "title": "Bounded repair", "required": true},
+      {"id": "DEL-02", "kind": "test_result", "title": "Verification evidence", "required": true}
+    ],
+    "result_contract": {"schema_id": "implementation_result_v1"}
+  },
   "runtime_preset_id": "production-codex-led-mixed-v1",
-  "acceptance_criteria": [
-    "The regression test fails before and passes after the repair",
-    "Reviewer finds no blocking issue",
-    "The complete targeted test suite passes"
-  ],
-  "constraints": ["Do not modify generated files", "Do not publish externally"],
   "require_review": true,
   "require_tests": true,
   "max_parallel_runs": 4,
@@ -1092,15 +1301,29 @@ X-OpenWorker-Token: <launch-token>
 }
 ```
 
-Useful read endpoints are:
+Useful control-plane endpoints are:
 
 - `GET /v1/orchestration/tasks?status=running&limit=100&offset=0`
 - `GET /v1/orchestration/tasks/<task-id>`
+- `GET /v1/orchestration/tasks/<task-id>/heartbeat-context?after_sequence=0`
+- `GET /v1/orchestration/tasks/<task-id>/briefs`
+- `POST /v1/orchestration/tasks/<task-id>/briefs` and `POST .../<revision>/publish`
+- `GET /v1/orchestration/tasks/<task-id>/context-refs?limit=100&offset=0`
+- `GET /v1/orchestration/context-refs/<ref-id>/content`
+- `GET/POST /v1/orchestration/tasks/<task-id>/relations`
+- `PUT /v1/orchestration/tasks/<task-id>/blockers`
+- `GET/POST /v1/orchestration/tasks/<task-id>/comments`
+- `GET/POST /v1/orchestration/tasks/<task-id>/work-products`
+- `GET /v1/orchestration/tasks/<task-id>/wakes`
+- `GET /v1/orchestration/wakes?status=failed&limit=100&offset=0`
+- `POST /v1/orchestration/wakes/<wake-id>/retry`
+- `GET/PUT /v1/orchestration/handoff-settings`
 - `GET /v1/orchestration/tasks/by-idempotency-key/<key>`
 - `GET /v1/orchestration/tasks/by-idempotency-key?idempotency_key=<opaque-key>`
 - `GET /v1/orchestration/tasks/<task-id>/events?latest=true&limit=1000`
 - `GET /v1/orchestration/tasks/<task-id>/runs?limit=200&offset=0`
 - `GET /v1/orchestration/tasks/<task-id>/evidence?limit=200&offset=0`
+- `GET /v1/orchestration/tasks/<task-id>/runs/<run-id>/activity?latest=true&limit=500`
 - `GET /v1/orchestration/tasks/<task-id>/runs/<run-id>/transcript`
 - `GET /v1/health` or `GET /v1/orchestration/health` (`503` for a stale/failed
   scheduler, lost leader, stopped outbox, or any dead letter)
@@ -1120,6 +1343,10 @@ Task creation requires either the `Idempotency-Key` header or an equivalent body
 `idempotency_key`; a lost HTTP response can be recovered by querying that key. Draft
 profile and policy updates use ETags. Send the draft's exact `etag` in `If-Match`
 when saving or publishing; stale editors receive a conflict rather than silently winning.
+Structured-handoff mutations likewise accept `Idempotency-Key` or their typed body
+operation field. A completed create command returns `200` on replay (`201` on first
+creation), and reusing a key with different input returns `409`. Task Brief draft updates
+and publication require the loaded content hash in `If-Match`.
 
 Dead-letter requeue is a formal audited command. It requires an `Idempotency-Key`
 header plus non-empty operator attribution and justification:
@@ -1174,6 +1401,20 @@ cd surfaces/gui
 npm test
 npm run build
 ```
+
+For a focused TCHP change, run this shorter gate first:
+
+```shell
+python -m pytest tests/test_orchestration_handoff.py tests/test_orchestration_handoff_performance.py tests/test_orchestration_migrations.py
+cd surfaces/gui
+npm test -- --run src/features/orchestration/HandoffPanels.test.tsx src/features/orchestration/Settings.test.tsx src/features/orchestration/OrchestrationSurface.test.tsx
+npm run build
+```
+
+The implementation-to-requirement evidence is maintained in
+[`docs/specifications/structured-handoff-acceptance-matrix.md`](specifications/structured-handoff-acceptance-matrix.md).
+The executable Agent procedure is
+[`orchestration-handoff`](../.agents/skills/orchestration-handoff/SKILL.md).
 
 For any failed run, inspect task detail in this order: open gate, latest run attempt,
 evidence artifact hash, event-chain verification, then workspace recovery journal. Do not

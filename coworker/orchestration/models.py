@@ -13,6 +13,29 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 
+from .handoff_models import (
+    BriefStatus,
+    ContextDeliveryMode,
+    ContextRefDraft,
+    ContextRefRecord,
+    ContextRefType,
+    ContextRequirement,
+    DelegationRequest,
+    DelegationResult,
+    ExecutionEnvelope,
+    HandoffValidationError,
+    TaskBriefDraft,
+    TaskBriefRecord,
+    TaskCommentRecord,
+    TaskRelationRecord,
+    TaskRelationType,
+    WakeReason,
+    WakeRequestRecord,
+    WakeStatus,
+    WorkProductKind,
+    WorkProductRecord,
+)
+
 
 class _StrEnum(str, Enum):
     def __str__(self) -> str:
@@ -229,6 +252,7 @@ class TaskRecord:
     version: int
     created_at: datetime
     updated_at: datetime
+    active_brief_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +376,7 @@ class RunRecord:
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
+    brief_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -370,6 +395,22 @@ class LeaseRecord:
 class RunClaim:
     run: RunRecord
     lease: LeaseRecord
+
+
+@dataclass(frozen=True)
+class RunActivityRecord:
+    sequence: int
+    id: str
+    task_id: str
+    run_id: str
+    event_key: str
+    source_id: str
+    kind: str
+    status: str
+    title: str
+    summary: str
+    detail: JsonMap
+    created_at: datetime
 
 
 @dataclass(frozen=True)

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ..config import load_config
 from ..permissions import Mode
@@ -131,14 +135,94 @@ def _ensure_ca_bundle() -> None:
         pass
 
 
-def _ensure_api_token(port: int) -> Path | None:
-    """Set launch auth; standalone/dev tokens use a user-only, port-specific file."""
+@dataclass(frozen=True, slots=True)
+class _ApiTokenFile:
+    path: Path
+    token: str
+    created: bool
+
+    def release(self) -> None:
+        """Remove only the token file created by this process and still owned by it."""
+
+        if not self.created:
+            return
+        try:
+            current = self.path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if secrets.compare_digest(current, self.token):
+            self.path.unlink(missing_ok=True)
+
+
+def _valid_sidecar_token(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _read_sidecar_token(path: Path) -> str:
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"could not read sidecar token file: {path}") from exc
+    if not _valid_sidecar_token(token):
+        raise RuntimeError(
+            f"invalid sidecar token file: {path}; remove it only after all "
+            "OpenWorker server processes have stopped"
+        )
+    return token
+
+
+def _ensure_api_token(port: int) -> _ApiTokenFile | None:
+    """Set launch auth without overwriting another process's port token."""
+
     if os.environ.get("COWORKER_API_TOKEN"):
         return None  # Tauri supplied an in-memory token; never persist it.
+    path = state_dir() / f"sidecar-{port}.token"
+    if path.exists():
+        token = _read_sidecar_token(path)
+        os.environ["COWORKER_API_TOKEN"] = token
+        return _ApiTokenFile(path=path, token=token, created=False)
+
     token = secrets.token_hex(32)
+    candidate = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.candidate"
+    )
+    created = False
+    try:
+        write_private_text(candidate, token + "\n")
+        try:
+            # Linking a complete private candidate is an atomic create-if-absent.
+            # If two launchers race, exactly one publishes its token; the loser
+            # reads and reuses that winner instead of replacing it.
+            os.link(candidate, path)
+            created = True
+        except FileExistsError:
+            token = _read_sidecar_token(path)
+    finally:
+        candidate.unlink(missing_ok=True)
     os.environ["COWORKER_API_TOKEN"] = token
-    return write_private_text(
-        state_dir() / f"sidecar-{port}.token", token + "\n"
+    return _ApiTokenFile(path=path, token=token, created=created)
+
+
+def _server_already_running(host: str, port: int, token: str) -> bool:
+    """Return whether this exact loopback endpoint is already healthy."""
+
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+    if ":" in probe_host and not probe_host.startswith("["):
+        probe_host = f"[{probe_host}]"
+    request = Request(
+        f"http://{probe_host}:{port}/v1/health",
+        headers={"X-OpenWorker-Token": token},
+    )
+    try:
+        with urlopen(request, timeout=0.75) as response:  # noqa: S310 - CLI host
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("status") == "ok"
+        and isinstance(payload.get("orchestration"), dict)
+        and payload["orchestration"].get("ready") is True
     )
 
 
@@ -162,8 +246,16 @@ def main(argv=None) -> None:
     # a random free port (to coexist with a hand-run server on 8765), so the
     # managed-connect redirect must follow the real port, not the 8765 default.
     os.environ["COWORKER_PORT"] = str(args.port)
-    generated_token_path = _ensure_api_token(args.port)
+    token_file = _ensure_api_token(args.port)
     try:
+        if token_file is not None and _server_already_running(
+            args.host, args.port, token_file.token
+        ):
+            print(
+                f"OpenWorker server is already running on {args.host}:{args.port}.",
+                file=sys.stderr,
+            )
+            return
         import uvicorn
 
         _exit_when_orphaned()
@@ -172,8 +264,8 @@ def main(argv=None) -> None:
             app, host=args.host, port=args.port, ws_max_size=_WS_MAX_FRAME_BYTES
         )
     finally:
-        if generated_token_path is not None:
-            generated_token_path.unlink(missing_ok=True)
+        if token_file is not None:
+            token_file.release()
             os.environ.pop("COWORKER_API_TOKEN", None)
 
 

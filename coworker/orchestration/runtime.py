@@ -23,6 +23,7 @@ DEFAULT_MODEL_CALL_LIMIT = 20
 DEFAULT_TOOL_CALL_LIMIT = 100
 DEFAULT_REPORTED_TOKEN_LIMIT = 1_000_000
 DEFAULT_ACTIVE_SECONDS_LIMIT = 7_200
+UNLIMITED_BUDGET_VALUE = (1 << 63) - 1
 _RUNTIME_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MODE_RANK = {"discuss": 0, "plan": 0, "interactive": 1, "custom": 2, "auto": 3}
 
@@ -125,26 +126,47 @@ class RuntimeBudget:
             object.__setattr__(self, name, value)
 
     def __add__(self, other: "RuntimeBudget") -> "RuntimeBudget":
+        def add(left: int, right: int) -> int:
+            if left >= UNLIMITED_BUDGET_VALUE or right >= UNLIMITED_BUDGET_VALUE:
+                return UNLIMITED_BUDGET_VALUE
+            return min(UNLIMITED_BUDGET_VALUE, left + right)
+
         return RuntimeBudget(
-            self.model_calls + other.model_calls,
-            self.tool_calls + other.tool_calls,
-            self.tokens + other.tokens,
-            self.wall_seconds + other.wall_seconds,
+            add(self.model_calls, other.model_calls),
+            add(self.tool_calls, other.tool_calls),
+            add(self.tokens, other.tokens),
+            add(self.wall_seconds, other.wall_seconds),
         )
 
     def __sub__(self, other: "RuntimeBudget") -> "RuntimeBudget":
         if not other.fits_within(self):
             raise BudgetExceededError("budget subtraction would become negative")
+
+        def subtract(ceiling: int, used: int) -> int:
+            # Unlimited ceilings remain unlimited after usage and reservations. This
+            # keeps exact usage accounting without manufacturing an interruption cap.
+            if ceiling >= UNLIMITED_BUDGET_VALUE:
+                return UNLIMITED_BUDGET_VALUE
+            return ceiling - used
+
         return RuntimeBudget(
-            self.model_calls - other.model_calls,
-            self.tool_calls - other.tool_calls,
-            self.tokens - other.tokens,
-            self.wall_seconds - other.wall_seconds,
+            subtract(self.model_calls, other.model_calls),
+            subtract(self.tool_calls, other.tool_calls),
+            subtract(self.tokens, other.tokens),
+            subtract(self.wall_seconds, other.wall_seconds),
         )
 
     def fits_within(self, ceiling: "RuntimeBudget") -> bool:
         return all(
-            getattr(self, name) <= getattr(ceiling, name)
+            getattr(ceiling, name) >= UNLIMITED_BUDGET_VALUE
+            or getattr(self, name) <= getattr(ceiling, name)
+            for name in ("model_calls", "tool_calls", "tokens", "wall_seconds")
+        )
+
+    @property
+    def is_unlimited(self) -> bool:
+        return all(
+            getattr(self, name) >= UNLIMITED_BUDGET_VALUE
             for name in ("model_calls", "tool_calls", "tokens", "wall_seconds")
         )
 
@@ -174,6 +196,12 @@ DEFAULT_TASK_BUDGET = RuntimeBudget(
     wall_seconds=DEFAULT_ACTIVE_SECONDS_LIMIT,
 )
 DEFAULT_RUN_BUDGET = DEFAULT_TASK_BUDGET
+UNLIMITED_RUNTIME_BUDGET = RuntimeBudget(
+    model_calls=UNLIMITED_BUDGET_VALUE,
+    tool_calls=UNLIMITED_BUDGET_VALUE,
+    tokens=UNLIMITED_BUDGET_VALUE,
+    wall_seconds=UNLIMITED_BUDGET_VALUE,
+)
 
 
 @dataclass(frozen=True, slots=True)

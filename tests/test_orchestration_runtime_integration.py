@@ -62,6 +62,343 @@ async def wait_until(predicate, timeout: float = 10.0):
     raise AssertionError("condition not reached")
 
 
+class StructuredOutcomeExecutor:
+    def __init__(self, output: dict):
+        self.output = output
+
+    async def execute(self, context):
+        return ExecutionOutcome(
+            status="succeeded",
+            session_id=context.claim.run.session_id or "structured-test-session",
+            output=self.output,
+            usage={"model_calls": 1, "tokens": 100},
+        )
+
+
+class WorkspaceCapturingExecutor(StructuredOutcomeExecutor):
+    def __init__(self, output: dict):
+        super().__init__(output)
+        self.workspaces: list[Path | None] = []
+
+    async def execute(self, context):
+        self.workspaces.append(context.workspace)
+        return await super().execute(context)
+
+
+class WorkProductHandoffExecutor:
+    def __init__(self) -> None:
+        self.reviewer_products: list[dict] = []
+
+    async def execute(self, context):
+        if context.node.key == "execute":
+            completion = {
+                "summary": "The candidate report is complete.",
+                "criterion_results": {"criterion-1": "pass"},
+                "work_products": [
+                    {
+                        "deliverable_id": "deliverable-1",
+                        "kind": "artifact",
+                        "title": "Candidate report",
+                        "summary": "Immutable report body for isolated review.",
+                    }
+                ],
+                "remaining_risks": [],
+            }
+            return ExecutionOutcome(
+                status="succeeded",
+                session_id=context.claim.run.session_id or "execute-session",
+                output={"summary": completion["summary"], "handoff_result": completion},
+            )
+        assert context.execution_envelope is not None
+        self.reviewer_products = list(
+            context.execution_envelope.context_manifest.get("work_products") or ()
+        )
+        criteria = {
+            criterion: "pass" for criterion in context.task.acceptance_criteria
+        }
+        return ExecutionOutcome(
+            status="succeeded",
+            session_id=context.claim.run.session_id or "review-session",
+            output={
+                "summary": "The published Work Product was reviewed.",
+                "verdict": {
+                    "status": "pass",
+                    "summary": "The published Work Product was reviewed.",
+                    "criteria": criteria,
+                },
+            },
+        )
+
+
+def _structured_result_task_request(*, idempotency_key: str) -> dict:
+    return {
+        "idempotency_key": idempotency_key,
+        "title": "Read-only structured result",
+        "objective": "Produce a read-only result",
+        "domain": "knowledge",
+        "read_only": True,
+        "acceptance_criteria": ["read only"],
+        "complexity_factors": {
+            "scope": 0,
+            "uncertainty": 0,
+            "dependencies": 0,
+            "side_effects": 0,
+            "parallelism": 0,
+            "verification": 0,
+        },
+        "plan": {
+            "nodes": [
+                {
+                    "key": "understand",
+                    "kind": "agent",
+                    "agent": "orchestrator",
+                }
+            ],
+            "edges": [],
+        },
+        "brief": {
+            "title": "Read-only structured result",
+            "objective": "Produce a read-only result",
+            "scope": {
+                "whole_task": True,
+                "reason": "The objective is the complete bounded scope.",
+            },
+            "instructions": ["Return a concise result without changing state."],
+            "constraints": ["Do not modify files."],
+            "acceptance_criteria": [
+                {
+                    "id": "criterion-1",
+                    "text": "read only",
+                    "required": True,
+                }
+            ],
+            "deliverables": [
+                {
+                    "id": "deliverable-1",
+                    "kind": "artifact",
+                    "title": "Read-only analysis report",
+                    "required": True,
+                }
+            ],
+            "result_contract": {"schema_id": "analysis_result_v1"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_only_workspace_skips_snapshot_and_reports_pre_agent_progress(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "large-read-only-workspace"
+    workspace.mkdir()
+    (workspace / "dbt_project.yml").write_text("name: example\n", encoding="utf-8")
+    provider_result = {
+        "summary": "The workspace was inspected without mutation.",
+        "status": "pass",
+        "criteria": {"read only": "pass"},
+        "files_touched": [],
+        "checks": ["Read-only workspace mounted."],
+        "remaining_risks": [],
+    }
+    executor = WorkspaceCapturingExecutor(
+        {"summary": provider_result["summary"], "structured_result": provider_result}
+    )
+    service = OrchestrationService(
+        FakeManager(workspace),
+        tmp_path / "read-only-direct-workspace",
+        executor=executor,
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        def unexpected_snapshot(*_args, **_kwargs):
+            raise AssertionError("read-only execution must not copy the workspace")
+
+        monkeypatch.setattr(service.workspaces, "prepare", unexpected_snapshot)
+        request = _structured_result_task_request(
+            idempotency_key="read-only-direct-workspace"
+        )
+        request.update({"domain": "code", "workspace": str(workspace)})
+        task_id = service.create_task(request)["id"]
+
+        run = await wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in service.store.list_runs(task_id)
+                    if item.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                ),
+                None,
+            )
+        )
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert executor.workspaces == [workspace.resolve()]
+        activity = service.store.list_run_activity(task_id, run.id)
+        assert [item.title for item in activity[:3]] == [
+            "Read-only workspace ready",
+            "Preparing execution subject",
+            "Execution subject ready",
+        ]
+        assert activity[0].detail == {"isolation": "read_only_source"}
+        assert not (
+            service.workspaces.base_dir
+            / "snapshots"
+            / service._task_snapshot_id(task_id)
+        ).exists()
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscription_structured_result_is_not_mistaken_for_complete_task(
+    tmp_path,
+):
+    provider_result = {
+        "summary": "The read-only boundary is understood.",
+        "status": "pass",
+        "criteria": {"read only": "pass"},
+        "files_touched": [],
+        "checks": ["No mutation tools were used."],
+        "remaining_risks": [],
+    }
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "subscription-structured",
+        executor=StructuredOutcomeExecutor(
+            {"summary": provider_result["summary"], "structured_result": provider_result}
+        ),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            _structured_result_task_request(
+                idempotency_key="subscription-structured-result"
+            )
+        )["id"]
+
+        run = await wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in service.store.list_runs(task_id)
+                    if item.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                ),
+                None,
+            )
+        )
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert run.output["structured_result"] == provider_result
+        assert "result" not in run.output
+        assert service.store.list_work_products(task_id) == ()
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_explicit_handoff_result_still_uses_atomic_structured_settlement(
+    tmp_path,
+):
+    completion = {
+        "summary": "The explicit handoff is complete.",
+        "criterion_results": {"criterion-1": "pass"},
+        "work_products": [
+            {
+                "deliverable_id": "deliverable-1",
+                "kind": "artifact",
+                "title": "Read-only analysis report",
+                "summary": "A bounded immutable result.",
+            }
+        ],
+        "remaining_risks": [],
+    }
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "explicit-handoff",
+        executor=StructuredOutcomeExecutor(
+            {
+                "summary": completion["summary"],
+                "structured_result": completion,
+                "handoff_result": completion,
+            }
+        ),
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            _structured_result_task_request(idempotency_key="explicit-handoff-result")
+        )["id"]
+
+        run = await wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in service.store.list_runs(task_id)
+                    if item.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                ),
+                None,
+            )
+        )
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert run.output["result"]["criterion_results"] == {
+            "criterion-1": "pass"
+        }
+        products = service.store.list_work_products(task_id)
+        assert len(products) == 1
+        assert products[0].metadata["deliverable_id"] == "deliverable-1"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_downstream_verifier_envelope_contains_upstream_work_product(tmp_path):
+    executor = WorkProductHandoffExecutor()
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "downstream-work-product",
+        executor=executor,
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        request = _structured_result_task_request(
+            idempotency_key="downstream-work-product"
+        )
+        request["plan"] = {
+            "nodes": [
+                {"key": "execute", "kind": "execute", "agent": "worker"},
+                {"key": "review", "kind": "review", "agent": "reviewer"},
+            ],
+            "edges": [{"from": "execute", "to": "review"}],
+        }
+        task_id = service.create_task(request)["id"]
+
+        await wait_until(
+            lambda: next(
+                (
+                    item
+                    for item in service.store.list_runs(task_id)
+                    if item.node_key == "review" and item.status is RunStatus.SUCCEEDED
+                ),
+                None,
+            )
+        )
+
+        assert len(executor.reviewer_products) == 1
+        assert executor.reviewer_products[0]["title"] == "Candidate report"
+        assert (
+            executor.reviewer_products[0]["summary"]
+            == "Immutable report body for isolated review."
+        )
+    finally:
+        await service.stop()
+
+
 def _start_claimed_parent(
     service: OrchestrationService,
     *,
@@ -268,6 +605,14 @@ def test_child_delegation_is_stable_across_lost_attempts_and_keeps_logical_owner
         assert replay["replayed"] is True
         assert replay["parent_run_id"] == claim.run.id
         child = service.store.get_task(child_id)
+        legacy_brief = service.store.get_active_brief(child_id)
+        assert legacy_brief.status.value == "published"
+        assert legacy_brief.objective == "stable delegated work"
+        assert any(
+            event.event_type == "legacy_delegation_used"
+            for event in service.store.list_events(task_id=child_id)
+        )
+        assert "upstream_context" not in child.input
         runtime_meta = dict(child.input["_runtime"])
         assert runtime_meta["parent_run_id"] == claim.run.id
         assert runtime_meta["parent_plan_id"] == retry.plan_id
@@ -607,6 +952,98 @@ class LeaseLossExecutor:
         self.interrupted.append(run_id)
 
 
+class CountingExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, _context):
+        self.calls += 1
+        raise AssertionError("required-context preflight must precede executor dispatch")
+
+
+@pytest.mark.asyncio
+async def test_required_context_preflight_reconciles_without_executor_call(tmp_path):
+    executor = CountingExecutor()
+    service = OrchestrationService(
+        FakeManager(), tmp_path / "required-context-data", executor=executor
+    )
+    try:
+        missing = "sha256:" + "f" * 64
+        task_id = service.create_task(
+            {
+                "idempotency_key": "required-context-preflight",
+                "objective": "Use required external evidence",
+                "domain": "knowledge",
+                "brief": {
+                    "title": "Required context preflight",
+                    "objective": "Use required external evidence",
+                    "scope": {"whole_task": True, "reason": "bounded test"},
+                    "instructions": ["Verify required context before execution"],
+                    "acceptance_criteria": [
+                        {
+                            "id": "AC-01",
+                            "text": "Missing evidence prevents dispatch",
+                            "required": True,
+                        }
+                    ],
+                    "deliverables": [
+                        {
+                            "id": "DEL-01",
+                            "kind": "test_result",
+                            "title": "Preflight result",
+                            "required": True,
+                        }
+                    ],
+                    "result_contract": {"schema_id": "preflight_v1"},
+                },
+                "context_refs": [
+                    {
+                        "requirement": "required",
+                        "ref_type": "artifact",
+                        "display_name": "Required missing artifact",
+                        "selection_reason": "Execution depends on this evidence",
+                        "locator": {"blob_uri": missing},
+                        "content_hash": missing,
+                        "delivery_mode": "on_demand",
+                    }
+                ],
+                "plan": {
+                    "nodes": [{"key": "execute", "agent": "worker"}],
+                    "edges": [],
+                },
+                "auto_start": False,
+            }
+        )["id"]
+        service.submit_task(task_id)
+        service._advance_task(task_id)
+        claim = service.store.claim_next_run(
+            "required-context-worker", command_id="claim-required-context"
+        )
+        assert claim is not None and claim.run.task_id == task_id
+
+        await service._execute_claim(claim)
+
+        assert executor.calls == 0
+        assert service.store.get_run(claim.run.id).status is RunStatus.FAILED
+        assert (
+            service.store.get_run(claim.run.id).error_kind
+            == "required_context_unavailable"
+        )
+        assert (
+            service.store.get_task(task_id).status
+            is TaskStatus.NEEDS_RECONCILIATION
+        )
+        verification_events = [
+            event
+            for event in service.store.list_events(task_id=task_id)
+            if event.event_type == "context_ref_verified"
+        ]
+        assert len(verification_events) == 1
+        assert verification_events[0].payload["available"] is False
+    finally:
+        service.store.close()
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_lease_conflict_interrupts_executor_and_quarantines_attempt(
     tmp_path,
@@ -667,6 +1104,79 @@ class ThreadAwareBlockingExecutor:
 
     def interrupt(self, run_id: str) -> None:
         self.interrupted.append(run_id)
+
+
+class PauseAwareBlockingExecutor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.run_id: str | None = None
+        self.interrupted: list[str] = []
+
+    async def execute(self, context):
+        self.loop = asyncio.get_running_loop()
+        self.run_id = context.claim.run.id
+        self.started.set()
+        await self.release.wait()
+        return ExecutionOutcome(
+            status="failed",
+            session_id=context.claim.run.session_id or "pause-test",
+            error_kind="agent_interrupted",
+            error_message="paused by operator",
+            usage={"model_calls": 1, "wall_seconds": 1},
+        )
+
+    def interrupt(self, run_id: str) -> None:
+        self.interrupted.append(run_id)
+        assert self.loop is not None
+        self.loop.call_soon_threadsafe(self.release.set)
+
+
+@pytest.mark.asyncio
+async def test_pause_interrupts_inflight_agent_without_canceling_task(tmp_path):
+    executor = PauseAwareBlockingExecutor()
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "pause-data",
+        executor=executor,
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "pause a running attempt and stop its process",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the Agent stops while the task stays resumable"],
+                "complexity_factors": {
+                    "scope": 1,
+                    "uncertainty": 1,
+                    "dependencies": 0,
+                    "side_effects": 0,
+                    "parallelism": 0,
+                    "verification": 1,
+                },
+                "plan": {
+                    "nodes": [{"key": "execute", "agent": "worker"}],
+                    "edges": [],
+                },
+            }
+        )["id"]
+        await asyncio.wait_for(executor.started.wait(), timeout=5)
+
+        paused = await asyncio.to_thread(service.pause_task, task_id)
+
+        assert paused.status is TaskStatus.PAUSED
+        await wait_until(
+            lambda: service.store.get_run(executor.run_id or "").status
+            is RunStatus.FAILED,
+            timeout=3,
+        )
+        assert executor.interrupted == [executor.run_id]
+        assert service.store.get_task(task_id).status is TaskStatus.PAUSED
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio
@@ -859,7 +1369,7 @@ async def test_parent_waits_for_unjoined_child_and_parent_run_is_auditable(tmp_p
 
         executor.release_child.set()
         await wait_until(
-            lambda: service.store.get_task(parent_id).status is TaskStatus.ARCHIVED,
+            lambda: service.store.get_task(parent_id).status is TaskStatus.COMPLETED,
             timeout=15,
         )
     finally:

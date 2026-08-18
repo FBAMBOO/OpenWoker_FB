@@ -13,6 +13,8 @@ from coworker.orchestration.models import (
     EvidenceKind,
     GateKind,
     GateStatus,
+    NodeSpec,
+    PlanSpec,
     TaskSpec,
     TaskStatus,
 )
@@ -204,6 +206,8 @@ def test_orchestration_api_exposes_tasks_and_versioned_profiles(tmp_path):
         assert capabilities.status_code == 200
         assert len(capabilities.json()["stages"]) == 8
         assert capabilities.json()["features"]["durable_resume"] is True
+        assert capabilities.json()["features"]["versioned_task_briefs"] is True
+        assert capabilities.json()["limits"]["runtime_budget_mode"] == "unlimited"
         assert capabilities.json()["health"]["ready"] is True
         assert client.get("/v1/orchestration/health").status_code == 200
 
@@ -236,7 +240,7 @@ def test_orchestration_api_exposes_tasks_and_versioned_profiles(tmp_path):
                 "auto_start": False,
             },
         )
-        assert replay.status_code == 201
+        assert replay.status_code == 200
         assert replay.json()["id"] == task["id"]
         conflict = client.post(
             "/v1/orchestration/tasks",
@@ -470,6 +474,78 @@ def test_orchestration_api_rejects_invalid_state_commands_and_serves_verified_bl
         assert response.content == b"immutable evidence"
         assert response.headers["content-type"].startswith("text/plain")
         assert client.get("/v1/orchestration/blobs/" + "0" * 64).status_code == 404
+
+
+def test_completed_result_can_be_restored_queried_and_followed_up(tmp_path):
+    manager = SessionManager(data_dir=tmp_path / "data", provider=ScriptedProvider([]))
+    service = manager.orchestration
+    created = service.create_task(
+        {
+            "idempotency_key": "completed-result-follow-up",
+            "objective": "Produce an architecture report",
+            "domain": "knowledge",
+            "read_only": True,
+            "acceptance_criteria": ["the report exists"],
+            "auto_start": False,
+        }
+    )
+    task = service.store.get_task(created["id"])
+    task = service.store.transition_task_status(
+        task.id, TaskStatus.QUEUED, expected_version=task.version
+    )
+    task = service.store.transition_task_status(
+        task.id, TaskStatus.RUNNING, expected_version=task.version
+    )
+    task = service.store.transition_task_status(
+        task.id, TaskStatus.COMPLETED, expected_version=task.version
+    )
+    artifact = service.blobs.put_json(
+        {"report": "Architecture report with src/system.py:42 evidence"}
+    )
+    product = service.work_products.create(
+        task.id,
+        kind="artifact",
+        title="Architecture report",
+        summary="Architecture report with src/system.py:42 evidence",
+        artifact_id=artifact.uri,
+        uri=artifact.uri,
+        content_hash=artifact.uri,
+        metadata={"deliverable_id": "DEL-01"},
+        verification_status="verified",
+        created_by="test-worker",
+    )
+
+    with TestClient(create_app(manager)) as client:
+        archived = client.post(f"/v1/orchestration/tasks/{task.id}/archive")
+        assert archived.status_code == 200
+        assert archived.json()["status"] == "archived"
+        assert archived.json()["terminal_outcome"] == "completed"
+
+        question = client.post(
+            f"/v1/orchestration/tasks/{task.id}/result-questions",
+            headers={"Idempotency-Key": "result-question-one"},
+            json={"question": "Where is the supporting file evidence?"},
+        )
+        assert question.status_code == 201
+        payload = question.json()
+        assert payload["source_task_id"] == task.id
+        assert payload["source_work_product_ids"] == [product.id]
+        assert payload["task_id"] != task.id
+
+        listed = client.get(
+            f"/v1/orchestration/tasks/{task.id}/result-questions"
+        )
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()] == [payload["id"]]
+
+        downloaded = client.get(f"/v1/orchestration/blobs/{artifact.sha256}")
+        assert downloaded.status_code == 200
+        assert b"src/system.py:42" in downloaded.content
+
+        restored = client.post(f"/v1/orchestration/tasks/{task.id}/restore")
+        assert restored.status_code == 200
+        assert restored.json()["status"] == "completed"
+        assert restored.json()["terminal_outcome"] == "completed"
 
 
 def test_task_events_default_to_latest_and_expose_bidirectional_page_cursors(
@@ -717,6 +793,98 @@ def test_run_transcript_is_read_only_task_scoped_and_does_not_invent_session_ids
         assert missing["available"] is False
         assert missing["session_id"] is None
         assert missing["messages"] == []
+
+
+def test_run_activity_api_is_task_scoped_incremental_and_privacy_labeled(tmp_path):
+    service, app = _dead_letter_control_plane(tmp_path)
+    task = service.store.create_task(
+        TaskSpec(
+            idempotency_key="api-run-activity",
+            objective="Observe one Agent run",
+        )
+    )
+    graph = service.store.create_plan_revision(
+        task.id,
+        PlanSpec(nodes=(NodeSpec("execute"),)),
+        expected_task_version=task.version,
+        created_by="test",
+    )
+    task = service.store.get_task(task.id)
+    task = service.store.transition_task_status(
+        task.id, TaskStatus.QUEUED, expected_version=task.version
+    )
+    task = service.store.transition_task_status(
+        task.id, TaskStatus.RUNNING, expected_version=task.version
+    )
+    run = service.store.enqueue_run(task.id, graph.nodes[0].key)
+    claim = service.store.claim_next_run("api-activity-worker")
+    assert claim is not None
+    service.store.start_run(run.id, claim.lease.token, claim.lease.fencing_token)
+    first = service.store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="reasoning-1",
+        source_id="reasoning",
+        kind="reasoning_summary",
+        status="running",
+        title="Reasoning summary",
+        summary="Checking the acceptance criteria.",
+        detail={"provider_summary": True, "access_token": "hidden"},
+    )
+    second = service.store.append_run_activity(
+        run.id,
+        claim.lease.token,
+        claim.lease.fencing_token,
+        event_key="usage-1",
+        source_id="usage",
+        kind="usage",
+        status="info",
+        title="Token usage updated",
+        detail={"total_tokens": 120, "input_tokens": 100, "output_tokens": 20},
+    )
+    other_task = service.store.create_task(
+        TaskSpec(idempotency_key="api-run-activity-other", objective="Other task")
+    )
+
+    try:
+        with TestClient(app) as client:
+            route = f"/v1/orchestration/tasks/{task.id}/runs/{run.id}/activity"
+            latest = client.get(route, params={"limit": 1})
+            assert latest.status_code == 200
+            payload = latest.json()
+            assert [item["id"] for item in payload["activity"]] == [second.id]
+            assert payload["has_more"] is True
+            assert payload["next_parameter"] == "before_sequence"
+            assert payload["privacy"] == {
+                "reasoning": "provider_summary_only",
+                "tool_output": "metadata_only",
+            }
+
+            older = client.get(
+                route,
+                params={"before_sequence": payload["next_sequence"], "limit": 1},
+            )
+            assert [item["id"] for item in older.json()["activity"]] == [first.id]
+            assert older.json()["activity"][0]["detail"]["access_token"] == "[REDACTED]"
+
+            forward = client.get(
+                route,
+                params={"after_sequence": first.sequence, "latest": "false"},
+            )
+            assert [item["id"] for item in forward.json()["activity"]] == [second.id]
+
+            ambiguous = client.get(
+                route,
+                params={"after_sequence": 1, "before_sequence": 2},
+            )
+            assert ambiguous.status_code == 422
+            wrong_task = client.get(
+                f"/v1/orchestration/tasks/{other_task.id}/runs/{run.id}/activity"
+            )
+            assert wrong_task.status_code == 404
+    finally:
+        service.store.close()
 
 
 def test_corrupt_audit_chain_fails_application_startup_closed(tmp_path):

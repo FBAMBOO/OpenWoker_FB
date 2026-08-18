@@ -57,6 +57,7 @@ export interface OrchestrationTaskSummary {
   profile_version?: number;
   parent_task_id?: string | null;
   parent_run_id?: string | null;
+  terminal_outcome?: WorkStatus | "draft";
 }
 
 export interface CreateOrchestrationTask {
@@ -78,6 +79,172 @@ export interface CreateOrchestrationTask {
   require_review?: boolean;
   require_tests?: boolean;
   auto_start?: boolean;
+  publish_brief?: boolean;
+  brief?: TaskBriefInput;
+  context_refs?: ContextRefInput[];
+}
+
+export interface AcceptanceCriterion {
+  id: string;
+  text: string;
+  required?: boolean;
+  verification?: string;
+}
+
+export interface BriefDeliverable {
+  id: string;
+  kind: string;
+  title?: string;
+  required?: boolean;
+}
+
+export interface TaskBriefInput {
+  title: string;
+  objective: string;
+  background: string;
+  scope: Record<string, unknown>;
+  instructions: string[];
+  constraints: string[];
+  non_goals: string[];
+  acceptance_criteria: AcceptanceCriterion[];
+  deliverables: BriefDeliverable[];
+  result_contract: Record<string, unknown>;
+}
+
+export interface TaskBrief extends TaskBriefInput {
+  id: string;
+  task_id: string;
+  revision: number;
+  status: "draft" | "published" | "superseded";
+  content_hash: string;
+  created_by_task_id?: string | null;
+  created_by_run_id?: string | null;
+  created_at: string;
+  published_at?: string | null;
+}
+
+export interface ContextRefInput {
+  requirement: "required" | "recommended" | "optional";
+  ref_type: string;
+  display_name: string;
+  selection_reason: string;
+  locator: Record<string, unknown>;
+  delivery_mode?: "metadata_only" | "excerpt" | "on_demand";
+  summary?: string;
+  mime_type?: string | null;
+  content_hash?: string | null;
+  byte_size?: number | null;
+  token_estimate?: number | null;
+  provenance?: Record<string, unknown>;
+  trust_level?: string;
+}
+
+export interface ContextRef extends ContextRefInput {
+  id: string;
+  task_id: string;
+  brief_id: string;
+  created_at: string;
+  read_count?: number;
+  last_read_at?: string | null;
+  last_read_by_run_id?: string | null;
+}
+
+export interface TaskRelation {
+  id: string;
+  from_task_id: string;
+  to_task_id: string;
+  relation_type: "parent" | "blocks" | "reviews" | "related" | "supersedes" | string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  removed_at?: string | null;
+}
+
+export interface TaskComment {
+  id: string;
+  task_id: string;
+  sequence: number;
+  author_type: string;
+  author_id: string;
+  created_by_run_id?: string | null;
+  body_markdown: string;
+  metadata: Record<string, unknown>;
+  reply_to_comment_id?: string | null;
+  created_at: string;
+}
+
+export interface TaskCommentDelta {
+  task_id: string;
+  after_sequence: number;
+  latest_sequence: number;
+  new_count: number;
+  comments: TaskComment[];
+  fallback_fetch_needed: boolean;
+}
+
+export interface WorkProduct {
+  id: string;
+  task_id: string;
+  run_id?: string | null;
+  kind: string;
+  title: string;
+  summary: string;
+  evidence_id?: string | null;
+  artifact_id?: string | null;
+  uri?: string | null;
+  content_hash?: string | null;
+  metadata: Record<string, unknown>;
+  verification_status: string;
+  created_by: string;
+  created_at: string;
+}
+
+export interface ResultQuestion {
+  id: string;
+  task_id: string;
+  source_task_id: string;
+  question: string;
+  status: WorkStatus | "draft";
+  terminal_outcome?: WorkStatus | "draft";
+  stage: OrchestrationStage | string;
+  progress?: number;
+  answer?: string | null;
+  answer_work_product_id?: string | null;
+  answer_artifact_id?: string | null;
+  source_work_product_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WakeRequest {
+  id: string;
+  target_task_id: string;
+  target_run_id?: string | null;
+  reason: string;
+  source_task_id?: string | null;
+  source_run_id?: string | null;
+  source_event_id?: string | null;
+  payload: Record<string, unknown>;
+  status: "pending" | "deferred" | "claimed" | "delivered" | "completed" | "failed" | "canceled" | string;
+  attempts: number;
+  coalesced_count: number;
+  last_error?: string | null;
+  not_before?: string | null;
+  claimed_by?: string | null;
+  claimed_until?: string | null;
+  delivered_at?: string | null;
+  completed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HandoffSummary {
+  protocol?: "structured" | "legacy" | string;
+  loaded?: boolean;
+  context?: { ref_count?: number; required_count?: number; estimated_tokens?: number };
+  relations?: Record<string, number>;
+  comments?: { count: number; latest_sequence: number; content_included: boolean };
+  work_products?: { count: number };
+  wakes?: { count: number; pending: number; failed: number };
 }
 
 export interface AttentionAction {
@@ -157,6 +324,12 @@ export interface AgentRun {
   summary?: string;
   error_kind?: string;
   error_message?: string;
+  budget?: {
+    model_calls: number;
+    tool_calls: number;
+    tokens: number;
+    wall_seconds: number;
+  } | null;
 }
 
 export interface TaskEvidence {
@@ -270,6 +443,30 @@ export interface OrchestrationHealth {
   last_error_at?: string | null;
   last_error?: string | null;
   consecutive_failures?: number;
+  handoff?: {
+    settings: HandoffRuntimeSettings;
+    metrics: {
+      counters: Record<string, number>;
+      gauges?: Record<string, number>;
+      histograms?: Record<string, unknown>;
+    };
+  };
+}
+
+export interface HandoffRuntimeSettings {
+  structured_handoff_enabled: boolean;
+  structured_handoff_required_for_new_tasks: boolean;
+  legacy_spawn_agent_enabled: boolean;
+  default_context_token_budget: number;
+  max_context_refs: number;
+  max_inline_bytes_per_ref: number;
+  max_inline_bytes_total: number;
+  max_comment_batch: number;
+  wake_coalesce_window_ms: number;
+  wake_max_attempts: number;
+  wake_backoff_seconds: number;
+  context_read_audit_enabled: boolean;
+  transcript_sharing_default: boolean;
 }
 
 export interface OutboxDeadLetter {
@@ -307,6 +504,36 @@ export interface RunTranscript {
   updated_at?: string | null;
 }
 
+export type RunActivityKind = "lifecycle" | "reasoning_summary" | "tool" | "message" | "usage" | "error";
+export type RunActivityStatus = "pending" | "running" | "completed" | "failed" | "canceled" | "info";
+
+export interface RunActivity {
+  sequence: number;
+  id: string;
+  event_key: string;
+  source_id: string;
+  kind: RunActivityKind;
+  status: RunActivityStatus;
+  title: string;
+  summary: string;
+  detail: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface RunActivityPage {
+  task_id: string;
+  run_id: string;
+  activity: RunActivity[];
+  has_more: boolean;
+  next_sequence?: number | null;
+  next_parameter?: "before_sequence" | "after_sequence" | string;
+  order: "oldest_to_newest" | string;
+  privacy: {
+    reasoning: "provider_summary_only" | string;
+    tool_output: "metadata_only" | string;
+  };
+}
+
 export interface SnapshotRef {
   id: string;
   version: number;
@@ -315,6 +542,9 @@ export interface SnapshotRef {
 }
 
 export interface OrchestrationTaskDetail extends OrchestrationTaskSummary {
+  result?: Record<string, unknown> | null;
+  brief?: TaskBrief;
+  handoff_summary?: HandoffSummary;
   stages?: TaskStageState[];
   attention?: AttentionGate[];
   attention_page?: AuditPage;
@@ -377,7 +607,7 @@ export interface AgentProfileMetadata extends Record<string, unknown> {
 }
 
 export interface AgentProfileSpec {
-  schema_version: 1;
+  schema_version: 1 | 2;
   profile_id: string;
   display_name: string;
   role: AgentRole;
@@ -390,6 +620,24 @@ export interface AgentProfileSpec {
   max_children: number;
   base?: ProfileRef | null;
   metadata: AgentProfileMetadata;
+  communication_policy?: AgentCommunicationPolicy;
+}
+
+export interface AgentCommunicationPolicy {
+  can_delegate: boolean;
+  allowed_child_roles: AgentRole[];
+  required_brief_fields: string[];
+  max_initial_context_tokens: number;
+  max_context_refs: number;
+  max_inline_bytes_per_ref: number;
+  max_inline_bytes_total: number;
+  allowed_context_ref_types: string[];
+  allow_full_transcript_reference: boolean;
+  allowed_relation_types: string[];
+  can_comment: boolean;
+  can_mention: boolean;
+  can_mention_receive: boolean;
+  result_contract_id: string;
 }
 
 export interface VersionProvenance {

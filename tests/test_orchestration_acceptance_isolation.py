@@ -142,7 +142,7 @@ async def start_code_task(
 
 
 @pytest.mark.asyncio
-async def test_review_failure_never_mutates_the_formal_workspace(tmp_path):
+async def test_evaluator_adjudication_of_review_failure_never_publishes_without_acceptance(tmp_path):
     workspace = tmp_path / "project"
     workspace.mkdir()
     (workspace / "baseline.txt").write_text("original", encoding="utf-8")
@@ -159,8 +159,8 @@ async def test_review_failure_never_mutates_the_formal_workspace(tmp_path):
     await service.start()
     try:
         task_id = await start_code_task(service)
-        reconciliation = await wait_until(
-            lambda: open_gate(service, task_id, GateKind.RECONCILIATION)
+        final_gate = await wait_until(
+            lambda: open_gate(service, task_id, GateKind.FINAL_ACCEPTANCE)
         )
 
         task = service.store.get_task(task_id)
@@ -174,7 +174,7 @@ async def test_review_failure_never_mutates_the_formal_workspace(tmp_path):
         assert publications(service, task_id) == []
         review = next(
             report
-            for report in reconciliation.prompt["verification"]
+            for report in final_gate.prompt["verification"]
             if report["role"] == "reviewer"
         )
         assert review["status"] == "fail"
@@ -206,7 +206,7 @@ async def test_candidate_is_published_once_and_only_after_final_acceptance(tmp_p
 
         service.resolve_gate(task_id, gate.id, decision="accept")
         await wait_until(
-            lambda: service.store.get_task(task_id).status is TaskStatus.ARCHIVED
+            lambda: service.store.get_task(task_id).status is TaskStatus.COMPLETED
         )
 
         assert (workspace / "orchestrated.txt").read_text(
@@ -302,7 +302,7 @@ async def test_restart_reconciles_publish_completed_before_audit_append(
         restarted_executor.service = recovered
         await recovered.start()
         await wait_until(
-            lambda: recovered.store.get_task(task_id).status is TaskStatus.ARCHIVED
+            lambda: recovered.store.get_task(task_id).status is TaskStatus.COMPLETED
         )
 
         recovered_publications = publications(recovered, task_id)
@@ -498,7 +498,7 @@ async def test_empty_verification_set_cannot_auto_pass_acceptance(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pass_verdict_with_failed_criterion_is_normalized_to_failure(tmp_path):
+async def test_failed_criterion_is_normalized_before_evaluator_adjudication(tmp_path):
     workspace = tmp_path / "project"
     workspace.mkdir()
     executor = AcceptanceExecutor(
@@ -515,7 +515,7 @@ async def test_pass_verdict_with_failed_criterion_is_normalized_to_failure(tmp_p
     try:
         task_id = await start_code_task(service)
         gate = await wait_until(
-            lambda: open_gate(service, task_id, GateKind.RECONCILIATION)
+            lambda: open_gate(service, task_id, GateKind.FINAL_ACCEPTANCE)
         )
 
         reviewer_run = next(
@@ -536,7 +536,7 @@ async def test_pass_verdict_with_failed_criterion_is_normalized_to_failure(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_verdict_for_an_old_candidate_hash_opens_reconciliation(tmp_path):
+async def test_evaluator_can_adjudicate_a_stale_upstream_verdict_without_publishing(tmp_path):
     workspace = tmp_path / "project"
     workspace.mkdir()
     executor = AcceptanceExecutor(mutate_candidate_during_review=True)
@@ -551,7 +551,7 @@ async def test_verdict_for_an_old_candidate_hash_opens_reconciliation(tmp_path):
     try:
         task_id = await start_code_task(service)
         gate = await wait_until(
-            lambda: open_gate(service, task_id, GateKind.RECONCILIATION)
+            lambda: open_gate(service, task_id, GateKind.FINAL_ACCEPTANCE)
         )
 
         reviewer_report = next(

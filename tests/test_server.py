@@ -480,6 +480,7 @@ def test_server_sets_explicit_websocket_frame_limit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server_run, "_ensure_ca_bundle", lambda: None)
     monkeypatch.setattr(server_run, "_exit_when_orphaned", lambda: None)
+    monkeypatch.setattr(server_run, "_server_already_running", lambda *_: False)
     monkeypatch.setattr(server_run, "build_app", lambda *args: fake_app)
     monkeypatch.setitem(
         sys.modules,
@@ -501,9 +502,12 @@ def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
     from coworker.server import run as server_run
 
     monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
-    path = server_run._ensure_api_token(9876)
+    token_file = server_run._ensure_api_token(9876)
+    assert token_file is not None
+    path = token_file.path
     try:
         assert path == tmp_path / "coworker-state" / "sidecar-9876.token"
+        assert token_file.created is True
         assert path.read_text().strip() == os.environ["COWORKER_API_TOKEN"]
         assert len(path.read_text().strip()) == 64
         if sys.platform == "win32":
@@ -517,8 +521,68 @@ def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
         else:
             assert (path.stat().st_mode & 0o777) == 0o600
     finally:
-        path.unlink(missing_ok=True)
+        token_file.release()
         os.environ.pop("COWORKER_API_TOKEN", None)
+
+
+def test_standalone_server_reuses_existing_port_token(tmp_path, monkeypatch):
+    import os
+
+    from coworker.server import run as server_run
+
+    path = tmp_path / "coworker-state" / "sidecar-9877.token"
+    token = "b" * 64
+    server_run.write_private_text(path, token + "\n")
+    monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+
+    token_file = server_run._ensure_api_token(9877)
+
+    assert token_file is not None
+    assert token_file.path == path
+    assert token_file.token == token
+    assert token_file.created is False
+    assert os.environ["COWORKER_API_TOKEN"] == token
+    token_file.release()
+    assert path.read_text(encoding="utf-8").strip() == token
+
+
+def test_token_owner_does_not_delete_a_replacement(tmp_path, monkeypatch):
+    import os
+
+    from coworker.server import run as server_run
+
+    monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+    token_file = server_run._ensure_api_token(9878)
+    assert token_file is not None and token_file.created is True
+    replacement = "c" * 64
+    server_run.write_private_text(token_file.path, replacement + "\n")
+
+    token_file.release()
+
+    assert token_file.path.read_text(encoding="utf-8").strip() == replacement
+    os.environ.pop("COWORKER_API_TOKEN", None)
+
+
+def test_duplicate_server_reuses_token_and_exits_before_building_app(
+    tmp_path, monkeypatch, capsys
+):
+    from coworker.server import run as server_run
+
+    path = tmp_path / "coworker-state" / "sidecar-9879.token"
+    token = "d" * 64
+    server_run.write_private_text(path, token + "\n")
+    monkeypatch.setattr(server_run, "_ensure_ca_bundle", lambda: None)
+    monkeypatch.setattr(server_run, "_server_already_running", lambda *_: True)
+    monkeypatch.setattr(
+        server_run,
+        "build_app",
+        lambda *_: pytest.fail("duplicate launch must not build another app"),
+    )
+
+    server_run.main(["--port", "9879"])
+
+    assert "already running" in capsys.readouterr().err
+    assert path.read_text(encoding="utf-8").strip() == token
 
 
 def test_ws_error_persists_notice_and_retry_reruns(tmp_path):

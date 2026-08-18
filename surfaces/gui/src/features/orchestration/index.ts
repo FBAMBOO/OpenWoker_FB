@@ -6,4 +6,6 @@ export { AgentProfilesSettings, createBlankAgentProfile } from "./AgentProfilesS
 export type { AgentProfilesSettingsProps } from "./AgentProfilesSettings";
 export { ModelRoutingSettings, createBlankModelPolicy } from "./ModelRoutingSettings";
 export type { ModelRoutingSettingsProps } from "./ModelRoutingSettings";
+export { RuntimeCommunicationSettings } from "./RuntimeCommunicationSettings";
+export type { RuntimeCommunicationSettingsProps } from "./RuntimeCommunicationSettings";
 export * from "./types";
