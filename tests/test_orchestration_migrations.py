@@ -59,6 +59,41 @@ def test_load_migrations_rejects_platform_dependent_line_endings(
         load_migrations(tmp_path)
 
 
+def test_legacy_crlf_checksum_is_canonicalized_without_replaying_sql(
+    tmp_path,
+) -> None:
+    source = tmp_path / "0001_initial.sql"
+    raw = b"CREATE TABLE stable (id INTEGER PRIMARY KEY);\n"
+    source.write_bytes(raw)
+    migration = load_migrations(tmp_path)[0]
+    legacy_checksum = hashlib.sha256(raw.replace(b"\n", b"\r\n")).hexdigest()
+    assert migration.legacy_checksums == (legacy_checksum,)
+
+    connection = sqlite3.connect(tmp_path / "legacy-crlf.db")
+    try:
+        assert apply_migrations(connection, (migration,)) == (1,)
+        connection.execute(
+            "UPDATE orch_schema_migrations SET checksum = ? WHERE version = 1",
+            (legacy_checksum,),
+        )
+        connection.commit()
+
+        assert apply_migrations(connection, (migration,)) == ()
+        assert connection.execute(
+            "SELECT checksum FROM orch_schema_migrations WHERE version = 1"
+        ).fetchone() == (migration.checksum,)
+
+        connection.execute(
+            "UPDATE orch_schema_migrations SET checksum = ? WHERE version = 1",
+            ("f" * 64,),
+        )
+        connection.commit()
+        with pytest.raises(MigrationError, match="checksum/name mismatch"):
+            apply_migrations(connection, (migration,))
+    finally:
+        connection.close()
+
+
 def test_database_at_0001_upgrades_to_current_bundle(tmp_path) -> None:
     bundle = load_migrations()
     assert bundle[0].version == 1

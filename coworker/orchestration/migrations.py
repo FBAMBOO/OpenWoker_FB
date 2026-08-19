@@ -20,6 +20,7 @@ class Migration:
     name: str
     sql: str
     checksum: str
+    legacy_checksums: tuple[str, ...] = ()
 
 
 def load_migrations(path: Path | None = None) -> tuple[Migration, ...]:
@@ -35,12 +36,15 @@ def load_migrations(path: Path | None = None) -> tuple[Migration, ...]:
                 f"migration {source.name} must use LF line endings; "
                 "check .gitattributes and renormalize the checkout"
             )
+        checksum = hashlib.sha256(raw).hexdigest()
+        crlf_checksum = hashlib.sha256(raw.replace(b"\n", b"\r\n")).hexdigest()
         migrations.append(
             Migration(
                 version=int(match.group(1)),
                 name=match.group(2),
                 sql=raw.decode("utf-8"),
-                checksum=hashlib.sha256(raw).hexdigest(),
+                checksum=checksum,
+                legacy_checksums=(crlf_checksum,) if crlf_checksum != checksum else (),
             )
         )
     if not migrations:
@@ -164,9 +168,22 @@ def apply_migrations(
             current = migration
             existing = applied_rows.get(migration.version)
             if existing is not None:
-                if existing != (migration.name, migration.checksum):
+                existing_name, existing_checksum = existing
+                if existing_name != migration.name or (
+                    existing_checksum != migration.checksum
+                    and existing_checksum not in migration.legacy_checksums
+                ):
                     raise MigrationError(
                         f"migration {migration.version:04d} checksum/name mismatch"
+                    )
+                if existing_checksum != migration.checksum:
+                    connection.execute(
+                        """
+                        UPDATE orch_schema_migrations
+                        SET checksum = ?
+                        WHERE version = ?
+                        """,
+                        (migration.checksum, migration.version),
                     )
                 continue
             _execute_sql_script(connection, migration.sql)
