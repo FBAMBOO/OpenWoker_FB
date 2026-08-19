@@ -3,7 +3,11 @@
 
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   pytest:
@@ -49,6 +53,7 @@ jobs:
         working-directory: surfaces/gui
         run: npm ci
       - name: Install Playwright browsers
+        timeout-minutes: 15
         working-directory: surfaces/gui
         run: npx playwright install --with-deps chromium
       - name: e2e
