@@ -11,7 +11,6 @@ from pathlib import Path
 
 from .errors import MigrationError
 
-
 _MIGRATION_NAME = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
 
@@ -31,6 +30,11 @@ def load_migrations(path: Path | None = None) -> tuple[Migration, ...]:
         if match is None:
             continue
         raw = source.read_bytes()
+        if b"\r" in raw:
+            raise MigrationError(
+                f"migration {source.name} must use LF line endings; "
+                "check .gitattributes and renormalize the checkout"
+            )
         migrations.append(
             Migration(
                 version=int(match.group(1)),

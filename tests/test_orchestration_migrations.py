@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,39 @@ def _migration(version: int, name: str, sql: str) -> Migration:
         sql=sql,
         checksum=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
     )
+
+
+def test_migration_sql_checkout_is_lf_and_checksums_match_exact_bytes() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    attribute_lines = {
+        line.split("#", 1)[0].strip()
+        for line in (repository / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    }
+    assert (
+        "coworker/orchestration/migrations/*.sql text eol=lf" in attribute_lines
+    )
+
+    directory = repository / "coworker" / "orchestration" / "migrations"
+    for migration in load_migrations(directory):
+        source = directory / f"{migration.version:04d}_{migration.name}.sql"
+        raw = source.read_bytes()
+        assert b"\r" not in raw, f"{source.name} is not LF-only"
+        assert migration.checksum == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("bad_line_ending", [b"\r\n", b"\r"])
+def test_load_migrations_rejects_platform_dependent_line_endings(
+    tmp_path, bad_line_ending: bytes
+) -> None:
+    source = tmp_path / "0001_initial.sql"
+    source.write_bytes(
+        bad_line_ending.join(
+            [b"CREATE TABLE stable (id INTEGER PRIMARY KEY);", b""]
+        )
+    )
+
+    with pytest.raises(MigrationError, match=r"0001_initial\.sql must use LF"):
+        load_migrations(tmp_path)
 
 
 def test_database_at_0001_upgrades_to_current_bundle(tmp_path) -> None:

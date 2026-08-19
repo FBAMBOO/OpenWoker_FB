@@ -1,0 +1,2 @@
+# Migration checksums hash exact file bytes, so every checkout must preserve LF.
+coworker/orchestration/migrations/*.sql text eol=lf
