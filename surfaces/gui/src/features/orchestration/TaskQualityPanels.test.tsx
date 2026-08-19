@@ -1,11 +1,13 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OrchestrationApi } from "./api";
 import { BudgetPanel } from "./BudgetPanel";
 import { DeliverableViewer } from "./DeliverableViewer";
 import { EvidenceExplorer } from "./EvidenceExplorer";
 import { TaskQualityPanel } from "./TaskQualityPanel";
 import type { OrchestrationTaskDetail } from "./types";
+
+afterEach(cleanup);
 
 const primary = {
   artifact_id: "artifact-v2", deliverable_id: "report", filename: "ARCHITECTURE.md",
@@ -70,7 +72,9 @@ describe("Task Quality V2 panels", () => {
     expect(screen.getByText("75%")).toBeTruthy();
     expect(screen.getByText("Signed waivers")).toBeTruthy();
     expect(screen.getByText("sha256:signed-waiver")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Request repair" }));
+    const repairButton = screen.getByRole("button", { name: "Request repair" });
+    expect((repairButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(repairButton);
     await waitFor(() => expect(api.requestTaskRepair).toHaveBeenCalledWith(task.id, expect.objectContaining({ source_artifact_id: "artifact-v2", finding_ids: ["finding-1"] })));
   });
 

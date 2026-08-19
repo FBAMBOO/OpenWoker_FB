@@ -19,7 +19,7 @@ export function RepairPanel({
   onChanged: () => Promise<void> | void;
 }) {
   const repairable = useMemo(() => findings.filter((item) => item.status === "open" && item.repairable), [findings]);
-  const [selected, setSelected] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>(() => repairable.map((item) => item.id));
   const [busy, setBusy] = useState<"repair" | "waiver" | "">("");
   const [error, setError] = useState<string | null>(null);
   const [waiverSubject, setWaiverSubject] = useState("");

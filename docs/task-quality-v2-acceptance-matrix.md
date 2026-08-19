@@ -13,7 +13,7 @@
 | Branch | `main` |
 | Base commit | `8df02f973d2961e47bd81baac10b4b77b0f85060` |
 | Implementation payload | 128 files |
-| Payload fingerprint | `sha256:afacebcfcc73392902c5b79a6e93cb1d0ee16ffaac8c1cc828f653ce7ee75057` |
+| Payload fingerprint | `sha256:c4cfd4750630c962728b1fa50ceba84d2fac33af5ded362d8f969783de1eae37` |
 | Fingerprint recipe | 对 128 个 payload 文件按 repo-relative path 做 ordinal 排序；每行写入 `path<TAB>sha256(file bytes)<LF>`，再对 UTF-8 manifest 做 SHA-256；排除本矩阵自身。 |
 | OS | Windows 11, `10.0.26200.0` |
 | PowerShell | `5.1.26100.9168` |
