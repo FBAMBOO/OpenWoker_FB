@@ -13,7 +13,7 @@ import json
 import re
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -1303,6 +1303,7 @@ class OrchestrationStore:
         created_by_run_id: Optional[str] = None,
         copy_context_from_brief_id: Optional[str] = None,
         command_id: Optional[str] = None,
+        _connection: Optional[sqlite3.Connection] = None,
     ) -> TaskBriefRecord:
         command_id = self._command_id(command_id)
         chosen = draft if isinstance(draft, TaskBriefDraft) else TaskBriefDraft.from_mapping(draft)
@@ -1313,7 +1314,7 @@ class OrchestrationStore:
             "created_by_run_id": created_by_run_id,
             "copy_context_from_brief_id": copy_context_from_brief_id,
         }
-        with self._write() as connection:
+        with (self._write() if _connection is None else nullcontext(_connection)) as connection:
             replay = self._start_command(
                 connection, command_id, "brief.create_draft", task_id, request
             )
@@ -1444,6 +1445,7 @@ class OrchestrationStore:
         ),
         informational: bool = False,
         command_id: Optional[str] = None,
+        _connection: Optional[sqlite3.Connection] = None,
     ) -> TaskBriefRecord:
         command_id = self._command_id(command_id)
         request = {
@@ -1453,7 +1455,7 @@ class OrchestrationStore:
             "required_fields": list(required_fields),
             "informational": bool(informational),
         }
-        with self._write() as connection:
+        with (self._write() if _connection is None else nullcontext(_connection)) as connection:
             replay = self._start_command(
                 connection, command_id, "brief.publish", task_id, request
             )
@@ -3402,6 +3404,7 @@ class OrchestrationStore:
         summary: str,
         evidence_id: Optional[str],
         artifact_id: Optional[str],
+        artifact_version_id: Optional[str],
         uri: Optional[str],
         content_hash: Optional[str],
         metadata: Mapping[str, Any],
@@ -3436,14 +3439,28 @@ class OrchestrationStore:
             evidence = self._require_evidence(connection, evidence_id)
             if evidence.task_id != task_id:
                 raise ConflictError("work product evidence belongs to another task")
+        if artifact_version_id:
+            artifact_version = connection.execute(
+                "SELECT task_id FROM orch_artifact_versions WHERE id=?",
+                (artifact_version_id,),
+            ).fetchone()
+            if artifact_version is None:
+                raise NotFoundError(
+                    f"artifact version {artifact_version_id} not found"
+                )
+            if artifact_version["task_id"] != task_id:
+                raise ConflictError(
+                    "work product artifact version belongs to another task"
+                )
         product_id = _id("wp")
         connection.execute(
             """
             INSERT INTO orch_work_products(
                 id, task_id, run_id, kind, title, summary, evidence_id,
                 artifact_id, uri, content_hash, metadata_json,
+                artifact_version_id,
                 verification_status, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 product_id,
@@ -3457,6 +3474,7 @@ class OrchestrationStore:
                 uri,
                 content_hash,
                 _json(metadata),
+                artifact_version_id,
                 verification_status,
                 str(created_by).strip(),
                 _stamp(_now()),
@@ -3488,6 +3506,7 @@ class OrchestrationStore:
         run_id: Optional[str] = None,
         evidence_id: Optional[str] = None,
         artifact_id: Optional[str] = None,
+        artifact_version_id: Optional[str] = None,
         uri: Optional[str] = None,
         content_hash: Optional[str] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -3507,6 +3526,7 @@ class OrchestrationStore:
             "summary": str(summary),
             "evidence_id": evidence_id,
             "artifact_id": artifact_id,
+            "artifact_version_id": artifact_version_id,
             "uri": uri,
             "content_hash": content_hash,
             "metadata": dict(metadata or {}),
@@ -3535,6 +3555,7 @@ class OrchestrationStore:
                 summary=summary,
                 evidence_id=evidence_id,
                 artifact_id=artifact_id,
+                artifact_version_id=artifact_version_id,
                 uri=uri,
                 content_hash=content_hash,
                 metadata=metadata or {},
@@ -3914,6 +3935,7 @@ class OrchestrationStore:
         expected_version: int,
         output: Optional[Mapping[str, Any]] = None,
         command_id: Optional[str] = None,
+        _connection: Optional[sqlite3.Connection] = None,
     ) -> TaskRecord:
         target = TaskStatus(target)
         command_id = self._command_id(command_id)
@@ -3923,7 +3945,7 @@ class OrchestrationStore:
             "expected_version": expected_version,
             "output": output,
         }
-        with self._write() as connection:
+        with (self._write() if _connection is None else nullcontext(_connection)) as connection:
             replay = self._start_command(
                 connection, command_id, "task.transition_status", task_id, request
             )
@@ -4340,6 +4362,7 @@ class OrchestrationStore:
         expected_task_version: int,
         created_by: str,
         command_id: Optional[str] = None,
+        _connection: Optional[sqlite3.Connection] = None,
     ) -> PlanGraph:
         order = validate_plan(spec)
         plan_payload = {
@@ -4356,7 +4379,7 @@ class OrchestrationStore:
             "created_by": created_by,
             "content_hash": content_hash,
         }
-        with self._write() as connection:
+        with (self._write() if _connection is None else nullcontext(_connection)) as connection:
             replay = self._start_command(
                 connection, command_id, "plan.create_revision", task_id, request
             )
@@ -5685,6 +5708,11 @@ class OrchestrationStore:
                         artifact_id=(
                             str(raw_product["artifact_id"])
                             if raw_product.get("artifact_id")
+                            else None
+                        ),
+                        artifact_version_id=(
+                            str(raw_product["artifact_version_id"])
+                            if raw_product.get("artifact_version_id")
                             else None
                         ),
                         uri=(str(raw_product["uri"]) if raw_product.get("uri") else None),
@@ -8766,6 +8794,7 @@ class OrchestrationStore:
             summary=row["summary"],
             evidence_id=row["evidence_id"],
             artifact_id=row["artifact_id"],
+            artifact_version_id=row["artifact_version_id"],
             uri=row["uri"],
             content_hash=row["content_hash"],
             metadata=_load(row["metadata_json"], {}),

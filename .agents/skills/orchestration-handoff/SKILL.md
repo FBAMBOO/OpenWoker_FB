@@ -37,10 +37,23 @@ Expect the server to atomically create the child task, published Brief, parent/b
 
 ## Return verifiable results
 
-1. Register each durable output with `create_work_product`. Prefer a workspace, Git, or content-addressed artifact reference plus a hash; do not paste large output into a comment.
-2. Call `complete_task` exactly once with a concise summary, Work Product descriptors, every required criterion result, remaining risks, and follow-up task IDs.
-3. Call `fail_task` for a structured failure, including a stable error kind and whether retry is safe.
-4. Never claim verification that this run could not perform. Reviewer and tester runs must start fresh and inspect only selected refs and Work Products.
+1. For a legacy/TCHP run, register each durable output with `create_work_product`. Prefer a workspace, Git, or content-addressed artifact reference plus a hash; do not paste large output into a comment.
+2. For a Task Quality V2 producer, use `create_artifact`, ordered `append_artifact_chunk`, and `complete_artifact` with the locally computed SHA-256. Submit the canonical typed role result with `submit_evidence_bundle` or `submit_analysis_result`; a prose summary is not the artifact.
+3. Call `complete_task` exactly once with a concise summary, Work Product descriptors, every required criterion result, remaining risks, and follow-up task IDs. Task Quality settlement validates the typed result before this compatibility completion can succeed.
+4. Call `fail_task` for a structured failure, including a stable error kind and whether retry is safe.
+5. Never claim verification that this run could not perform. Reviewer and tester runs must start fresh and inspect only direct bindings and exact immutable artifacts.
+
+## Verify a Task Quality V2 artifact
+
+When the execution envelope marks `task_quality_v2=true`, use the run-bound quality tools. Identity is server-bound; never add task, run, lease, actor, contract, or snapshot IDs that a tool does not request.
+
+1. Read `get_task_contract`, `get_repository_snapshot`, and `get_execution_strategy`. Use `get_repository_inventory`, `search_snapshot`, `read_snapshot_file`, and `list_evidence_bundles` only within the frozen direct bindings.
+2. Call `list_artifacts` or `get_artifact` to obtain the exact candidate ID and SHA-256. Read the complete candidate through `read_artifact` or `read_work_product_artifact`, using bounded ranges until the server reports 100% coverage. Never substitute a producer summary for unread bytes.
+3. Return every issue through `submit_quality_findings` as a typed finding with severity, blocking/repairable flags, stable location, evidence references, and suggested fix. Do not hide a problem only in verdict prose or return `findings=[]` when the review describes a defect.
+4. Bind claims and citations to the frozen snapshot. Absence claims require the query, scope, exclusions, result hash, and limitation; runtime facts must not be inferred from static files.
+5. On a repair run, call `get_repair_request`, read the source artifact completely, and create a child version with `create_repaired_artifact`. Change only authorized Markdown sections. Reviewers must create a fresh 100% receipt for the child hash.
+
+Hard gates, open blocking findings, artifact/read integrity, schema integrity, the server-summed rubric, and the effective budget are authoritative. An evaluator recommendation cannot override them. Security, schema, artifact/hash, exact-read, baseline, and hard-budget integrity failures are not waivable.
 
 ## Diagnose or recover
 
@@ -58,4 +71,4 @@ Use `GET /v1/orchestration/health` for wake metrics and effective settings. Chan
 
 ## Project references
 
-Read [the orchestration guide](../../../docs/orchestration.md) for operations and source ownership. Read [the detailed implementation specification](../../../docs/specifications/Detailed_Implementation_Specification.md) when changing protocol behavior, schema, security policy, rollout, or acceptance coverage. Run the focused handoff, migration, performance, and GUI tests listed in the guide before declaring the change complete.
+Read [the orchestration guide](../../../docs/orchestration.md) for operations and source ownership, and [the Task Quality V2 runbook](../../../docs/task-quality-v2.md) for canonical artifacts, gates, repairs, budgets, rollout, and recovery. Read [the detailed handoff specification](../../../docs/specifications/Detailed_Implementation_Specification.md) or [the Task Quality V2 implementation specification](../../../docs/specifications/OpenWorker_Task_Quality_V2_End_to_End_Implementation_Spec_2026-08-18.md) when changing protocol behavior, schema, security policy, rollout, or acceptance coverage. Run the focused handoff, migration, Task Quality, benchmark, provider, performance, and GUI tests listed in the guides before declaring the change complete.

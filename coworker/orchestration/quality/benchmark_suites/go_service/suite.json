@@ -1,0 +1,23 @@
+{
+  "id": "go_service",
+  "name": "Go service repository analysis",
+  "stack": "go-service",
+  "version": 1,
+  "snapshot_artifact_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "prompt_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444445",
+  "baseline_candidate": "legacy",
+  "thresholds": {"quality_score": 85, "citation_resolution_ratio": 1.0, "artifact_read_coverage_ratio": 1.0, "duplicate_scan_ratio": 0.2, "reported_tokens": 3000000, "tool_calls": 120, "elapsed_seconds": 1200},
+  "oracle": {"required_areas": ["commands", "packages", "transport", "storage", "tests", "config", "deployment"], "inventory": {"go_packages": 26, "handlers": 14, "tests": 31, "deployment_files": 6}},
+  "candidate_defaults": {
+    "rubric_scores": {"architecture_coverage": 27, "relationships": 18, "evidence": 19, "quantitative": 8, "risk_actionability": 8, "limitations": 5, "presentation": 5},
+    "covered_areas": ["commands", "packages", "transport", "storage", "tests", "config", "deployment"],
+    "citations_total": 25, "citations_resolved": 25, "priority_claims": 6, "priority_claims_with_direct_evidence": 6,
+    "reviewer_read_bytes": 12500, "artifact_bytes": 12500, "snapshot_correct": true, "baseline_error_count": 0,
+    "expensive_queries": 13, "duplicate_non_cached_queries": 2, "reported_tokens": 760000, "tool_calls": 46, "elapsed_seconds": 295,
+    "repair_attempts": 0, "repair_success_ratio": 1.0, "primary_deliverable_present": true, "primary_deliverable_mime": "text/markdown",
+    "workspace_unchanged": true, "aggregation_separated": true, "schema_field_loss": 0,
+    "hard_gates": {"QG001": "pass", "QG002": "pass", "QG003": "pass", "QG010": "pass", "QG013": "pass"},
+    "inventory": {"go_packages": 26, "handlers": 14, "tests": 31, "deployment_files": 6}
+  },
+  "candidates": {"v2": {}, "legacy": {"rubric_scores": {"coverage": 41, "evidence": 16, "clarity": 12}, "covered_areas": ["commands", "packages", "transport", "tests"], "citations_resolved": 18, "reviewer_read_bytes": 5800, "hard_gates": {"QG003": "fail", "QG010": "fail"}}}
+}

@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { downloadApiResource, getHealth, Session } from "./api";
+import { apiRequest, ApiRequestError, downloadApiResource, getHealth, Session } from "./api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -79,4 +79,26 @@ it("treats a 503 orchestration readiness snapshot as reachable health data", asy
   }) as Response));
 
   await expect(getHealth()).resolves.toEqual(snapshot);
+});
+
+it("surfaces the canonical orchestration error message without stringifying the envelope", async () => {
+  const payload = {
+    error: {
+      code: "ETAG_MISMATCH",
+      message: "The contract changed; reload its current version.",
+      retryable: true,
+      details: {},
+      correlation_id: "corr-1",
+    },
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: false,
+    status: 409,
+    text: async () => JSON.stringify(payload),
+  })));
+
+  const caught = await apiRequest("/v1/orchestration/task-drafts/task-1/contract").catch((error) => error);
+  expect(caught).toBeInstanceOf(ApiRequestError);
+  expect((caught as ApiRequestError).message).toBe("The contract changed; reload its current version.");
+  expect((caught as ApiRequestError).payload).toEqual(payload);
 });

@@ -207,7 +207,7 @@ def test_orchestration_api_exposes_tasks_and_versioned_profiles(tmp_path):
         assert len(capabilities.json()["stages"]) == 8
         assert capabilities.json()["features"]["durable_resume"] is True
         assert capabilities.json()["features"]["versioned_task_briefs"] is True
-        assert capabilities.json()["limits"]["runtime_budget_mode"] == "unlimited"
+        assert capabilities.json()["limits"]["runtime_budget_mode"] == "enforced"
         assert capabilities.json()["health"]["ready"] is True
         assert client.get("/v1/orchestration/health").status_code == 200
 
@@ -392,7 +392,11 @@ def test_gate_resolve_http_retry_is_idempotent_and_payload_reuse_conflicts(tmp_p
             json=changed,
         )
         assert conflict.status_code == 409
-        assert "reused with different input" in conflict.json()["detail"]
+        assert "reused with different input" in conflict.json()["error"]["message"]
+        assert conflict.json()["error"]["code"] == "CONFLICT"
+        assert conflict.headers["x-correlation-id"] == conflict.json()["error"][
+            "correlation_id"
+        ]
 
         decisions = [
             evidence

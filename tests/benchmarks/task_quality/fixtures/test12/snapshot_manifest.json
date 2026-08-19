@@ -1,0 +1,14 @@
+{
+  "schema_id": "sanitized_benchmark_snapshot_v1",
+  "snapshot_artifact_id": "sha256:2b2360f32117cc5b234e63230e1ae6741a64be70f00000000000000000000000",
+  "selected_ref": "refs/remotes/origin/main",
+  "commit_oid": "2b2360f32117cc5b234e63230e1ae6741a64be70",
+  "project_root": "fabric-dbt/fabric_warehouse",
+  "network_used": false,
+  "files": [
+    {"path": "fabric-dbt/fabric_warehouse/dbt_project.yml", "blob_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"path": "fabric-dbt/fabric_warehouse/models/marts/fact_orders.sql", "blob_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {"path": "fabric-dbt/fabric_warehouse/macros/surrogate_key.sql", "blob_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+    {"path": "pipelines/deploy-warehouse.yml", "blob_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+  ]
+}

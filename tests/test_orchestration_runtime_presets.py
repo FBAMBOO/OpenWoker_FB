@@ -357,7 +357,11 @@ def test_task_create_api_exposes_the_conditioned_primary_profile_contract(servic
     assert preset.status_code == 201
     assert read_only.status_code == 201
     assert rejected.status_code == 422
-    assert "validated execute node with a Worker profile" in rejected.json()["detail"]
+    assert (
+        "validated execute node with a Worker profile"
+        in rejected.json()["error"]["message"]
+    )
+    assert rejected.json()["error"]["code"] == "SEMANTIC_VALIDATION_FAILED"
 
 
 def test_frozen_runtime_preset_snapshot_rejects_tampering(service):

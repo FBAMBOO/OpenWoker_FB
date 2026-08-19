@@ -1,0 +1,10 @@
+{
+  "snapshot_ref": "refs/remotes/origin/main",
+  "commit_oid": "2b2360f32117cc5b234e63230e1ae6741a64be70",
+  "project_root": "fabric-dbt/fabric_warehouse",
+  "required_areas": ["entrypoints", "models", "macros", "tests", "seeds", "snapshots", "deployment"],
+  "inventory": {"models": 228, "macro_sql": 52, "sql_tests": 42, "seeds": 5, "snapshots": 2, "pipeline_yaml": 15},
+  "minimum_quality_score": 85,
+  "citation_resolution_ratio": 1.0,
+  "artifact_read_coverage_ratio": 1.0
+}

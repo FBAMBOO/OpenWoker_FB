@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import uuid
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from .catalogs import CatalogConflict, CatalogError, CatalogNotFound
 from .api_schemas import (
@@ -13,6 +19,7 @@ from .api_schemas import (
     DelegateTaskRequest,
     HandoffSettingsPayload,
     ResultQuestionRequest,
+    TaskQualitySchemaSnapshot,
     TaskBriefPayload,
     TaskCommentRequest,
     TaskRelationRequest,
@@ -22,7 +29,157 @@ from .errors import ConflictError, NotFoundError, OrchestrationError
 from .handoff_models import HandoffValidationError
 from .models import OrchestrationStage, TaskStatus
 from .profiles import AgentRole, ProfileValidationError
+from .quality.models import (
+    Archetype,
+    ArtifactStatus,
+    BudgetMode,
+    BudgetStatus,
+    QualityStatus,
+    WorkflowStatus,
+)
+from .quality.state_machine import task_quality_schema_snapshot
 from .runtime import RuntimeErrorBase
+
+
+_ERROR_CODES = {
+    400: "INVALID_REQUEST",
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    409: "CONFLICT",
+    412: "ETAG_MISMATCH",
+    413: "PAYLOAD_TOO_LARGE",
+    416: "RANGE_NOT_SATISFIABLE",
+    422: "SEMANTIC_VALIDATION_FAILED",
+    423: "RESOURCE_LOCKED",
+    428: "PRECONDITION_REQUIRED",
+    429: "BUDGET_OR_RATE_LIMIT",
+    503: "PROVIDER_UNAVAILABLE",
+    507: "ARTIFACT_STORAGE_UNAVAILABLE",
+}
+_API_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"),
+    re.compile(r"(?i)\bsk-[a-z0-9_-]{12,}\b"),
+    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|password)\s*[:=]\s*)[^\s,;\"']+"),
+)
+
+
+def _safe_error_text(value: Any) -> str:
+    result = str(value)
+    for pattern in _API_SECRET_PATTERNS:
+        result = pattern.sub(
+            r"\1[REDACTED]" if pattern.groups else "[REDACTED_SECRET]", result
+        )
+    return result[:4_096]
+
+
+def _safe_error_details(value: Any, *, key: str = "") -> Any:
+    normalized_key = key.lower().replace("-", "_")
+    if any(
+        marker in normalized_key
+        for marker in ("authorization", "api_key", "token", "password", "secret", "cookie")
+    ):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _safe_error_details(item, key=str(item_key))
+            for item_key, item in value.items()
+            if str(item_key) != "input"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_error_details(item, key=key) for item in value]
+    if isinstance(value, str):
+        return _safe_error_text(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _safe_error_text(value)
+
+
+def _correlation_id(request: Request) -> str:
+    supplied = str(request.headers.get("x-correlation-id") or "").strip()
+    if supplied and len(supplied) <= 128 and re.fullmatch(r"[A-Za-z0-9._:-]+", supplied):
+        return supplied
+    return f"corr_{uuid.uuid4().hex}"
+
+
+def _error_response(
+    request: Request,
+    *,
+    status_code: int,
+    detail: Any,
+    headers: Optional[dict[str, str]] = None,
+) -> JSONResponse:
+    correlation_id = _correlation_id(request)
+    if isinstance(detail, dict):
+        code = str(detail.get("code") or _ERROR_CODES.get(status_code, "REQUEST_FAILED"))
+        message = _safe_error_text(detail.get("message") or code.replace("_", " ").title())
+        details = detail.get("details")
+        if details is None:
+            details = {
+                str(key): value
+                for key, value in detail.items()
+                if key not in {"code", "message", "retryable", "correlation_id"}
+            }
+        retryable = bool(detail.get("retryable", status_code in {429, 503, 507}))
+    else:
+        code = _ERROR_CODES.get(status_code, "REQUEST_FAILED")
+        message = _safe_error_text(detail)
+        details = {"issues": detail} if isinstance(detail, list) else {}
+        retryable = status_code in {429, 503, 507}
+    response_headers = {**dict(headers or {}), "X-Correlation-ID": correlation_id}
+    return JSONResponse(
+        status_code=status_code,
+        headers=response_headers,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+                "details": _safe_error_details(details),
+                "correlation_id": correlation_id,
+            }
+        },
+    )
+
+
+class _OrchestrationAPIRoute(APIRoute):
+    """Render every orchestration failure through the canonical V2 envelope."""
+
+    def get_route_handler(self) -> Callable[..., Any]:
+        original = super().get_route_handler()
+
+        async def handler(request: Request) -> Any:
+            try:
+                return await original(request)
+            except RequestValidationError as exc:
+                return _error_response(
+                    request,
+                    status_code=422,
+                    detail={
+                        "code": "SCHEMA_VALIDATION_FAILED",
+                        "message": "Request schema validation failed.",
+                        "retryable": False,
+                        "details": {
+                            "issues": [
+                                {
+                                    "location": [str(item) for item in issue.get("loc", ())],
+                                    "type": str(issue.get("type") or "validation_error"),
+                                    "message": _safe_error_text(issue.get("msg") or "invalid value"),
+                                }
+                                for issue in exc.errors()
+                            ]
+                        },
+                    },
+                )
+            except HTTPException as exc:
+                return _error_response(
+                    request,
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=exc.headers,
+                )
+
+        return handler
 
 
 def _translate(operation: Callable[[], Any]) -> Any:
@@ -46,6 +203,72 @@ def _etag(value: str | None) -> str:
     if not value:
         raise HTTPException(status_code=428, detail="If-Match is required for draft mutation")
     return value
+
+
+def _if_match(value: str | None) -> str:
+    """Normalize one strong ETag supplied by an operator mutation."""
+
+    chosen = _etag(value).strip()
+    if chosen.startswith("W/"):
+        raise HTTPException(status_code=412, detail="a strong If-Match ETag is required")
+    if chosen.startswith('"') and chosen.endswith('"'):
+        chosen = chosen[1:-1]
+    if not chosen:
+        raise HTTPException(status_code=428, detail="If-Match is required")
+    return chosen
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if not header:
+        return False
+    candidates = [item.strip() for item in header.split(",")]
+    return "*" in candidates or etag in {
+        item.removeprefix("W/").strip('"') for item in candidates
+    }
+
+
+def _byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Parse a single HTTP byte range and return a half-open interval."""
+
+    if value is None:
+        return None
+    if not value.startswith("bytes=") or "," in value:
+        raise HTTPException(
+            status_code=416,
+            detail="only one bytes range is supported",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    raw = value.removeprefix("bytes=").strip()
+    if "-" not in raw:
+        raise HTTPException(
+            status_code=416,
+            detail="invalid byte range",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    start_raw, end_raw = raw.split("-", 1)
+    try:
+        if not start_raw:
+            suffix = int(end_raw)
+            if suffix <= 0:
+                raise ValueError
+            start = max(0, size - suffix)
+            end = size
+        else:
+            start = int(start_raw)
+            end = size if not end_raw else min(size, int(end_raw) + 1)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=416,
+            detail="invalid byte range",
+            headers={"Content-Range": f"bytes */{size}"},
+        ) from exc
+    if start < 0 or start >= size or end <= start:
+        raise HTTPException(
+            status_code=416,
+            detail="byte range is not satisfiable",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    return start, end
 
 
 def _operation_id(
@@ -78,16 +301,22 @@ def _command_already_completed(service: Any, command_id: Optional[str]) -> bool:
 
 
 def create_orchestration_router(manager: Any) -> APIRouter:
-    router = APIRouter(prefix="/v1/orchestration", tags=["orchestration"])
+    router = APIRouter(
+        prefix="/v1/orchestration",
+        tags=["orchestration"],
+        route_class=_OrchestrationAPIRoute,
+    )
     service = manager.orchestration
 
     @router.get("/capabilities")
     def capabilities() -> dict[str, Any]:
+        quality_schema = task_quality_schema_snapshot()
         return {
             "schema_version": 2,
             "stages": [item.value for item in OrchestrationStage],
             "task_statuses": [item.value for item in TaskStatus],
             "agent_roles": [item.value for item in AgentRole],
+            "task_quality_v2": quality_schema,
             "limits": {
                 "max_depth": 3,
                 "max_concurrency": service.max_concurrency,
@@ -202,14 +431,134 @@ def create_orchestration_router(manager: Any) -> APIRouter:
             )
         )
 
+    # -- Task Quality V2 draft workflow ----------------------------------
+    @router.post("/task-drafts", status_code=201)
+    def create_task_draft(
+        payload: dict[str, Any] = Body(...),
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not str(idempotency_key or "").strip():
+            raise HTTPException(
+                status_code=428,
+                detail="Idempotency-Key is required for task draft creation",
+            )
+        return _translate(
+            lambda: service.quality.create_draft(
+                payload, idempotency_key=str(idempotency_key or "")
+            )
+        )
+
+    @router.post("/task-drafts/{task_id}:analyze")
+    def analyze_task_draft(
+        task_id: str,
+        payload: dict[str, Any] = Body(default={}),
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not str(idempotency_key or "").strip():
+            raise HTTPException(
+                status_code=428,
+                detail="Idempotency-Key is required for goal analysis",
+            )
+        return _translate(
+            lambda: service.quality.analyze(
+                task_id,
+                payload,
+                idempotency_key=str(idempotency_key or ""),
+            )
+        )
+
+    @router.get("/task-drafts/{task_id}/analysis")
+    def task_draft_analysis(task_id: str, response: Response) -> dict[str, Any]:
+        result = _translate(lambda: service.quality.analysis(task_id))
+        response.headers["ETag"] = f'"{result["contract_etag"]}"'
+        return result
+
+    @router.put("/task-drafts/{task_id}/contract")
+    def update_task_draft_contract(
+        task_id: str,
+        response: Response,
+        payload: dict[str, Any] = Body(...),
+        if_match: Optional[str] = Header(None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        result = _translate(
+            lambda: service.quality.update_contract(
+                task_id, payload, if_match=_if_match(if_match)
+            )
+        )
+        value = result.model_dump(mode="json", exclude_none=True)
+        response.headers["ETag"] = f'"{result.content_hash}"'
+        return value
+
+    @router.post("/task-drafts/{task_id}/target:resolve")
+    def resolve_task_draft_target(
+        task_id: str, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        return _translate(lambda: service.quality.resolve_target(task_id, payload))
+
+    @router.post("/task-drafts/{task_id}/snapshots", status_code=201)
+    def freeze_task_draft_snapshot(
+        task_id: str, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        return _translate(lambda: service.quality.freeze_snapshot(task_id, payload))
+
+    @router.post("/task-drafts/{task_id}/contract:publish")
+    def publish_task_draft_contract(
+        task_id: str,
+        response: Response,
+        if_match: Optional[str] = Header(None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        result = _translate(
+            lambda: service.quality.publish_contract(
+                task_id, if_match=_if_match(if_match)
+            )
+        )
+        response.headers["ETag"] = f'"{result["content_hash"]}"'
+        return result
+
+    @router.post("/task-drafts/{task_id}/strategy:generate")
+    def generate_task_draft_strategy(
+        task_id: str, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        return _translate(lambda: service.quality.generate_strategy(task_id, payload))
+
+    @router.post("/task-drafts/{task_id}:start")
+    def start_task_draft(task_id: str) -> dict[str, Any]:
+        return _translate(lambda: service.quality.start(task_id))
+
     # -- tasks ------------------------------------------------------------
     @router.get("/tasks")
     def list_tasks(
         status: Optional[list[TaskStatus]] = Query(None),
+        workflow_status: Optional[list[WorkflowStatus]] = Query(None),
+        quality_status: Optional[list[QualityStatus]] = Query(None),
+        artifact_status: Optional[list[ArtifactStatus]] = Query(None),
+        budget_status: Optional[list[BudgetStatus]] = Query(None),
+        archetype: Optional[list[Archetype]] = Query(None),
+        repo: Optional[str] = Query(None),
+        snapshot_ref: Optional[str] = Query(None),
+        budget_mode: Optional[list[BudgetMode]] = Query(None),
+        has_waiver: Optional[bool] = Query(None),
+        repair_count: Optional[int] = Query(None, ge=0),
+        created_by: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=10_000),
         offset: int = Query(0, ge=0),
     ) -> list[dict[str, Any]]:
-        return service.list_tasks(statuses=status, limit=limit, offset=offset)
+        return service.list_tasks(
+            statuses=status,
+            workflow_statuses=workflow_status,
+            quality_statuses=quality_status,
+            artifact_statuses=artifact_status,
+            budget_statuses=budget_status,
+            archetypes=archetype,
+            repo=repo,
+            snapshot_ref=snapshot_ref,
+            budget_modes=budget_mode,
+            has_waiver=has_waiver,
+            repair_count=repair_count,
+            created_by=created_by,
+            limit=limit,
+            offset=offset,
+        )
 
     @router.post("/tasks", status_code=201)
     def create_task(
@@ -259,6 +608,209 @@ def create_orchestration_router(manager: Any) -> APIRouter:
     @router.get("/tasks/{task_id}")
     def get_task(task_id: str) -> dict[str, Any]:
         return _translate(lambda: service.task_detail(task_id))
+
+    @router.get("/tasks/{task_id}/contract")
+    def task_quality_contract(task_id: str, response: Response) -> dict[str, Any]:
+        result = _translate(lambda: service.quality.active_contract(task_id))
+        response.headers["ETag"] = f'"{result["content_hash"]}"'
+        return result
+
+    @router.get("/tasks/{task_id}/snapshot")
+    def task_quality_snapshot(task_id: str) -> dict[str, Any]:
+        return _translate(lambda: service.quality.active_snapshot(task_id))
+
+    @router.get("/tasks/{task_id}/strategy")
+    def task_quality_strategy(task_id: str) -> dict[str, Any]:
+        return _translate(lambda: service.quality.active_strategy(task_id))
+
+    @router.get("/tasks/{task_id}/coverage")
+    def task_quality_coverage(
+        task_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1_000),
+        cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+    ) -> dict[str, Any]:
+        return _translate(
+            lambda: service.quality.coverage(
+                task_id, offset=offset, limit=limit, cursor=cursor
+            )
+        )
+
+    @router.get("/tasks/{task_id}/claims")
+    def task_quality_claims(
+        task_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1_000),
+        cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+    ) -> dict[str, Any]:
+        return _translate(
+            lambda: service.quality.claims(
+                task_id, offset=offset, limit=limit, cursor=cursor
+            )
+        )
+
+    @router.get("/tasks/{task_id}/quality")
+    def task_quality_results(
+        task_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1_000),
+        gate_cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+        finding_cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+        evaluation_cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+        waiver_cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+    ) -> dict[str, Any]:
+        return _translate(
+            lambda: service.quality.quality(
+                task_id,
+                offset=offset,
+                limit=limit,
+                gate_cursor=gate_cursor,
+                finding_cursor=finding_cursor,
+                evaluation_cursor=evaluation_cursor,
+                waiver_cursor=waiver_cursor,
+            )
+        )
+
+    @router.get("/tasks/{task_id}/deliverables")
+    def task_quality_deliverables(
+        task_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1_000),
+        cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
+    ) -> dict[str, Any]:
+        return _translate(
+            lambda: service.quality.deliverables(
+                task_id, offset=offset, limit=limit, cursor=cursor
+            )
+        )
+
+    @router.post("/tasks/{task_id}/repairs", status_code=201)
+    def create_task_repair(
+        task_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        return _translate(lambda: service.quality.request_repair(task_id, payload))
+
+    @router.post("/tasks/{task_id}/waivers", status_code=201)
+    def create_task_waiver(
+        task_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        if {"actor_id", "actor_role"}.intersection(payload):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "SERVER_DERIVED_IDENTITY_REQUIRED",
+                    "message": "Waiver actor identity is derived from authentication.",
+                },
+            )
+        authoritative = {
+            **payload,
+            # The desktop sidecar token represents one authenticated local
+            # operator. Request JSON can never forge this audit identity.
+            "actor_id": "local-user",
+            "actor_role": "admin",
+        }
+        return _translate(
+            lambda: service.quality.create_waiver(task_id, authoritative)
+        )
+
+    @router.post("/tasks/{task_id}:resume")
+    def resume_quality_task(
+        task_id: str, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        forbidden = {"actor_id", "actor_role", "resume_status", "workflow_status"}
+        if forbidden.intersection(payload):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "SERVER_DERIVED_IDENTITY_REQUIRED",
+                    "message": (
+                        "Resume identity and workflow target are derived by the server."
+                    ),
+                },
+            )
+        unexpected = sorted(set(payload) - {"effective_limits", "reason"})
+        if unexpected:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "RESUME_INPUT_REJECTED",
+                    "message": "Resume accepts only effective_limits and reason.",
+                    "details": {"unexpected_fields": unexpected},
+                },
+            )
+        authoritative = {**payload, "actor_id": "local-user"}
+        return _translate(lambda: service.quality.resume(task_id, authoritative))
+
+    # -- offline Task Quality benchmarks --------------------------------
+    @router.get("/benchmarks/suites")
+    def benchmark_suites() -> list[dict[str, Any]]:
+        return _translate(service.quality_benchmarks.list_suites)
+
+    @router.post("/benchmarks/runs", status_code=201)
+    def create_benchmark_run(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        allowed = {"suite_id", "candidate_id"}
+        unexpected = sorted(set(payload) - allowed)
+        if unexpected:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "BENCHMARK_INPUT_REJECTED",
+                    "message": "Benchmark runs accept registered identifiers only.",
+                    "details": {"unexpected_fields": unexpected},
+                },
+            )
+        return _translate(
+            lambda: service.quality_benchmarks.run(
+                str(payload.get("suite_id") or ""),
+                candidate_id=str(payload.get("candidate_id") or "v2"),
+            )
+        )
+
+    @router.get("/benchmarks/runs/{run_id}")
+    def benchmark_run(run_id: str) -> dict[str, Any]:
+        return _translate(lambda: service.quality_benchmarks.get_run(run_id))
+
+    @router.get("/benchmarks/runs/{run_id}/comparison")
+    def benchmark_comparison(run_id: str) -> dict[str, Any]:
+        return _translate(lambda: service.quality_benchmarks.comparison(run_id))
+
+    @router.post("/benchmarks/suites/{suite_id}:promote-baseline")
+    def promote_benchmark_baseline(
+        suite_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        if {"actor_id", "actor_role"}.intersection(payload):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "SERVER_DERIVED_IDENTITY_REQUIRED",
+                    "message": "Baseline actor identity is derived from authentication.",
+                },
+            )
+        return _translate(
+            lambda: service.quality_benchmarks.promote_baseline(
+                suite_id,
+                run_id=str(payload.get("run_id") or ""),
+                actor_id="local-user",
+                actor_role="admin",
+                reason=str(payload.get("reason") or ""),
+            )
+        )
+
+    @router.get("/tasks/{task_id}/export")
+    def export_quality_task(task_id: str) -> Response:
+        content, filename = _translate(lambda: service.quality.export(task_id))
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename*=UTF-8''" + quote(filename, safe="")
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     # -- task-centric handoff -------------------------------------------
     @router.get("/tasks/{task_id}/heartbeat-context")
@@ -824,6 +1376,12 @@ def create_orchestration_router(manager: Any) -> APIRouter:
             },
         }
 
+    @router.get("/task-quality/schema", response_model=TaskQualitySchemaSnapshot)
+    def task_quality_schema() -> TaskQualitySchemaSnapshot:
+        """Expose the typed source used by OpenAPI and the GUI generator."""
+
+        return TaskQualitySchemaSnapshot.model_validate(task_quality_schema_snapshot())
+
     @router.get("/tasks/{task_id}/runs")
     def task_runs(
         task_id: str,
@@ -849,9 +1407,106 @@ def create_orchestration_router(manager: Any) -> APIRouter:
         task_id: str,
         offset: int = Query(0, ge=0),
         limit: int = Query(200, ge=1, le=500),
+        claim_id: Optional[str] = Query(None),
+        path: Optional[str] = Query(None),
+        cursor: Optional[str] = Query(None, min_length=1, max_length=2_048),
     ) -> dict[str, Any]:
+        projection = _translate(lambda: service.quality.task_projection(task_id))
+        if projection["task_quality_v2"]:
+            result = _translate(
+                lambda: service.quality.evidence(
+                    task_id,
+                    offset=offset,
+                    limit=limit,
+                    claim_id=claim_id,
+                    path=path,
+                    cursor=cursor,
+                )
+            )
+            page = result["evidence"]
+            return {
+                "task_id": task_id,
+                "evidence": page["items"],
+                **{key: value for key, value in page.items() if key != "items"},
+                "order": "oldest_to_newest",
+            }
         return _translate(
             lambda: service.task_evidence_page(task_id, offset=offset, limit=limit)
+        )
+
+    @router.get("/artifacts/{artifact_id}")
+    def artifact_metadata(artifact_id: str, response: Response) -> dict[str, Any]:
+        result = _translate(lambda: service.quality.artifact_metadata(artifact_id))
+        if result.get("sha256"):
+            response.headers["ETag"] = f'"{result["sha256"]}"'
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return result
+
+    @router.get("/artifacts/{artifact_id}/content")
+    def artifact_content(
+        artifact_id: str,
+        range_header: Optional[str] = Header(None, alias="Range"),
+        if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
+    ) -> Response:
+        artifact, content = _translate(
+            lambda: service.quality.artifact_content(artifact_id)
+        )
+        etag = str(artifact.sha256)
+        headers = {
+            "ETag": f'"{etag}"',
+            "Accept-Ranges": "bytes",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, immutable, max-age=31536000",
+        }
+        if _etag_matches(if_none_match, etag):
+            return Response(status_code=304, headers=headers)
+        selected = _byte_range(range_header, len(content))
+        if selected is None:
+            return Response(content=content, media_type=artifact.mime_type, headers=headers)
+        start, end = selected
+        headers["Content-Range"] = f"bytes {start}-{end - 1}/{len(content)}"
+        headers["Content-Length"] = str(end - start)
+        return Response(
+            content=content[start:end],
+            status_code=206,
+            media_type=artifact.mime_type,
+            headers=headers,
+        )
+
+    @router.get("/artifacts/{artifact_id}/download")
+    def download_artifact(
+        artifact_id: str,
+        if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
+    ) -> Response:
+        artifact, content = _translate(
+            lambda: service.quality.artifact_content(artifact_id)
+        )
+        etag = str(artifact.sha256)
+        headers = {
+            "ETag": f'"{etag}"',
+            "Content-Disposition": (
+                "attachment; filename*=UTF-8''" + quote(artifact.filename, safe="")
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, immutable, max-age=31536000",
+        }
+        if _etag_matches(if_none_match, etag):
+            return Response(status_code=304, headers=headers)
+        return Response(content=content, media_type=artifact.mime_type, headers=headers)
+
+    @router.get("/artifacts/{artifact_id}/diff")
+    def artifact_diff(
+        artifact_id: str, base: str = Query(..., min_length=1)
+    ) -> Response:
+        content = _translate(
+            lambda: service.quality.artifact_diff(
+                artifact_id, base_artifact_id=base
+            )
+        )
+        return Response(
+            content=content,
+            media_type="text/x-diff; charset=utf-8",
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     @router.get("/blobs/{sha256}")

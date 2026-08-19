@@ -10,6 +10,230 @@ export const ORCHESTRATION_STAGES = [
 ] as const;
 
 export type OrchestrationStage = (typeof ORCHESTRATION_STAGES)[number];
+
+export * from "./taskQuality.generated";
+import type {
+  TaskQualityArchetype,
+  TaskQualityArtifactStatus,
+  TaskQualityBudgetMode,
+  TaskQualityBudgetStatus,
+  TaskQualityStatus,
+  TaskQualityWorkflowStatus,
+} from "./taskQuality.generated";
+
+export interface PrimaryDeliverable {
+  artifact_id: string;
+  deliverable_id: string;
+  filename: string;
+  mime_type: string;
+  sha256: string;
+  byte_size: number;
+  version: number;
+  status: TaskQualityArtifactStatus;
+}
+
+export interface QualityVerdict {
+  evaluation_id: string;
+  decision: "publish" | "repair" | "needs_attention" | "reject" | string;
+  rubric_score_id?: string | null;
+  total_score?: number | null;
+  finding_ids: string[];
+  content_hash: string;
+}
+
+export interface EffectiveBudget {
+  ledger_id?: string;
+  mode: TaskQualityBudgetMode | "unconfigured";
+  source?: string | null;
+  used: Record<string, number>;
+  reserved: Record<string, number>;
+  remaining: Record<string, number>;
+  limit: Record<string, number | null>;
+  provider_usage?: Record<string, unknown>;
+  over_budget?: boolean;
+  fencing_token?: number;
+}
+
+export interface RepositoryTargetSummary {
+  repo: string;
+  repo_root: string;
+  snapshot_ref?: string | null;
+  short_sha?: string | null;
+  dirty: boolean;
+  snapshot_id: string;
+}
+
+export interface TaskQualityRequirement {
+  id: string;
+  category: string;
+  text: string;
+  required: boolean;
+  hard_gate: boolean;
+  source: string;
+  confidence?: number | null;
+  verification_method: string;
+}
+
+export interface TaskQualityDeliverableSpec {
+  id: string;
+  kind: string;
+  filename: string;
+  mime_type: string;
+  required: boolean;
+  primary: boolean;
+  required_sections: string[];
+  result_schema_id: string;
+}
+
+export interface TaskQualityContract {
+  id: string;
+  task_id: string;
+  version: number;
+  status: "draft" | "published" | "superseded";
+  title: string;
+  objective: string;
+  archetype: TaskQualityArchetype;
+  quality_profile_id: string;
+  original_prompt_hash: string;
+  requirements: TaskQualityRequirement[];
+  deliverables: TaskQualityDeliverableSpec[];
+  constraints: Array<Record<string, unknown>>;
+  non_goals: string[];
+  content_hash: string;
+  etag: string;
+}
+
+export interface RepositorySnapshotV2 extends Record<string, unknown> {
+  id: string;
+  task_id: string;
+  version: number;
+  status: string;
+  repo_root: string;
+  project_root: string;
+  snapshot_kind: string;
+  selected_ref?: string | null;
+  commit_oid?: string | null;
+  dirty: boolean;
+  manifest_hash: string;
+  resolution_confidence: number;
+  resolution_reason: string;
+}
+
+export interface ExecutionStrategyV2 extends Record<string, unknown> {
+  id: string;
+  task_id: string;
+  version: number;
+  archetype: TaskQualityArchetype;
+  template_id: string;
+  assessment: {
+    cognitive_complexity: number;
+    operational_risk: number;
+    evidence_workload: number;
+    rationale: string[];
+  };
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<Record<string, unknown>>;
+  effective_policy: Record<string, unknown>;
+  policy_provenance?: Record<string, unknown>;
+  budget_profile: Record<string, unknown>;
+  max_repair_attempts: number;
+  content_hash: string;
+}
+
+export interface TaskDraftAnalysisV2 {
+  id: string;
+  task_id: string;
+  status: string;
+  contract: TaskQualityContract;
+  contract_etag: string;
+  target_resolution: Record<string, unknown>;
+  request_hash: string;
+}
+
+export interface TaskQualityPage<T> {
+  items: T[];
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  next_offset?: number | null;
+  cursor?: string | null;
+  next_cursor?: string | null;
+  pagination?: "offset" | "cursor";
+}
+
+export interface QualityFinding extends Record<string, unknown> {
+  id: string;
+  severity: string;
+  category: string;
+  message: string;
+  blocking: boolean;
+  repairable: boolean;
+  status: string;
+  section_id?: string | null;
+  suggested_fix?: string | null;
+}
+
+export interface QualityBundleV2 {
+  task_id: string;
+  quality_status: TaskQualityStatus;
+  quality_reason_code?: string | null;
+  quality_verdict?: QualityVerdict | null;
+  gates: TaskQualityPage<Record<string, unknown>>;
+  findings: TaskQualityPage<QualityFinding>;
+  evaluations: TaskQualityPage<Record<string, unknown>>;
+  waivers: TaskQualityPage<Record<string, unknown>>;
+}
+
+export interface TaskQualityApiError {
+  error: {
+    code: string;
+    message: string;
+    retryable: boolean;
+    details: Record<string, unknown>;
+    correlation_id: string;
+  };
+}
+
+export interface TaskQualityBenchmarkSuite {
+  id: string;
+  name: string;
+  stack: string;
+  version: number;
+  snapshot_artifact_id: string;
+  prompt_hash: string;
+  candidate_ids: string[];
+  baseline_candidate: string;
+  thresholds: Record<string, number>;
+  content_hash: string;
+  promoted_baseline?: Record<string, unknown>;
+}
+
+export interface TaskQualityBenchmarkRun {
+  id: string;
+  suite_id: string;
+  suite_version: number;
+  suite_hash: string;
+  snapshot_artifact_id: string;
+  prompt_hash: string;
+  candidate_id: string;
+  status: "pass" | "fail";
+  metrics: Record<string, unknown>;
+  failures: Array<Record<string, unknown>>;
+  created_at: string;
+  completed_at: string;
+  content_hash: string;
+}
+
+export interface TaskQualityBenchmarkComparison {
+  run_id: string;
+  suite_id: string;
+  candidate_id: string;
+  baseline: Record<string, unknown>;
+  current_metrics: Record<string, unknown>;
+  baseline_metrics: Record<string, unknown>;
+  deltas: Record<string, number>;
+  quality_score_regression: boolean;
+}
 export type WorkStatus =
   | "pending"
   | "ready"
@@ -58,6 +282,26 @@ export interface OrchestrationTaskSummary {
   parent_task_id?: string | null;
   parent_run_id?: string | null;
   terminal_outcome?: WorkStatus | "draft";
+  task_quality_v2?: boolean;
+  workflow_status?: TaskQualityWorkflowStatus;
+  workflow_resume_status?: TaskQualityWorkflowStatus | null;
+  quality_status?: TaskQualityStatus;
+  artifact_status?: TaskQualityArtifactStatus;
+  budget_status?: TaskQualityBudgetStatus;
+  quality_reason_code?: string | null;
+  attention_reason?: string | null;
+  archetype?: TaskQualityArchetype | null;
+  primary_deliverable?: PrimaryDeliverable | null;
+  quality_verdict?: QualityVerdict | null;
+  quality_score?: number | null;
+  hard_gate_status?: "pending" | "pass" | "fail" | "unknown" | string;
+  effective_budget?: EffectiveBudget;
+  budget_utilization_percent?: number | null;
+  target?: RepositoryTargetSummary | null;
+  has_waiver?: boolean;
+  run_summary?: { nodes: number; repairs: number };
+  created_by?: string | null;
+  started_at?: string | null;
 }
 
 export interface CreateOrchestrationTask {
@@ -375,6 +619,9 @@ export interface AuditPage {
   offset?: number;
   limit?: number;
   next_offset?: number | null;
+  cursor?: string | null;
+  next_cursor?: string | null;
+  pagination?: "offset" | "cursor";
   order?: "oldest_to_newest" | string;
 }
 
@@ -450,6 +697,18 @@ export interface OrchestrationHealth {
       gauges?: Record<string, number>;
       histograms?: Record<string, unknown>;
     };
+  };
+  task_quality?: {
+    schema_version: number;
+    metrics: Record<string, unknown>;
+    series: Record<string, unknown>;
+    alerts: Array<{
+      code: string;
+      severity: string;
+      observed: number;
+      message: string;
+    }>;
+    privacy: string;
   };
 }
 
@@ -563,6 +822,14 @@ export interface OrchestrationTaskDetail extends OrchestrationTaskSummary {
   children_details?: OrchestrationTaskDetail[];
   children_page?: ChildTaskPage;
   runtime_page?: RuntimePage;
+  quality_refs?: {
+    contract_id?: string | null;
+    snapshot_id?: string | null;
+    strategy_id?: string | null;
+    budget_ledger_id?: string | null;
+  };
+  legacy_quality_projection?: boolean;
+  quality_projection_warning?: string;
 }
 
 export interface ValidationIssue {

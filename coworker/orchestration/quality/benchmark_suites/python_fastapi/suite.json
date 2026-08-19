@@ -1,0 +1,23 @@
+{
+  "id": "python_fastapi",
+  "name": "Python FastAPI service analysis",
+  "stack": "python-fastapi",
+  "version": 1,
+  "snapshot_artifact_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "prompt_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222223",
+  "baseline_candidate": "legacy",
+  "thresholds": {"quality_score": 85, "citation_resolution_ratio": 1.0, "artifact_read_coverage_ratio": 1.0, "duplicate_scan_ratio": 0.2, "reported_tokens": 3000000, "tool_calls": 120, "elapsed_seconds": 1200},
+  "oracle": {"required_areas": ["entrypoints", "packages", "api", "data", "tests", "config", "deployment"], "inventory": {"python_modules": 34, "routes": 18, "tests": 27, "deployment_files": 4}},
+  "candidate_defaults": {
+    "rubric_scores": {"architecture_coverage": 27, "relationships": 18, "evidence": 18, "quantitative": 8, "risk_actionability": 9, "limitations": 5, "presentation": 5},
+    "covered_areas": ["entrypoints", "packages", "api", "data", "tests", "config", "deployment"],
+    "citations_total": 24, "citations_resolved": 24, "priority_claims": 6, "priority_claims_with_direct_evidence": 6,
+    "reviewer_read_bytes": 12000, "artifact_bytes": 12000, "snapshot_correct": true, "baseline_error_count": 0,
+    "expensive_queries": 12, "duplicate_non_cached_queries": 1, "reported_tokens": 720000, "tool_calls": 44, "elapsed_seconds": 280,
+    "repair_attempts": 0, "repair_success_ratio": 1.0, "primary_deliverable_present": true, "primary_deliverable_mime": "text/markdown",
+    "workspace_unchanged": true, "aggregation_separated": true, "schema_field_loss": 0,
+    "hard_gates": {"QG001": "pass", "QG002": "pass", "QG003": "pass", "QG010": "pass", "QG013": "pass"},
+    "inventory": {"python_modules": 34, "routes": 18, "tests": 27, "deployment_files": 4}
+  },
+  "candidates": {"v2": {}, "legacy": {"rubric_scores": {"coverage": 42, "evidence": 18, "clarity": 12}, "covered_areas": ["entrypoints", "api", "tests", "config"], "citations_resolved": 18, "reviewer_read_bytes": 6000, "hard_gates": {"QG003": "fail", "QG010": "fail"}}}
+}

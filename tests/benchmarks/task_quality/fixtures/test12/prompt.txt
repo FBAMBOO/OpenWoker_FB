@@ -1,0 +1,1 @@
+只读分析当前 Fabric/dbt 项目的整体架构，识别 dbt 项目入口、models、macros、tests、seeds、snapshots 和部署配置之间的关系，并给出带文件证据的架构报告。不要修改任何文件。
