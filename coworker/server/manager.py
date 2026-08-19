@@ -191,9 +191,10 @@ class SessionManager:
         self.orchestration = OrchestrationService(
             self,
             base / "orchestration",
-            # Usage remains auditable, but a fixed model/tool/token/time allowance
-            # must not terminate a run merely because it was divided across the DAG.
-            enforce_runtime_budgets=False,
+            # Production defaults to enforced limits. Task Quality V2 replaces the
+            # former equal-DAG split with a versioned strategy ledger; an explicitly
+            # selected unlimited profile remains possible and visible as such.
+            enforce_runtime_budgets=True,
         )
         # Seed the PDF-fallback module global from prefs so engines see the user's
         # choice from the first turn (set_pdf_settings keeps it in sync after).

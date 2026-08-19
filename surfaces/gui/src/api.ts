@@ -42,6 +42,16 @@ export class ApiRequestError extends Error {
   }
 }
 
+const responseErrorMessage = (payload: unknown, status: number): string => {
+  const body = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : {};
+  const canonical = body.error && typeof body.error === "object" && !Array.isArray(body.error)
+    ? body.error as Record<string, unknown>
+    : {};
+  return String(canonical.message || body.message || (typeof body.error === "string" ? body.error : "") || body.detail || `Request failed (${status})`);
+};
+
 /** Authenticated JSON seam for feature modules with their own versioned API contracts. */
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const url = /^https?:\/\//.test(path) ? path : `${httpBase()}${path.startsWith("/") ? path : `/${path}`}`;
@@ -56,9 +66,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
     }
   }
   if (!response.ok) {
-    const body = payload as Record<string, unknown>;
-    const message = String(body?.message || body?.error || body?.detail || `Request failed (${response.status})`);
-    throw new ApiRequestError(response.status, message, payload);
+    throw new ApiRequestError(response.status, responseErrorMessage(payload, response.status), payload);
   }
   return payload as T;
 }
@@ -75,9 +83,7 @@ export async function downloadApiResource(path: string, filename = "download"): 
     } catch {
       // Preserve the plain-text message for ApiRequestError below.
     }
-    const body = payload as Record<string, unknown>;
-    const message = String(body?.message || body?.error || body?.detail || `Request failed (${response.status})`);
-    throw new ApiRequestError(response.status, message, payload);
+    throw new ApiRequestError(response.status, responseErrorMessage(payload, response.status), payload);
   }
 
   const blobUrl = URL.createObjectURL(await response.blob());

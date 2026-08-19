@@ -8,6 +8,21 @@ import {
   type OrchestrationApi,
 } from "./api";
 import { TaskHandoffPanel, type HandoffPanelKind } from "./HandoffPanels";
+import { BudgetPanel } from "./BudgetPanel";
+import { DeliverableViewer } from "./DeliverableViewer";
+import { EvidenceExplorer } from "./EvidenceExplorer";
+import { TaskQualityDefinitionPanel } from "./TaskQualityDefinitionPanel";
+import { TaskQualityOverview } from "./TaskQualityOverview";
+import { TaskQualityPanel } from "./TaskQualityPanel";
+import { TaskQualityWizard } from "./TaskQualityWizard";
+import {
+  TASK_QUALITY_ARCHETYPES,
+  TASK_QUALITY_ARTIFACT_STATUSES,
+  TASK_QUALITY_BUDGET_MODES,
+  TASK_QUALITY_BUDGET_STATUSES,
+  TASK_QUALITY_STATUSES,
+  TASK_QUALITY_WORKFLOW_STATUSES,
+} from "./types";
 import type {
   AgentRole,
   AgentProfileSummary,
@@ -46,10 +61,29 @@ import {
   StatusBadge,
 } from "./ui";
 
-type DetailTab = "brief" | "context" | "dependencies" | "communication" | "products" | "wakes" | "graph" | "runs" | "evidence" | "activity";
+type DetailTab = "overview" | "brief" | "context" | "dependencies" | "communication" | "products" | "wakes" | "graph" | "runs" | "evidence" | "activity" | "contract" | "target" | "deliverables" | "quality" | "budget" | "audit";
 type GraphMode = "dag" | "list";
 type TaskAction = "submit" | "pause" | "resume" | "cancel" | "archive" | "restore";
 type TaskFilter = "active" | "finished" | "archived" | "all";
+interface QualityListFilters {
+  workflowStatus: string;
+  qualityStatus: string;
+  artifactStatus: string;
+  budgetStatus: string;
+  archetype: string;
+  repo: string;
+  snapshotRef: string;
+  budgetMode: string;
+  hasWaiver: string;
+  repairCount: string;
+  createdBy: string;
+}
+
+const EMPTY_QUALITY_LIST_FILTERS: QualityListFilters = {
+  workflowStatus: "", qualityStatus: "", artifactStatus: "", budgetStatus: "",
+  archetype: "", repo: "", snapshotRef: "", budgetMode: "", hasWaiver: "",
+  repairCount: "", createdBy: "",
+};
 
 const TASK_PAGE_SIZE = 20;
 const DEFAULT_RUNTIME_PRESET_ID = "production-codex-led-mixed-v1";
@@ -179,7 +213,9 @@ export function OrchestrationSurface({
   const [listError, setListError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [createMode, setCreateMode] = useState<"classic" | "quality-v2">("classic");
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("active");
+  const [qualityFilters, setQualityFilters] = useState<QualityListFilters>(EMPTY_QUALITY_LIST_FILTERS);
   const [taskPage, setTaskPage] = useState(0);
   const [hasNextPage, setHasNextPage] = useState(false);
   const [runDetailsId, setRunDetailsId] = useState<string | null>(null);
@@ -228,6 +264,17 @@ export function OrchestrationSurface({
     try {
       const next = await api.listTasks({
         ...(taskFilter === "all" ? {} : { statuses: TASK_FILTER_STATUSES[taskFilter] }),
+        ...(qualityFilters.workflowStatus ? { workflowStatuses: [qualityFilters.workflowStatus as NonNullable<OrchestrationTaskSummary["workflow_status"]>] } : {}),
+        ...(qualityFilters.qualityStatus ? { qualityStatuses: [qualityFilters.qualityStatus as NonNullable<OrchestrationTaskSummary["quality_status"]>] } : {}),
+        ...(qualityFilters.artifactStatus ? { artifactStatuses: [qualityFilters.artifactStatus as NonNullable<OrchestrationTaskSummary["artifact_status"]>] } : {}),
+        ...(qualityFilters.budgetStatus ? { budgetStatuses: [qualityFilters.budgetStatus as NonNullable<OrchestrationTaskSummary["budget_status"]>] } : {}),
+        ...(qualityFilters.archetype ? { archetypes: [qualityFilters.archetype as NonNullable<OrchestrationTaskSummary["archetype"]>] } : {}),
+        ...(qualityFilters.repo ? { repo: qualityFilters.repo } : {}),
+        ...(qualityFilters.snapshotRef ? { snapshotRef: qualityFilters.snapshotRef } : {}),
+        ...(qualityFilters.budgetMode ? { budgetModes: [qualityFilters.budgetMode as "hard" | "soft" | "unlimited"] } : {}),
+        ...(qualityFilters.hasWaiver ? { hasWaiver: qualityFilters.hasWaiver === "true" } : {}),
+        ...(qualityFilters.repairCount ? { repairCount: Number(qualityFilters.repairCount) } : {}),
+        ...(qualityFilters.createdBy ? { createdBy: qualityFilters.createdBy } : {}),
         limit: TASK_PAGE_SIZE + 1,
         offset: taskPage * TASK_PAGE_SIZE,
       });
@@ -247,7 +294,7 @@ export function OrchestrationSurface({
     } finally {
       if (listRequestId.current === requestId && blocking) setLoadingList(false);
     }
-  }, [api, initialTaskId, taskFilter, taskPage]);
+  }, [api, initialTaskId, qualityFilters, taskFilter, taskPage]);
 
   const loadDetail = useCallback(async (taskId: string) => {
     const requestId = ++detailRequestId.current;
@@ -493,12 +540,20 @@ export function OrchestrationSurface({
     await loadTasks();
   };
 
+  const openStartedQualityTask = async (taskId: string) => {
+    setShowCreate(false);
+    setSelectedId(taskId);
+    const next = await api.getTask(taskId);
+    setDetail(next);
+    await loadTasks();
+  };
+
   const runTaskAction = async (action: TaskAction) => {
     if (!selectedId) return;
     const operation = {
       submit: api.submitTask,
       pause: api.pauseTask,
-      resume: api.resumeTask,
+      resume: detail?.task_quality_v2 ? api.resumeTaskQuality : api.resumeTask,
       cancel: api.cancelTask,
       archive: api.archiveTask,
       restore: api.restoreTask,
@@ -708,6 +763,11 @@ export function OrchestrationSurface({
     setActivityHasOlder(false);
   };
 
+  const updateQualityFilter = (key: keyof QualityListFilters, value: string) => {
+    setQualityFilters((current) => ({ ...current, [key]: value }));
+    setTaskPage(0);
+  };
+
   return (
     <main className="flex min-h-0 flex-1 bg-paper" data-testid="orchestration-surface">
       <aside className="flex w-[280px] shrink-0 flex-col border-r border-line bg-panel/50">
@@ -716,7 +776,10 @@ export function OrchestrationSurface({
             <Icon name="branch" size={16} /> Tasks
             <button
               className="ml-auto flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-medium text-accent hover:bg-accentSoft"
-              onClick={() => setShowCreate(true)}
+              onClick={() => {
+                setCreateMode("classic");
+                setShowCreate(true);
+              }}
             >
               <Icon name="plus" size={12} /> New
             </button>
@@ -742,6 +805,27 @@ export function OrchestrationSurface({
               <option value="all">All tasks</option>
             </select>
           </label>
+          <details className="mt-2 rounded-lg border border-line bg-paper px-2.5 py-2">
+            <summary className="cursor-pointer text-[10.5px] font-medium text-ink">Task Quality filters</summary>
+            <div className="mt-2 space-y-2">
+              <label className="block text-[9.5px] text-muted">Workflow<select aria-label="Workflow status filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.workflowStatus} onChange={(event) => updateQualityFilter("workflowStatus", event.target.value)}><option value="">Any</option>{TASK_QUALITY_WORKFLOW_STATUSES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+              <div className="grid grid-cols-2 gap-1.5">
+                <label className="block text-[9.5px] text-muted">Quality<select aria-label="Quality status filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.qualityStatus} onChange={(event) => updateQualityFilter("qualityStatus", event.target.value)}><option value="">Any</option>{TASK_QUALITY_STATUSES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+                <label className="block text-[9.5px] text-muted">Artifact<select aria-label="Artifact status filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.artifactStatus} onChange={(event) => updateQualityFilter("artifactStatus", event.target.value)}><option value="">Any</option>{TASK_QUALITY_ARTIFACT_STATUSES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+                <label className="block text-[9.5px] text-muted">Budget status<select aria-label="Budget status filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.budgetStatus} onChange={(event) => updateQualityFilter("budgetStatus", event.target.value)}><option value="">Any</option>{TASK_QUALITY_BUDGET_STATUSES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+                <label className="block text-[9.5px] text-muted">Budget mode<select aria-label="Budget mode filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.budgetMode} onChange={(event) => updateQualityFilter("budgetMode", event.target.value)}><option value="">Any</option>{TASK_QUALITY_BUDGET_MODES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+              </div>
+              <label className="block text-[9.5px] text-muted">Archetype<select aria-label="Task archetype filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.archetype} onChange={(event) => updateQualityFilter("archetype", event.target.value)}><option value="">Any</option>{TASK_QUALITY_ARCHETYPES.map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label>
+              <input aria-label="Repository filter" className={`${INPUT} w-full py-1 text-[10px]`} value={qualityFilters.repo} onChange={(event) => updateQualityFilter("repo", event.target.value)} placeholder="Repository" />
+              <input aria-label="Snapshot ref filter" className={`${INPUT} w-full py-1 text-[10px]`} value={qualityFilters.snapshotRef} onChange={(event) => updateQualityFilter("snapshotRef", event.target.value)} placeholder="Snapshot ref / SHA" />
+              <div className="grid grid-cols-2 gap-1.5">
+                <label className="block text-[9.5px] text-muted">Waiver<select aria-label="Waiver filter" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.hasWaiver} onChange={(event) => updateQualityFilter("hasWaiver", event.target.value)}><option value="">Any</option><option value="true">Has waiver</option><option value="false">No waiver</option></select></label>
+                <label className="block text-[9.5px] text-muted">Repairs<input aria-label="Repair count filter" type="number" min="0" className={`${INPUT} mt-0.5 w-full py-1 text-[10px]`} value={qualityFilters.repairCount} onChange={(event) => updateQualityFilter("repairCount", event.target.value)} placeholder="Any" /></label>
+              </div>
+              <input aria-label="Created by filter" className={`${INPUT} w-full py-1 text-[10px]`} value={qualityFilters.createdBy} onChange={(event) => updateQualityFilter("createdBy", event.target.value)} placeholder="Created by" />
+              <button type="button" className={`${BUTTON} w-full`} onClick={() => { setQualityFilters(EMPTY_QUALITY_LIST_FILTERS); setTaskPage(0); }}>Clear quality filters</button>
+            </div>
+          </details>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2.5">
           {loadingList ? (
@@ -805,12 +889,28 @@ export function OrchestrationSurface({
             onRequeue={(outboxId) => void requeueDeadLetter(outboxId)}
           />
           {showCreate ? (
-            <CreateTaskForm
-              api={api}
-              initialWorkspace={currentWorkspace}
-              onCreate={createTask}
-              onCancel={() => setShowCreate(false)}
-            />
+            <div>
+              <div className="mb-4 flex items-center gap-2" aria-label="Task creation mode">
+                <button type="button" className={createMode === "classic" ? `${BUTTON} border-accent bg-accentSoft text-accent` : BUTTON} onClick={() => setCreateMode("classic")}>Classic</button>
+                <button type="button" className={createMode === "quality-v2" ? `${BUTTON} border-accent bg-accentSoft text-accent` : BUTTON} onClick={() => setCreateMode("quality-v2")}>Task Quality V2</button>
+                <span className="ml-2 text-[10.5px] text-muted">V2 is an opt-in immutable quality workflow for repository tasks.</span>
+              </div>
+              {createMode === "classic" ? (
+                <CreateTaskForm
+                  api={api}
+                  initialWorkspace={currentWorkspace}
+                  onCreate={createTask}
+                  onCancel={() => setShowCreate(false)}
+                />
+              ) : (
+                <TaskQualityWizard
+                  api={api}
+                  initialWorkspace={currentWorkspace}
+                  onStarted={openStartedQualityTask}
+                  onCancel={() => setShowCreate(false)}
+                />
+              )}
+            </div>
           ) : !selectedId ? (
             <EmptyState title="Select a task" detail="Task plans, agent runs, evidence, and decisions appear here." />
           ) : loadingDetail && !detail ? (
@@ -884,7 +984,8 @@ function OperationalHealthPanel({
   onRefresh: () => void;
   onRequeue: (outboxId: string) => void;
 }) {
-  if (!error && (!health || health.ready)) return null;
+  const qualityAlerts = health?.task_quality?.alerts || [];
+  if (!error && (!health || (health.ready && qualityAlerts.length === 0))) return null;
   const leader = health?.leader;
   const outbox = health?.outbox;
   return (
@@ -897,7 +998,7 @@ function OperationalHealthPanel({
         <Icon name="shield" size={16} className="mt-0.5 shrink-0 text-warnInk" />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <h2 className="text-[13px] font-semibold text-warnInk">Orchestration recovery</h2>
+            <h2 className="text-[13px] font-semibold text-warnInk">{health?.ready ? "Task quality alerts" : "Orchestration recovery"}</h2>
             {health && <span className="text-[10px] uppercase tracking-wide text-warnInk/70">{health.state}</span>}
             <button type="button" className="ml-auto text-[11px] font-medium text-accent hover:underline" onClick={onRefresh}>
               Refresh health
@@ -926,6 +1027,15 @@ function OperationalHealthPanel({
           {(health?.last_error || outbox?.last_error) && (
             <div className="mt-2 break-words rounded-lg bg-panel/50 px-3 py-2 font-mono text-[10px] text-danger">
               {health?.last_error || outbox?.last_error}
+            </div>
+          )}
+          {qualityAlerts.length > 0 && (
+            <div className="mt-3 space-y-1.5" aria-label="Task quality alerts">
+              {qualityAlerts.map((alert) => (
+                <div key={alert.code} className="rounded-lg border border-danger/20 bg-dangerSoft px-3 py-2 text-[10.5px] text-danger">
+                  <span className="font-semibold">{alert.code}</span><span className="ml-2">{alert.message}</span><span className="ml-2 text-[9.5px]">observed {alert.observed}</span>
+                </div>
+              ))}
             </div>
           )}
           {deadLetters.length > 0 && (
@@ -1458,6 +1568,14 @@ function CreateTaskForm({
 }
 
 function TaskRow({ task, selected, onSelect }: { task: OrchestrationTaskSummary; selected: boolean; onSelect: () => void }) {
+  const qualityAttention = task.task_quality_v2 && (
+    task.quality_status === "fail"
+    || task.quality_status === "waived"
+    || task.hard_gate_status === "fail"
+    || task.artifact_status === "rejected"
+    || task.budget_status === "exhausted"
+    || task.budget_status === "over_budget"
+  );
   return (
     <button
       className={`w-full rounded-xl px-3 py-2.5 text-left transition-colors ${
@@ -1474,10 +1592,30 @@ function TaskRow({ task, selected, onSelect }: { task: OrchestrationTaskSummary;
         )}
       </div>
       <div className="mt-1 flex items-center gap-1.5">
-        <StatusBadge status={task.status} />
-        <span className="truncate text-[10.5px] text-faint">{task.stage === "archive" ? (task.status === "running" ? "Finalizing" : "Finalized") : humanize(task.stage)}</span>
+        <StatusBadge status={task.task_quality_v2 ? task.workflow_status || task.status : task.status} />
+        <span className="truncate text-[10.5px] text-faint">{task.task_quality_v2 ? humanize(task.archetype || "custom") : task.stage === "archive" ? (task.status === "running" ? "Finalizing" : "Finalized") : humanize(task.stage)}</span>
         <span className="ml-auto shrink-0 text-[10px] text-faint">{formatTime(task.updated_at)}</span>
       </div>
+      {task.task_quality_v2 && (
+        <>
+          <div className="mt-1.5 grid grid-cols-3 gap-1 text-[9px]">
+            <span className={`truncate rounded px-1.5 py-0.5 ${qualityAttention ? "bg-warnSoft text-warnInk" : "bg-paper text-muted"}`}>Quality {humanize(task.quality_status || "pending")}</span>
+            <span className="truncate rounded bg-paper px-1.5 py-0.5 text-muted">Artifact {humanize(task.artifact_status || "none")}</span>
+            <span className="truncate rounded bg-paper px-1.5 py-0.5 text-muted">Budget {humanize(task.budget_status || "unconfigured")}</span>
+          </div>
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[9px] text-faint">
+            <span className="min-w-0 flex-1 truncate">{task.target ? `${task.target.repo}@${task.target.short_sha || task.target.snapshot_ref || "snapshot"}${task.target.dirty ? " dirty" : ""}` : "Target pending"}</span>
+            <span>{task.quality_score == null ? "Score --" : `Score ${task.quality_score}`}</span>
+            <span>{task.hard_gate_status || "pending"} gates</span>
+          </div>
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[9px] text-faint">
+            <span className="min-w-0 flex-1 truncate">{task.primary_deliverable ? `${task.primary_deliverable.filename} v${task.primary_deliverable.version}` : "Deliverable pending"}</span>
+            <span>{task.effective_budget?.mode || "unconfigured"}{task.budget_utilization_percent == null ? "" : ` ${task.budget_utilization_percent}%`}</span>
+            {task.has_waiver && <span className="text-warnInk">waived</span>}
+          </div>
+          {(task.attention_reason || task.quality_reason_code) && <div className="mt-1 truncate text-[9px] text-warnInk">{task.attention_reason || task.quality_reason_code}</div>}
+        </>
+      )}
     </button>
   );
 }
@@ -1539,7 +1677,9 @@ function TaskDetailView({
     );
     if (switchedTask || resultBecameReady) {
       setTab(
-        ["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0
+        task.task_quality_v2
+          ? "overview"
+          : ["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0
           ? "products"
           : "graph",
       );
@@ -1554,7 +1694,30 @@ function TaskDetailView({
   const canResume = ["paused", "blocked", "needs_reconciliation"].includes(task.status);
   const canCancel = !["completed", "failed", "canceled", "cancelled", "archived", "canceling"].includes(task.status);
   const canArchive = ["completed", "failed", "canceled", "cancelled"].includes(task.status);
-  const canRestore = task.status === "archived" && task.terminal_outcome === "completed";
+  const canRestore = !task.task_quality_v2 && task.status === "archived" && task.terminal_outcome === "completed";
+  const detailTabs: Array<[DetailTab, string, number]> = task.task_quality_v2 ? [
+    ["overview", "Overview", task.primary_deliverable ? 1 : 0],
+    ["graph", "Plan", task.nodes?.length || 0],
+    ["contract", "Contract", task.quality_refs?.contract_id ? 1 : 0],
+    ["target", "Target", task.quality_refs?.snapshot_id ? 1 : 0],
+    ["activity", "Activity", task.activity?.length || 0],
+    ["evidence", "Evidence", task.evidence?.length || 0],
+    ["deliverables", "Deliverables", task.primary_deliverable ? 1 : 0],
+    ["quality", "Quality", task.quality_status === "pending" ? 0 : 1],
+    ["budget", "Budget", task.effective_budget?.mode === "unconfigured" ? 0 : 1],
+    ["audit", "Audit", task.activity?.length || 0],
+  ] : [
+    ["brief", "Brief", task.brief?.revision || 0],
+    ["context", "Context", task.handoff_summary?.context?.ref_count || 0],
+    ["dependencies", "Dependencies", Object.values(task.handoff_summary?.relations || {}).reduce((sum, value) => sum + Number(value || 0), 0)],
+    ["communication", "Communication", task.handoff_summary?.comments?.count || 0],
+    ["products", "Results", task.handoff_summary?.work_products?.count || 0],
+    ["wakes", "Wakes", task.handoff_summary?.wakes?.count || 0],
+    ["graph", "Work graph", task.nodes?.length || 0],
+    ["runs", "Agent runs", taskRuns(task).length],
+    ["evidence", "Evidence", task.evidence?.length || 0],
+    ["activity", "Activity", task.activity?.length || 0],
+  ];
 
   const act = async (action: TaskAction) => {
     if (action === "cancel" && !window.confirm("Cancel this task and all active descendants?")) return;
@@ -1576,6 +1739,10 @@ function TaskDetailView({
           <div className="min-w-0 flex-1">
             <div className="mb-1.5 flex items-center gap-2">
               <StatusBadge status={task.status} />
+              {task.task_quality_v2 && <StatusBadge status={task.workflow_status || "unknown"} label={`Workflow ${humanize(task.workflow_status || "unknown")}`} />}
+              {task.task_quality_v2 && <StatusBadge status={task.quality_status || "unknown"} label={`Quality ${humanize(task.quality_status || "unknown")}`} />}
+              {task.task_quality_v2 && <StatusBadge status={task.artifact_status || "none"} label={`Artifact ${humanize(task.artifact_status || "none")}`} />}
+              {task.task_quality_v2 && <StatusBadge status={task.budget_status || "unconfigured"} label={`Budget ${humanize(task.budget_status || "unconfigured")}`} />}
               {task.handoff_summary?.protocol === "legacy" && <StatusBadge status="draft" label="Legacy handoff" />}
               {!!task.handoff_summary?.wakes?.pending && <StatusBadge status="pending" label={`${task.handoff_summary.wakes.pending} pending wake${task.handoff_summary.wakes.pending === 1 ? "" : "s"}`} />}
               {!!task.handoff_summary?.wakes?.failed && <button onClick={() => setTab("wakes")}><StatusBadge status="failed" label={`${task.handoff_summary.wakes.failed} failed wake${task.handoff_summary.wakes.failed === 1 ? "" : "s"}`} /></button>}
@@ -1585,6 +1752,7 @@ function TaskDetailView({
             {task.objective && <p className="mt-1 max-w-3xl text-[12.5px] leading-relaxed text-muted">{task.objective}</p>}
             <div className="mt-1 flex flex-wrap gap-2 text-[10.5px] text-faint">
               <code>{task.id}</code>
+              {task.task_quality_v2 && task.target && <span className="font-mono">{task.target.snapshot_ref || "snapshot"}@{task.target.short_sha || task.target.snapshot_id.slice(0, 12)}{task.target.dirty ? " / dirty" : ""}</span>}
               {task.status === "waiting_child" && <span>Waiting for {(task.children || []).filter((child) => !["completed", "failed", "canceled", "archived"].includes(child.status)).length} active child task(s)</span>}
               {task.status === "blocked" && <button className="text-accent" onClick={() => setTab("dependencies")}>Open blocker details</button>}
               {task.status === "waiting_human" && <span>Waiting on {pendingAttention.map((gate) => humanize(gate.kind)).join(", ") || "operator input"}</span>}
@@ -1629,7 +1797,7 @@ function TaskDetailView({
 
       <StageTimeline current={task.stage} taskStatus={task.status} states={task.stages} />
 
-      {["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0 && (
+      {!task.task_quality_v2 && ["waiting_human", "completed", "archived"].includes(task.status) && workProductCount > 0 && (
         <section
           className="mt-4 flex flex-wrap items-center gap-3 rounded-xl2 border border-okLine bg-okSoft px-4 py-3"
           aria-label="Completed results"
@@ -1707,18 +1875,7 @@ function TaskDetailView({
       )}
 
       <div className="mt-5 flex items-center overflow-x-auto border-b border-line">
-        {([
-          ["brief", "Brief", task.brief?.revision || 0],
-          ["context", "Context", task.handoff_summary?.context?.ref_count || 0],
-          ["dependencies", "Dependencies", Object.values(task.handoff_summary?.relations || {}).reduce((sum, value) => sum + Number(value || 0), 0)],
-          ["communication", "Communication", task.handoff_summary?.comments?.count || 0],
-          ["products", "Results", task.handoff_summary?.work_products?.count || 0],
-          ["wakes", "Wakes", task.handoff_summary?.wakes?.count || 0],
-          ["graph", "Work graph", task.nodes?.length || 0],
-          ["runs", "Agent runs", taskRuns(task).length],
-          ["evidence", "Evidence", task.evidence?.length || 0],
-          ["activity", "Activity", task.activity?.length || 0],
-        ] as Array<[DetailTab, string, number]>).map(([value, label, count]) => {
+        {detailTabs.map(([value, label, count]) => {
           const truncated = value === "runs"
             ? Boolean(task.runs_page?.has_more || (task.children_details || []).some((child) => child.runs_page?.has_more))
             : value === "evidence"
@@ -1739,6 +1896,14 @@ function TaskDetailView({
       </div>
 
       <div className="py-4">
+        {task.task_quality_v2 && tab === "overview" && (
+          <TaskQualityOverview task={task} apiDownload={apiDownload} onViewDeliverable={() => setTab("deliverables")} onViewQuality={() => setTab("quality")} />
+        )}
+        {task.task_quality_v2 && tab === "contract" && <TaskQualityDefinitionPanel api={api} taskId={task.id} kind="contract" />}
+        {task.task_quality_v2 && tab === "target" && <TaskQualityDefinitionPanel api={api} taskId={task.id} kind="target" />}
+        {task.task_quality_v2 && tab === "deliverables" && <DeliverableViewer api={api} apiDownload={apiDownload} taskId={task.id} />}
+        {task.task_quality_v2 && tab === "quality" && <TaskQualityPanel api={api} task={task} onTaskRefresh={onRefresh} />}
+        {task.task_quality_v2 && tab === "budget" && <BudgetPanel task={task} />}
         {(["brief", "context", "dependencies", "communication", "products", "wakes"] as HandoffPanelKind[]).includes(tab as HandoffPanelKind) && (
           <TaskHandoffPanel
             key={`${task.id}:${tab}`}
@@ -1751,7 +1916,9 @@ function TaskDetailView({
           />
         )}
         {tab === "graph" && (
-          <WorkGraph nodes={task.nodes || []} mode={graphMode} onModeChange={setGraphMode} />
+          task.task_quality_v2
+            ? <TaskQualityDefinitionPanel api={api} taskId={task.id} kind="plan" />
+            : <WorkGraph nodes={task.nodes || []} mode={graphMode} onModeChange={setGraphMode} />
         )}
         {tab === "runs" && (
           <RunTree
@@ -1765,7 +1932,8 @@ function TaskDetailView({
             onViewRun={onViewRun}
           />
         )}
-        {tab === "evidence" && (
+        {tab === "evidence" && task.task_quality_v2 && <EvidenceExplorer api={api} taskId={task.id} />}
+        {tab === "evidence" && !task.task_quality_v2 && (
           <EvidenceList
             task={task}
             snapshotLimit={task.detail_limits?.evidence}
@@ -1777,6 +1945,7 @@ function TaskDetailView({
           />
         )}
         {tab === "activity" && <ActivityList task={task} />}
+        {task.task_quality_v2 && tab === "audit" && <ActivityList task={task} />}
       </div>
     </div>
   );

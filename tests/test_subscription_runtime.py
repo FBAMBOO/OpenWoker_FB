@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import queue
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,6 +14,8 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 import coworker.orchestration.subscription_runtime as runtime_module
 from coworker.orchestration.blobs import ContentAddressedBlobStore
@@ -438,6 +442,34 @@ class _FakeDynamicToolCodexProcess(_FakeCodexProcess):
     def __init__(self) -> None:
         self.stdout = _QueueStdout()
         self.stdin = _DynamicToolCodexStdin(self.stdout)
+        self.stderr = io.StringIO("")
+        self.return_code: int | None = None
+
+
+class _TwoDynamicToolCodexStdin(_CodexStdin):
+    def _respond(self, message: Mapping[str, Any]) -> None:
+        if message.get("method") == "turn/start":
+            for index in (1, 2):
+                self.stdout.push(
+                    {
+                        "id": f"budget-tool-request-{index}",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": "codex-thread-1",
+                            "turnId": "codex-turn-1",
+                            "callId": f"budget-tool-call-{index}",
+                            "tool": "list_files",
+                            "arguments": {"path": ".", "max_depth": 1},
+                        },
+                    }
+                )
+        super()._respond(message)
+
+
+class _FakeTwoDynamicToolCodexProcess(_FakeCodexProcess):
+    def __init__(self) -> None:
+        self.stdout = _QueueStdout()
+        self.stdin = _TwoDynamicToolCodexStdin(self.stdout)
         self.stderr = io.StringIO("")
         self.return_code: int | None = None
 
@@ -1008,6 +1040,25 @@ def test_current_subscription_prompt_excludes_raw_upstream_but_accepts_frozen_v2
     assert claude._load_checkpoint(recovered_context) == checkpoint
 
 
+def test_subscription_prompt_separates_stable_authority_from_assignment_delta(
+    harness: _Harness,
+) -> None:
+    developer = runtime_module._developer_prompt(harness.context)
+    assignment = runtime_module._assignment_prompt(harness.context)
+    combined = runtime_module._prompt(harness.context)
+
+    assert harness.context.profile.instructions in developer
+    assert harness.context.profile.instructions not in assignment
+    assert harness.context.task.objective in assignment
+    assert "OpenWorker owns budgets" in developer
+    assert "OpenWorker owns budgets" not in assignment
+    assert combined.count(developer) == 1
+    assert combined.count(assignment) == 1
+    matrix = runtime_module.runtime_capability_matrix(harness.context)
+    assert matrix["internal_multi_agent"]["available"] is False
+    assert matrix["skills"]["available"] is False
+
+
 def test_subscription_environment_scrubs_api_and_model_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1232,6 +1283,102 @@ def test_commands_pin_cli_protocol_model_effort_and_role_ceiling(
 
 
 @pytest.mark.asyncio
+async def test_claude_quality_mcp_reuses_run_bound_callbacks_over_stdio(
+    harness: _Harness,
+) -> None:
+    context = replace(
+        harness.context,
+        node=replace(
+            harness.context.node,
+            metadata={**dict(harness.context.node.metadata), "task_quality_v2": True},
+        ),
+    )
+    bridge = runtime_module._ClaudeQualityMcpBridge(
+        store=harness.store,
+        blob_store=harness.blob_store,
+        state_dir=harness.state_dir,
+        context=context,
+    )
+    config_path = bridge.start()
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        server = config["mcpServers"]["openworker_quality"]
+        environment = {**os.environ, **server["env"]}
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "coworker.orchestration.quality.mcp_bridge"],
+            env=environment,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        async with stdio_client(parameters) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                listing = await session.list_tools()
+                names = {item.name for item in listing.tools}
+                assert {
+                    "get_task_contract",
+                    "read_artifact",
+                    "create_artifact",
+                    "complete_artifact",
+                }.issubset(names)
+                assert "submit_quality_findings" not in names
+                for item in listing.tools:
+                    properties = set(item.inputSchema.get("properties") or {})
+                    assert not properties.intersection(
+                        {
+                            "task_id",
+                            "run_id",
+                            "lease_token",
+                            "fencing_token",
+                            "profile_id",
+                            "contract_id",
+                            "snapshot_id",
+                        }
+                    )
+                result = await session.call_tool("list_artifacts", {})
+                assert result.isError is False
+                assert result.structuredContent == {"items": []}
+    finally:
+        bridge.close()
+    assert not config_path.exists()
+
+
+def test_claude_quality_command_is_mcp_only_and_source_workspace_read_only(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_module.shutil,
+        "which",
+        lambda command: f"/fake/bin/{command}",
+    )
+    context = replace(
+        harness.context,
+        node=replace(
+            harness.context.node,
+            metadata={**dict(harness.context.node.metadata), "task_quality_v2": True},
+        ),
+    )
+    claude = _runtime(ClaudeCodeSubscriptionRuntime, CLAUDE_OPUS_5_HIGH, harness)
+    config_path = harness.state_dir / "run-bound-mcp.json"
+
+    argv = claude.build_command(context, mcp_config=config_path)
+
+    allowed_builtin = {
+        item for item in argv[argv.index("--tools") + 1].split(",") if item
+    }
+    allowed_mcp = set(argv[argv.index("--allowedTools") + 1].split(","))
+    assert allowed_builtin == set()
+    assert all(item.startswith("mcp__openworker_quality__") for item in allowed_mcp)
+    assert "mcp__openworker_quality__read_artifact" in allowed_mcp
+    assert "--strict-mcp-config" in argv
+    assert "--safe-mode" not in argv
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert runtime_module.runtime_capability_matrix(context)[
+        "source_workspace_write"
+    ] is False
+
+
+@pytest.mark.asyncio
 async def test_kimi_oauth_background_execution_fails_closed_before_spawn(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1324,6 +1471,9 @@ async def test_codex_jsonl_protocol_persists_thread_and_turn_checkpoint(
     assert sent[1] == {"method": "initialized"}
     thread_start = next(item for item in sent if item.get("method") == "thread/start")
     assert thread_start["params"]["model"] == "gpt-5.6-sol"
+    assert thread_start["params"]["developerInstructions"] == runtime_module._developer_prompt(
+        harness.context
+    )
     assert thread_start["params"]["config"]["features"]["multi_agent"] is False
     assert {
         "runtimeWorkspaceRoots",
@@ -1333,6 +1483,12 @@ async def test_codex_jsonl_protocol_persists_thread_and_turn_checkpoint(
     }.isdisjoint(thread_start["params"])
     turn_start = next(item for item in sent if item.get("method") == "turn/start")
     assert turn_start["params"]["model"] == "gpt-5.6-sol"
+    assert turn_start["params"]["input"] == [
+        {"type": "text", "text": runtime_module._assignment_prompt(harness.context)}
+    ]
+    assert turn_start["params"]["input"][0]["text"] != thread_start["params"][
+        "developerInstructions"
+    ]
     assert turn_start["params"]["effort"] == "max"
     assert turn_start["params"]["outputSchema"] == runtime_module._result_schema()
     assert {
@@ -1395,6 +1551,49 @@ async def test_codex_stops_streaming_turn_when_reported_token_budget_is_crossed(
     )
     assert any(item.title == "Run token budget reached" for item in activity)
     assert any(item.title == "Agent stopped at run budget" for item in activity)
+
+
+@pytest.mark.asyncio
+async def test_codex_rejects_n_plus_one_tool_call_before_dispatch(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex = _runtime(CodexSubscriptionRuntime, CODEX_GPT_5_6_SOL_MAX, harness)
+    monkeypatch.setattr(
+        codex,
+        "probe",
+        lambda: _healthy(
+            CODEX_GPT_5_6_SOL_MAX, "codex-subscription", "codex-cli 0.147.0"
+        ),
+    )
+    process = _FakeTwoDynamicToolCodexProcess()
+    active = _FakeActive(process)
+    monkeypatch.setattr(codex, "_spawn", lambda *_args, **_kwargs: active)
+    context = replace(
+        harness.context,
+        task=replace(
+            harness.context.task,
+            policy={**dict(harness.context.task.policy), "read_only": True},
+        ),
+        runtime_budget=RuntimeBudget(
+            model_calls=1,
+            tool_calls=1,
+            tokens=1_000,
+            wall_seconds=60,
+        ),
+    )
+
+    outcome = await codex.execute(context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "runtime_budget_exceeded"
+    responses = {
+        str(item.get("id"))
+        for item in process.stdin.messages
+        if "result" in item
+    }
+    assert "budget-tool-request-1" in responses
+    assert "budget-tool-request-2" not in responses
+    assert active.tree.terminate_calls >= 1
 
 
 @pytest.mark.asyncio

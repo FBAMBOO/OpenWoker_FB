@@ -8,4 +8,5 @@ export { ModelRoutingSettings, createBlankModelPolicy } from "./ModelRoutingSett
 export type { ModelRoutingSettingsProps } from "./ModelRoutingSettings";
 export { RuntimeCommunicationSettings } from "./RuntimeCommunicationSettings";
 export type { RuntimeCommunicationSettingsProps } from "./RuntimeCommunicationSettings";
+export { TaskQualitySettings } from "./TaskQualitySettings";
 export * from "./types";

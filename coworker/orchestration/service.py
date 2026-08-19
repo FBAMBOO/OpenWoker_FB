@@ -92,6 +92,41 @@ from .policy import (
 )
 from .presets import RuntimePreset, runtime_preset, runtime_presets
 from .profiles import AgentProfile, AgentRole
+from .quality.artifacts import ArtifactService as QualityArtifactService
+from .quality.budgets import (
+    BudgetExceeded as QualityBudgetExceeded,
+    BudgetService as QualityBudgetService,
+    ProviderUsage as QualityProviderUsage,
+)
+from .quality.benchmark import TaskQualityBenchmarkService
+from .quality.contract_compiler import ContractCompiler
+from .quality.contracts import ContractRepository
+from .quality.evidence import EvidenceLedger
+from .quality.facade import TaskQualityFacade
+from .quality.query_cache import RepositoryQueryCache
+from .quality.observability import TaskQualityObservability
+from .quality.repo_inventory import RepositoryInventoryService
+from .quality.repo_tools import SnapshotRepoTools
+from .quality.runtime_tools import (
+    QUALITY_TOOL_NAMES,
+    QualityRuntimeDependencies,
+    TaskQualityRunToolFactory,
+    quality_tool_names_for_role,
+)
+from .quality.settlement import (
+    QualityResultSettlementService,
+    QualitySettlementDependencies,
+)
+from .quality.repository_resolver import RepositoryResolver
+from .quality.repository_snapshot import RepositorySnapshotService
+from .quality.strategy_selector import StrategySelector
+from .quality.state_machine import (
+    WorkflowEvent,
+    apply_workflow_event,
+    transition_workflow_in_transaction,
+)
+from .quality.validators import DeterministicValidatorEngine
+from .quality.workflow import QualityWorkflowDependencies, QualityWorkflowEngine
 from .observability import HandoffMetrics
 from .relations import TaskRelationService
 from .routing import (
@@ -188,7 +223,7 @@ _READ_ONLY_RUNTIME_TOOLS = frozenset(
         "complete_task",
         "fail_task",
     }
-)
+) | QUALITY_TOOL_NAMES
 _MUTATING_DELIVERABLE_KINDS = frozenset(
     {
         WorkProductKind.IMPLEMENTATION_PATCH.value,
@@ -278,6 +313,72 @@ class OrchestrationService:
         self.store = OrchestrationStore(self.base / "orchestration.db")
         self.catalog = ConfigurationCatalog(self.base / "catalog.json")
         self.blobs = ContentAddressedBlobStore(self.base / "blobs")
+        self.quality_artifacts = QualityArtifactService(self.store, self.blobs)
+        self.quality_contract_compiler = ContractCompiler()
+        self.quality_contracts = ContractRepository(self.store)
+        self.quality_repository_resolver = RepositoryResolver()
+        self.quality_snapshots = RepositorySnapshotService(
+            self.store, self.quality_artifacts
+        )
+        self.quality_inventories = RepositoryInventoryService(
+            self.store, self.quality_artifacts, self.quality_snapshots
+        )
+        self.quality_query_cache = RepositoryQueryCache(
+            self.store, self.quality_artifacts
+        )
+        self.quality_repo_tools = SnapshotRepoTools(
+            self.quality_snapshots,
+            self.quality_inventories,
+            self.quality_query_cache,
+        )
+        self.quality_evidence = EvidenceLedger(self.store, self.quality_snapshots)
+        self.quality_strategies = StrategySelector(self.store)
+        self.quality_budgets = QualityBudgetService(self.store)
+        self.quality_benchmarks = TaskQualityBenchmarkService(
+            Path(__file__).resolve().parent / "quality" / "benchmark_suites",
+            self.base / "task-quality-benchmarks.json",
+        )
+        self.quality_observability = TaskQualityObservability(
+            self.store,
+            repo_tools=self.quality_repo_tools,
+            benchmarks=self.quality_benchmarks,
+        )
+        self.quality_validators = DeterministicValidatorEngine(
+            self.store, self.quality_artifacts, self.quality_snapshots
+        )
+        self.quality_workflow = QualityWorkflowEngine(
+            QualityWorkflowDependencies(
+                store=self.store,
+                contracts=self.quality_contracts,
+                snapshots=self.quality_snapshots,
+                strategies=self.quality_strategies,
+                artifacts=self.quality_artifacts,
+                inventories=self.quality_inventories,
+                validators=self.quality_validators,
+                budgets=self.quality_budgets,
+            )
+        )
+        self.quality_runtime_tools = TaskQualityRunToolFactory(
+            QualityRuntimeDependencies(
+                store=self.store,
+                contracts=self.quality_contracts,
+                snapshots=self.quality_snapshots,
+                strategies=self.quality_strategies,
+                inventories=self.quality_inventories,
+                repo_tools=self.quality_repo_tools,
+                artifacts=self.quality_artifacts,
+            )
+        )
+        self.quality_settlement = QualityResultSettlementService(
+            QualitySettlementDependencies(
+                store=self.store,
+                contracts=self.quality_contracts,
+                strategies=self.quality_strategies,
+                artifacts=self.quality_artifacts,
+                snapshots=self.quality_snapshots,
+            )
+        )
+        self.quality = TaskQualityFacade(self)
         self.legacy_upstream_externalizer = LegacyUpstreamExternalizer(self.blobs)
         self._backfill_legacy_upstream_context()
         self.workspaces = WorkspaceManager(self.base / "workspaces")
@@ -341,6 +442,7 @@ class OrchestrationService:
             local_owner_eligible=bool(
                 getattr(manager, "subscription_local_owner_eligible", True)
             ),
+            quality_settlement=self.quality_settlement,
         )
         if executor is not None:
             # Tests and embedders may inject a complete executor boundary. Do not
@@ -358,6 +460,8 @@ class OrchestrationService:
                 context_resolver=self.context_resolver,
                 handoff_metrics=self.handoff_metrics,
                 profile_resolver=self.catalog.resolve_profile,
+                quality_tool_factory=self.quality_runtime_tools,
+                quality_settlement=self.quality_settlement,
                 wake_coalesce_window_ms=self.handoff_settings.wake_coalesce_window_ms,
             )
             self.executor = SubscriptionDispatchExecutor(
@@ -482,6 +586,7 @@ class OrchestrationService:
                 self.store.reap_expired_leases,
                 command_id=f"startup-reap-{uuid.uuid4().hex}",
             )
+            await self._durable_to_thread(self._begin_task_quality_recovery)
             await self._durable_to_thread(self.wakes.recover_expired_claims)
             await self._durable_to_thread(self.wakes.activate_due)
             await self._durable_to_thread(self._repair_legacy_final_rejections)
@@ -504,6 +609,7 @@ class OrchestrationService:
             await self._recover_pending_run_commits()
             await self._durable_to_thread(self._cleanup_archived_workspaces)
             await self._durable_to_thread(self._rebuild_all_runtimes)
+            await self._durable_to_thread(self._finish_task_quality_recovery)
             outbox = await self._durable_to_thread(self.store.outbox_health)
             self._outbox_pending = int(outbox["pending"])
             self._outbox_dead_letters = int(outbox["dead_letters"])
@@ -836,6 +942,7 @@ class OrchestrationService:
                 "settings": self.handoff_settings.to_dict(),
                 "metrics": self.handoff_metrics.snapshot(),
             },
+            "task_quality": self.quality_observability.snapshot(),
         }
 
     async def _coordinate_tasks(self) -> None:
@@ -1056,6 +1163,57 @@ class OrchestrationService:
                 )
 
     # -- runtime projection and recovery --------------------------------
+    def _begin_task_quality_recovery(self) -> None:
+        """Persist exact active V2 checkpoints before rebuilding runtime state."""
+
+        with self.store._read() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM orch_tasks
+                WHERE active_contract_id IS NOT NULL
+                  AND workflow_status IN ('running','validating','reviewing','repairing')
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        for row in rows:
+            apply_workflow_event(
+                self.store,
+                task_id=str(row["id"]),
+                event=WorkflowEvent.CRASH_DETECTED,
+                reason_code="process_restart_recovery",
+                command_id=f"quality-recovery-begin:{row['id']}",
+            )
+
+    def _finish_task_quality_recovery(self) -> None:
+        """Resume only the server-persisted checkpoint after runtime rebuild."""
+
+        with self.store._read() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, status FROM orch_tasks
+                WHERE active_contract_id IS NOT NULL AND workflow_status='recovering'
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        for row in rows:
+            event = (
+                WorkflowEvent.RECOVERY_UNCERTAIN
+                if row["status"] == TaskStatus.NEEDS_RECONCILIATION.value
+                else WorkflowEvent.RECOVERY_SUCCEEDED
+            )
+            apply_workflow_event(
+                self.store,
+                task_id=str(row["id"]),
+                event=event,
+                reason_code=(
+                    "recovery_uncertain"
+                    if event is WorkflowEvent.RECOVERY_UNCERTAIN
+                    else None
+                ),
+                clear_reason=event is WorkflowEvent.RECOVERY_SUCCEEDED,
+                command_id=f"quality-recovery-finish:{row['id']}",
+            )
+
     @staticmethod
     def _task_runtime_id(task_id: str) -> str:
         return f"task:{task_id}"
@@ -1182,6 +1340,8 @@ class OrchestrationService:
         elif task_read_only:
             roots = ()
         tools = set(profile.allowed_tools)
+        if bool(task.input.get("task_quality_v2")):
+            tools.update(quality_tool_names_for_role(profile.role))
         if profile.role in {
             AgentRole.REVIEWER,
             AgentRole.TESTER,
@@ -1286,6 +1446,23 @@ class OrchestrationService:
     ) -> RuntimeBudget:
         if not self.enforce_runtime_budgets:
             return UNLIMITED_RUNTIME_BUDGET
+        quality = self._quality_budget_binding(task.id, node.key)
+        if quality is not None:
+            mode, _ledger_id, allocation = quality
+            if mode == "unlimited":
+                return UNLIMITED_RUNTIME_BUDGET
+            return RuntimeBudget(
+                model_calls=int(allocation.get("model_calls", 0) or 0),
+                tool_calls=int(allocation.get("tool_calls", 0) or 0),
+                tokens=int(
+                    allocation.get(
+                        "max_reported_tokens",
+                        allocation.get("reserved_reported_tokens", 0),
+                    )
+                    or 0
+                ),
+                wall_seconds=int(allocation.get("active_seconds", 0) or 0),
+            )
         explicit = task.budget.get("run_budget") if isinstance(task.budget, Mapping) else None
         if isinstance(explicit, Mapping):
             return self._budget(explicit)
@@ -1304,6 +1481,68 @@ class OrchestrationService:
             share(total.tokens),
             share(total.wall_seconds),
         )
+
+    def _quality_budget_binding(
+        self, task_id: str, node_key: str
+    ) -> tuple[str, str | None, dict[str, int]] | None:
+        """Resolve one frozen strategy allocation; never manufacture equal shares."""
+
+        with self.store._read() as connection:
+            row = connection.execute(
+                """
+                SELECT t.active_budget_ledger_id, s.budget_profile_json,
+                       p.metadata_json AS active_plan_metadata_json
+                FROM orch_tasks t
+                LEFT JOIN orch_execution_strategies s
+                  ON s.id=t.active_strategy_id
+                LEFT JOIN orch_plans p ON p.id=t.active_plan_id
+                WHERE t.id=? AND t.active_strategy_id IS NOT NULL
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None or row["budget_profile_json"] is None:
+                return None
+            ledger = (
+                connection.execute(
+                    "SELECT mode FROM orch_budget_ledgers WHERE id=?",
+                    (row["active_budget_ledger_id"],),
+                ).fetchone()
+                if row["active_budget_ledger_id"]
+                else None
+            )
+        profile = json.loads(row["budget_profile_json"])
+        allocations = dict(profile.get("node_allocations") or {})
+        plan_metadata = json.loads(row["active_plan_metadata_json"] or "{}")
+        repair_allocations = plan_metadata.get("repair_node_allocations")
+        if isinstance(repair_allocations, Mapping):
+            allocations = dict(repair_allocations)
+        raw = allocations.get(node_key)
+        if not isinstance(raw, Mapping):
+            raise ConflictError(
+                f"frozen quality strategy has no budget allocation for node {node_key}"
+            )
+        mode = str(ledger["mode"] if ledger is not None else profile.get("mode") or "hard")
+        return (
+            mode,
+            str(row["active_budget_ledger_id"])
+            if row["active_budget_ledger_id"]
+            else None,
+            {str(key): int(value) for key, value in raw.items()},
+        )
+
+    @staticmethod
+    def _quality_reservation_amounts(allocation: Mapping[str, int]) -> dict[str, int]:
+        return {
+            "model_calls": int(allocation.get("model_calls", 0) or 0),
+            "tool_calls": int(allocation.get("tool_calls", 0) or 0),
+            "reported_tokens": int(
+                allocation.get("reserved_reported_tokens", 0) or 0
+            ),
+            "active_seconds": int(allocation.get("active_seconds", 0) or 0),
+            "tool_payload_bytes": int(
+                allocation.get("tool_payload_bytes", 0) or 0
+            ),
+        }
 
     def _attempt_budget(
         self,
@@ -1497,6 +1736,38 @@ class OrchestrationService:
     def _task_result_envelope(self, task: TaskRecord) -> dict[str, Any]:
         """Build the bounded, hash-addressed result consumed by a parent Agent."""
 
+        if self._is_task_quality_v2(task.id):
+            projection = self.quality.task_projection(task.id)
+            primary = projection.get("primary_deliverable")
+            envelope = {
+                "schema_version": 2,
+                "child_task_id": task.id,
+                "task_id": task.id,
+                "plan_id": task.active_plan_id,
+                "status": (
+                    TaskStatus.COMPLETED.value
+                    if task.status is TaskStatus.RUNNING
+                    and task.current_stage is OrchestrationStage.ARCHIVE
+                    else task.status.value
+                ),
+                "summary": (
+                    f"Published primary deliverable {primary['filename']}"
+                    if isinstance(primary, Mapping)
+                    else ""
+                ),
+                "primary_deliverable": dict(primary)
+                if isinstance(primary, Mapping)
+                else None,
+                "quality_status": projection["quality_status"],
+                "artifact_status": projection["artifact_status"],
+                "budget_status": projection["budget_status"],
+                "quality_verdict": projection.get("quality_verdict"),
+                "quality_refs": projection.get("quality_refs"),
+                "completed_at": _iso(task.updated_at),
+            }
+            envelope["result_hash"] = _canonical_hash(envelope)
+            return envelope
+
         graph = self.store.get_plan(task.active_plan_id) if task.active_plan_id else None
         runs = self.store.list_runs(task.id)
         latest = self._latest_runs(runs)
@@ -1606,6 +1877,313 @@ class OrchestrationService:
         }
         envelope["result_hash"] = _canonical_hash(envelope)
         return envelope
+
+    def _is_task_quality_v2(self, task_id: str) -> bool:
+        with self.store._read() as connection:
+            row = connection.execute(
+                "SELECT active_contract_id FROM orch_tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        return bool(row is not None and row["active_contract_id"])
+
+    def _quality_v2_completion_eligibility(
+        self, task_id: str
+    ) -> tuple[bool, dict[str, Any], tuple[str, ...]]:
+        """Recheck every publish invariant at the lifecycle completion boundary."""
+
+        projection = self.quality.task_projection(task_id)
+        reasons: list[str] = []
+        primary = projection.get("primary_deliverable")
+        if projection.get("workflow_status") != "completed":
+            reasons.append("workflow_not_completed")
+        if projection.get("quality_status") not in {"pass", "waived"}:
+            reasons.append("quality_not_publishable")
+        if (
+            not isinstance(primary, Mapping)
+            or primary.get("status") != "verified"
+            or not primary.get("sha256")
+        ):
+            reasons.append("primary_artifact_not_verified")
+        budget_status = str(projection.get("budget_status") or "")
+        budget_allowed = budget_status in {"within_budget", "warning", "unlimited"}
+        if budget_status == "over_budget":
+            strategy_ref = str(
+                (projection.get("quality_refs") or {}).get("strategy_id") or ""
+            )
+            strategy = (
+                self.quality_strategies.get(strategy_ref) if strategy_ref else None
+            )
+            soft_policy = (
+                dict(strategy.effective_policy).get("soft_budget_publish", {})
+                if strategy is not None
+                else {}
+            )
+            budget_allowed = bool(
+                strategy is not None
+                and str(strategy.budget_profile.get("mode") or "") == "soft"
+                and isinstance(soft_policy, Mapping)
+                and soft_policy.get("value") is True
+            )
+        if not budget_allowed:
+            reasons.append("budget_not_publishable")
+        with self.store._read() as connection:
+            evaluation = connection.execute(
+                """
+                SELECT artifact_id, artifact_hash, decision, verdict
+                FROM orch_quality_evaluations
+                WHERE task_id=? AND evaluation_type='final'
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if (
+            evaluation is None
+            or not isinstance(primary, Mapping)
+            or evaluation["artifact_id"] != primary.get("artifact_id")
+            or evaluation["artifact_hash"] != primary.get("sha256")
+            or evaluation["decision"] != "publish"
+            or evaluation["verdict"] != "pass"
+        ):
+            reasons.append("authoritative_publish_decision_missing")
+        return not reasons, projection, tuple(reasons)
+
+    def _hold_quality_v2_completion(
+        self, task: TaskRecord, reasons: Sequence[str]
+    ) -> TaskRecord:
+        reason = str(reasons[0] if reasons else "quality_attention_required")
+        with self.store._write() as connection:
+            row = connection.execute(
+                "SELECT workflow_status FROM orch_tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            current = str(row["workflow_status"] if row is not None else "")
+            event = None
+            if current in {"running", "validating", "reviewing"}:
+                event = WorkflowEvent.ATTENTION_REQUIRED
+            elif current == "repairing":
+                event = WorkflowEvent.REPAIR_EXHAUSTED
+            if event is not None:
+                transition_workflow_in_transaction(
+                    self.store,
+                    connection,
+                    task_id=task.id,
+                    event=event,
+                    reason_code=reason,
+                    command_id=f"quality-completion-hold:{task.id}:{reason}",
+                )
+            connection.execute(
+                """
+                UPDATE orch_tasks SET quality_reason_code=? WHERE id=?
+                """,
+                (reason, task.id),
+            )
+        fresh = self.store.get_task(task.id)
+        if fresh.status is TaskStatus.RUNNING:
+            return self._transition_status(
+                fresh,
+                TaskStatus.NEEDS_RECONCILIATION,
+                reason,
+                output={
+                    **dict(fresh.output or {}),
+                    "task_quality_v2": True,
+                    "quality_completion_blockers": list(reasons),
+                },
+            )
+        return fresh
+
+    def _prepare_quality_v2_repair(self, task: TaskRecord) -> str:
+        """Compile one active RepairRequest into a fresh acyclic plan revision."""
+
+        with self.store._read() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM orch_repair_requests
+                WHERE task_id=? AND status IN ('pending','running')
+                ORDER BY attempt DESC, created_at DESC LIMIT 1
+                """,
+                (task.id,),
+            ).fetchone()
+        if row is None:
+            return "none"
+        graph = self.store.get_plan(task.active_plan_id or "")
+        if str(graph.plan.metadata.get("repair_request_id") or "") == row["id"]:
+            self.quality_workflow.repairs.fail_active(
+                str(row["id"]),
+                reason="repair_plan_failed",
+            )
+            return "failed"
+        strategy = self.quality_strategies.get(
+            str(
+                self.quality.task_projection(task.id)["quality_refs"]["strategy_id"]
+            )
+        )
+        producer = next(
+            (
+                item
+                for item in strategy.nodes
+                if item.config.get("result_schema_id") == "analysis_report_result_v2"
+            ),
+            None,
+        )
+        if producer is None:
+            raise ConflictError("repair strategy has no canonical artifact producer")
+        keys = (producer.key, "validate", "review", "adjudicate", "publish")
+        source_nodes = {item.key: item for item in graph.nodes}
+        missing = tuple(key for key in keys if key not in source_nodes)
+        if missing:
+            raise ConflictError(
+                "repair plan cannot preserve missing strategy nodes: "
+                + ", ".join(missing)
+            )
+        allocations = self._repair_node_allocations(
+            dict(json.loads(row["budget_allocation_json"])),
+            producer_key=producer.key,
+        )
+        specs: list[NodeSpec] = []
+        for key in keys:
+            source = source_nodes[key]
+            node_input = dict(source.input)
+            config = dict(node_input.get("quality_node_config") or {})
+            config.update(
+                {
+                    "repair_mode": True,
+                    "repair_request_id": str(row["id"]),
+                    "repair_attempt": int(row["attempt"]),
+                }
+            )
+            node_input["quality_node_config"] = config
+            instructions = source.instructions
+            if key == producer.key:
+                instructions = (
+                    "Execute only the active bounded RepairRequest. Call "
+                    "get_repair_request(), read the exact immutable parent artifact, "
+                    "change only allowed_sections, create the child with "
+                    "create_repaired_artifact(), finalize it, and submit the canonical "
+                    "analysis_report_result_v2. Do not modify the source workspace."
+                )
+            specs.append(
+                NodeSpec(
+                    key=source.key,
+                    title=(
+                        f"Repair artifact v{int(row['target_version'])}"
+                        if key == producer.key
+                        else source.title
+                    ),
+                    instructions=instructions,
+                    kind=source.kind,
+                    agent=source.agent,
+                    model=source.model,
+                    input=node_input,
+                    join_policy=source.join_policy,
+                    failure_policy=FailurePolicy.FAIL_FAST,
+                    effect_safety=source.effect_safety,
+                    retry_policy=RetryPolicy(max_attempts=1),
+                    timeout_seconds=source.timeout_seconds,
+                    priority=source.priority,
+                    concurrency_key=source.concurrency_key,
+                    metadata={
+                        **dict(source.metadata),
+                        "repair_request_id": str(row["id"]),
+                        "repair_attempt": int(row["attempt"]),
+                    },
+                )
+            )
+        repair_spec = PlanSpec(
+            nodes=tuple(specs),
+            edges=tuple(
+                EdgeSpec(
+                    from_node=source,
+                    to_node=target,
+                    condition=EdgeCondition.SUCCESS,
+                    required=True,
+                    metadata={"quality_condition": "publish" if target == "publish" else "success"},
+                )
+                for source, target in zip(keys, keys[1:])
+            ),
+            metadata={
+                "generated": "task-quality-v2-repair",
+                "strategy_id": strategy.id,
+                "strategy_hash": strategy.content_hash,
+                "repair_request_id": str(row["id"]),
+                "repair_attempt": int(row["attempt"]),
+                "repair_source_artifact_id": str(row["source_artifact_id"]),
+                "repair_node_allocations": allocations,
+            },
+        )
+        self.store.create_plan_revision(
+            task.id,
+            repair_spec,
+            expected_task_version=task.version,
+            created_by="task-quality-v2-repair-coordinator",
+            command_id=_command("quality-repair-plan", str(row["id"])),
+        )
+        fresh = self.store.get_task(task.id)
+        self._transition_stage(
+            fresh,
+            OrchestrationStage.EXECUTION_REVIEW_TEST,
+            "task-quality-v2-repair-started",
+        )
+        return "started"
+
+    @staticmethod
+    def _repair_node_allocations(
+        total: Mapping[str, int],
+        *,
+        producer_key: str,
+    ) -> dict[str, dict[str, int]]:
+        """Split one repair envelope across producer/scorer plus zero-model services."""
+
+        tokens = max(0, int(total.get("reported_tokens", 0) or 0))
+        model_calls = max(0, int(total.get("model_calls", 0) or 0))
+        tool_calls = max(0, int(total.get("tool_calls", 0) or 0))
+        active_seconds = max(3, int(total.get("active_seconds", 0) or 0))
+        payload_bytes = max(0, int(total.get("tool_payload_bytes", 0) or 0))
+
+        def split(value: int) -> tuple[int, int]:
+            producer_value = (value * 2 + 2) // 3
+            return producer_value, value - producer_value
+
+        producer_tokens, review_tokens = split(tokens)
+        producer_models, review_models = split(model_calls)
+        producer_tools, review_tools = split(tool_calls)
+        producer_seconds, review_seconds = split(active_seconds - 3)
+        producer_payload, review_payload = split(payload_bytes)
+
+        def allocation(
+            reserved_tokens: int,
+            calls: int,
+            tools: int,
+            seconds: int,
+            payload: int,
+        ) -> dict[str, int]:
+            return {
+                "min_reported_tokens": 0 if reserved_tokens == 0 else max(1, reserved_tokens // 4),
+                "reserved_reported_tokens": reserved_tokens,
+                "max_reported_tokens": max(reserved_tokens, int(reserved_tokens * 1.35)),
+                "model_calls": calls,
+                "tool_calls": tools,
+                "active_seconds": seconds,
+                "tool_payload_bytes": payload,
+            }
+
+        zero = allocation(0, 0, 0, 1, 0)
+        return {
+            producer_key: allocation(
+                producer_tokens,
+                producer_models,
+                producer_tools,
+                producer_seconds,
+                producer_payload,
+            ),
+            "validate": dict(zero),
+            "review": allocation(
+                review_tokens,
+                review_models,
+                review_tools,
+                review_seconds,
+                review_payload,
+            ),
+            "adjudicate": dict(zero),
+            "publish": dict(zero),
+        }
 
     @staticmethod
     def _normalize_verdict(value: Any) -> str:
@@ -2822,6 +3400,25 @@ class OrchestrationService:
             # the durable CANCELING transition.
             with publication_fence:
                 fresh = self.store.get_task(current.id)
+                if fresh.status in _TERMINAL_TASKS:
+                    continue
+                if self._is_task_quality_v2(fresh.id):
+                    with self.store._read() as connection:
+                        quality_row = connection.execute(
+                            "SELECT workflow_status FROM orch_tasks WHERE id=?",
+                            (fresh.id,),
+                        ).fetchone()
+                    quality_status = str(
+                        quality_row["workflow_status"] if quality_row is not None else ""
+                    )
+                    if quality_status not in {"canceled", "archived"}:
+                        apply_workflow_event(
+                            self.store,
+                            task_id=fresh.id,
+                            event=WorkflowEvent.CANCEL_REQUESTED,
+                            reason_code="user_canceled",
+                            command_id=f"quality-cancel:{fresh.id}",
+                        )
                 if fresh.status is TaskStatus.DRAFT:
                     canceled = self.store.transition_task_status(
                         fresh.id,
@@ -2830,8 +3427,6 @@ class OrchestrationService:
                         command_id=f"cancel-{uuid.uuid4().hex}",
                     )
                     self.relations.resolve_terminal(canceled.id)
-                    continue
-                if fresh.status in _TERMINAL_TASKS:
                     continue
                 if fresh.status is not TaskStatus.CANCELING:
                     fresh = self.store.transition_task_status(
@@ -2885,6 +3480,19 @@ class OrchestrationService:
     def archive_task(self, task_id: str) -> TaskRecord:
         task = self.store.get_task(task_id)
         if task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELED, TaskStatus.FAILED}:
+            if self._is_task_quality_v2(task.id):
+                with self.store._read() as connection:
+                    workflow = connection.execute(
+                        "SELECT workflow_status FROM orch_tasks WHERE id=?",
+                        (task.id,),
+                    ).fetchone()["workflow_status"]
+                if workflow != "archived":
+                    apply_workflow_event(
+                        self.store,
+                        task_id=task.id,
+                        event=WorkflowEvent.ARCHIVE_REQUESTED,
+                        command_id=f"quality-archive:{task.id}",
+                    )
             task = self.store.transition_task_status(
                 task.id,
                 TaskStatus.ARCHIVED,
@@ -2900,6 +3508,10 @@ class OrchestrationService:
 
     def restore_task(self, task_id: str) -> TaskRecord:
         task = self.store.get_task(task_id)
+        if self._is_task_quality_v2(task.id):
+            raise ConflictError(
+                "archived Task Quality V2 tasks are immutable restore-view records"
+            )
         if task.status is TaskStatus.ARCHIVED:
             archived_from = str(
                 dict(task.output or {}).get("archived_from") or "completed"
@@ -3732,6 +4344,129 @@ class OrchestrationService:
             "acceptance_contract_hash": contract_hash,
         }
 
+    def _quality_assignment_context(
+        self,
+        task: TaskRecord,
+        node: NodeRecord,
+        remaining_budget: RuntimeBudget,
+    ) -> dict[str, Any]:
+        """Build the bounded authoritative V2 assignment block for one turn."""
+
+        with self.store._read() as connection:
+            row = connection.execute(
+                """
+                SELECT active_contract_id, active_snapshot_id, active_strategy_id
+                FROM orch_tasks WHERE id=?
+                """,
+                (task.id,),
+            ).fetchone()
+            repair_row = connection.execute(
+                """
+                SELECT * FROM orch_repair_requests
+                WHERE task_id=? AND status IN ('pending','running')
+                ORDER BY attempt DESC, created_at DESC LIMIT 1
+                """,
+                (task.id,),
+            ).fetchone()
+        if (
+            row is None
+            or not row["active_contract_id"]
+            or not row["active_snapshot_id"]
+            or not row["active_strategy_id"]
+        ):
+            raise ConflictError(
+                "Task Quality V2 execution requires frozen contract, snapshot and strategy"
+            )
+        contract = self.quality_contracts.get(row["active_contract_id"])
+        snapshot = self.quality_snapshots.get(row["active_snapshot_id"])
+        strategy = self.quality_strategies.get(row["active_strategy_id"])
+        contract_value = contract.model_dump(mode="json", exclude_none=True)
+        encoded = json.dumps(
+            contract_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        omitted_fields: list[str] = []
+        if len(encoded) > 20 * 1024:
+            # Required and hard requirements, constraints and deliverables are never
+            # omitted. Optional soft requirements remain available through
+            # get_task_contract() and are named explicitly here.
+            requirements = list(contract_value.get("requirements") or ())
+            retained = [
+                item
+                for item in requirements
+                if bool(item.get("required")) or bool(item.get("hard_gate"))
+            ]
+            omitted = [
+                str(item.get("id") or "")
+                for item in requirements
+                if item not in retained
+            ]
+            if omitted:
+                contract_value["requirements"] = retained
+                omitted_fields.append(
+                    "contract.requirements.optional:" + ",".join(omitted)
+                )
+        quality_ledger = None
+        binding = self._quality_budget_binding(task.id, node.key)
+        if binding is not None and binding[1] is not None:
+            quality_ledger = self.quality_budgets.get(binding[1]).model_dump(
+                mode="json"
+            )
+        repair_context = None
+        if (
+            repair_row is not None
+            and str(node.metadata.get("repair_request_id") or "")
+            == str(repair_row["id"])
+        ):
+            repair_context = {
+                "id": str(repair_row["id"]),
+                "source_artifact_id": str(repair_row["source_artifact_id"]),
+                "target_version": int(repair_row["target_version"]),
+                "finding_ids": json.loads(repair_row["finding_ids_json"]),
+                "allowed_sections": json.loads(repair_row["allowed_sections_json"]),
+                "required_validators": json.loads(
+                    repair_row["required_validators_json"]
+                ),
+                "attempt": int(repair_row["attempt"]),
+                "status": str(repair_row["status"]),
+            }
+        return {
+            "contract": contract_value,
+            "snapshot": snapshot.model_dump(
+                mode="json",
+                exclude={"workspace_root", "repo_root"},
+                exclude_none=True,
+            ),
+            "strategy": {
+                "id": strategy.id,
+                "version": strategy.version,
+                "content_hash": strategy.content_hash,
+                "template_id": strategy.template_id,
+                "semantic_scorer_node_key": strategy.semantic_scorer_node_key,
+                "effective_policy": dict(strategy.effective_policy),
+                "feature_flags": dict(strategy.feature_flags),
+            },
+            "direct_input_bindings": list(
+                node.input.get("direct_bindings") or ()
+            ),
+            "run_budget_remaining": {
+                "model_calls": remaining_budget.model_calls,
+                "tool_calls": remaining_budget.tool_calls,
+                "reported_tokens": remaining_budget.tokens,
+                "active_seconds": remaining_budget.wall_seconds,
+            },
+            "quality_budget_ledger": quality_ledger,
+            "repair_request": repair_context,
+            "omitted_fields": omitted_fields,
+            "on_demand_tools": [
+                "get_task_contract",
+                "get_repository_snapshot",
+                "get_execution_strategy",
+            ],
+        }
+
     def _ensure_run_snapshot(
         self, task: TaskRecord, run: RunRecord
     ) -> Optional[WorkspaceSnapshot]:
@@ -4101,6 +4836,23 @@ class OrchestrationService:
                     continue
                 return self.store.get_task(task.id)
             if stage is OrchestrationStage.INTER_STEP_EVALUATION:
+                if self._is_task_quality_v2(task.id):
+                    repair_state = self._prepare_quality_v2_repair(task)
+                    if repair_state == "started":
+                        continue
+                    eligible, _projection, reasons = (
+                        self._quality_v2_completion_eligibility(task.id)
+                    )
+                    if not eligible:
+                        if repair_state == "failed":
+                            reasons = ("repair_plan_failed", *reasons)
+                        return self._hold_quality_v2_completion(task, reasons)
+                    self._transition_stage(
+                        task,
+                        OrchestrationStage.FINAL_ACCEPTANCE,
+                        "task-quality-v2-publish-authorized",
+                    )
+                    continue
                 graph = self.store.get_plan(task.active_plan_id or "")
                 runs = [
                     run
@@ -4417,6 +5169,16 @@ class OrchestrationService:
                 self._transition_stage(task, OrchestrationStage.FINAL_ACCEPTANCE, "evaluation-passed")
                 continue
             if stage is OrchestrationStage.FINAL_ACCEPTANCE:
+                if self._is_task_quality_v2(task.id):
+                    eligible, _projection, reasons = (
+                        self._quality_v2_completion_eligibility(task.id)
+                    )
+                    if not eligible:
+                        return self._hold_quality_v2_completion(task, reasons)
+                    self._transition_stage(
+                        task, OrchestrationStage.ARCHIVE, "task-quality-v2-published"
+                    )
+                    continue
                 graph = self.store.get_plan(task.active_plan_id or "")
                 history_runs = [
                     run
@@ -4620,6 +5382,12 @@ class OrchestrationService:
                 self._transition_stage(task, OrchestrationStage.ARCHIVE, "accepted")
                 continue
             if stage is OrchestrationStage.ARCHIVE:
+                if self._is_task_quality_v2(task.id):
+                    eligible, _projection, reasons = (
+                        self._quality_v2_completion_eligibility(task.id)
+                    )
+                    if not eligible:
+                        return self._hold_quality_v2_completion(task, reasons)
                 if task.status is TaskStatus.RUNNING:
                     result = self._task_result_envelope(task)
                     task = self._transition_status(
@@ -6632,6 +7400,10 @@ class OrchestrationService:
         heartbeat: Optional[asyncio.Task[None]] = None
         snapshot = None
         node: Optional[NodeRecord] = None
+        quality_reservation_id: Optional[str] = None
+        quality_reservation_token: Optional[int] = None
+        quality_reservation_settled = False
+        quality_budget_exhausted = False
         runtime_id = self._run_runtime_id(run.id)
         wake_was_delivered = False
         try:
@@ -6652,6 +7424,23 @@ class OrchestrationService:
             remaining_budget = runtime_node.remaining_budget
             graph = self.store.get_plan(run.plan_id)
             node = next(item for item in graph.nodes if item.id == run.node_id)
+            quality_binding = self._quality_budget_binding(task.id, node.key)
+            if quality_binding is not None:
+                _mode, quality_ledger_id, quality_allocation = quality_binding
+                if quality_ledger_id is None:
+                    raise ConflictError(
+                        "quality strategy execution requires an active budget ledger"
+                    )
+                (
+                    quality_reservation_id,
+                    quality_reservation_token,
+                ) = self.quality_budgets.reserve(
+                    quality_ledger_id,
+                    amounts=self._quality_reservation_amounts(quality_allocation),
+                    purpose=f"strategy-node:{node.key}:attempt:{run.attempt}",
+                    run_id=run.id,
+                    reservation_id=f"quality-reservation:{run.id}",
+                )
             profile = self._profile_for_node(node)
             model_policy = self._policy_for_node(node)
             preset = self._runtime_preset_for_task(task)
@@ -6770,6 +7559,16 @@ class OrchestrationService:
                 subject = await self._durable_to_thread(
                     self._candidate_subject, task, graph
                 )
+                if bool(node.metadata.get("task_quality_v2")):
+                    subject = {
+                        **subject,
+                        "task_quality_v2": await self._durable_to_thread(
+                            self._quality_assignment_context,
+                            task,
+                            node,
+                            remaining_budget,
+                        ),
+                    }
             except Exception as exc:
                 self._record_run_activity(
                     claim,
@@ -6874,6 +7673,8 @@ class OrchestrationService:
                 self._runtime_for_task(task.id, rebuild=True)
                 return
             effective_tools = set(profile.allowed_tools)
+            if bool(node.metadata.get("task_quality_v2")):
+                effective_tools.update(quality_tool_names_for_role(profile.role))
             if runtime_node.effective_permissions.tools is not None:
                 effective_tools &= set(runtime_node.effective_permissions.tools)
             execution_envelope = None
@@ -6993,9 +7794,71 @@ class OrchestrationService:
             )
             if timeout_seconds is not None and timeout_seconds <= 0:
                 raise BudgetExceededError("run has no wall-clock budget remaining")
-            outcome = await self._execute_with_lease_guard(
-                context, heartbeat, timeout_seconds
-            )
+            if node.kind is NodeKind.NOOP and bool(
+                node.metadata.get("task_quality_v2")
+            ):
+                outcome = await self._durable_to_thread(
+                    self.quality_workflow.execute, context
+                )
+            else:
+                outcome = await self._execute_with_lease_guard(
+                    context, heartbeat, timeout_seconds
+                )
+            if (
+                quality_reservation_id is not None
+                and quality_reservation_token is not None
+            ):
+                raw_provider_total = outcome.usage.get("provider_reported_tokens")
+                if raw_provider_total is None:
+                    raw_provider_total = outcome.usage.get("tokens", 0)
+                ledger = self.quality_budgets.consume(
+                    quality_reservation_id,
+                    usage=QualityProviderUsage(
+                        model_calls=int(outcome.usage.get("model_calls", 0) or 0),
+                        tool_calls=int(outcome.usage.get("tool_calls", 0) or 0),
+                        input_tokens=max(
+                            int(outcome.usage.get("input_tokens", 0) or 0),
+                            int(
+                                outcome.usage.get("cached_input_tokens", 0) or 0
+                            ),
+                        ),
+                        cached_input_tokens=int(
+                            outcome.usage.get("cached_input_tokens", 0) or 0
+                        ),
+                        output_tokens=int(
+                            outcome.usage.get("output_tokens", 0) or 0
+                        ),
+                        reasoning_tokens=int(
+                            outcome.usage.get("reasoning_tokens", 0) or 0
+                        ),
+                        provider_reported_tokens=int(raw_provider_total or 0),
+                        provider_reported_includes_cached=(
+                            bool(outcome.usage["provider_reported_includes_cached"])
+                            if outcome.usage.get(
+                                "provider_reported_includes_cached"
+                            )
+                            is not None
+                            else None
+                        ),
+                        active_seconds=int(
+                            outcome.usage.get("wall_seconds", 0) or 0
+                        ),
+                        tool_payload_bytes=int(
+                            outcome.usage.get("tool_payload_bytes", 0) or 0
+                        ),
+                    ),
+                    fencing_token=quality_reservation_token,
+                    final=True,
+                )
+                quality_reservation_settled = True
+                with self.store._read() as connection:
+                    budget_row = connection.execute(
+                        "SELECT budget_status FROM orch_tasks WHERE id=?", (task.id,)
+                    ).fetchone()
+                quality_budget_exhausted = bool(
+                    budget_row is not None
+                    and budget_row["budget_status"] == "exhausted"
+                )
             segment_key = str(
                 outcome.gate_id
                 or f"fence-{claim.lease.fencing_token}-{outcome.status}"
@@ -7116,6 +7979,29 @@ class OrchestrationService:
                 outcome.usage,
                 segment_key=segment_key,
             )
+            if quality_budget_exhausted:
+                self.store.fail_run(
+                    run.id,
+                    claim.lease.token,
+                    claim.lease.fencing_token,
+                    error_kind="budget_exceeded",
+                    error_message=(
+                        "provider usage exhausted the frozen Task Quality V2 root budget"
+                    ),
+                    output={
+                        **dict(outcome.output),
+                        "checkpoint_preserved": True,
+                        "budget_ledger_id": ledger.id,
+                    },
+                    command_id=_command(
+                        "quality-budget-exhausted",
+                        run.id,
+                        claim.lease.fencing_token,
+                    ),
+                )
+                runtime.finish(runtime_id, RuntimeStatus.FAILED)
+                self._runtime_for_task(task.id, rebuild=True)
+                return
             if outcome.status == "suspended":
                 checkpoint = outcome.output.get("engine_checkpoint")
                 if not outcome.gate_id or not isinstance(checkpoint, Mapping):
@@ -7295,12 +8181,30 @@ class OrchestrationService:
             self._safe_fail(claim, "workspace_conflict", str(exc))
         except NoEligibleModelError as exc:
             self._safe_fail(claim, "no_eligible_model", str(exc))
+        except QualityBudgetExceeded as exc:
+            self._safe_fail(claim, "budget_exceeded", str(exc))
         except (BudgetExceededError, RuntimeLimitError, RuntimeStateError) as exc:
             self._safe_fail(claim, "runtime_limit", str(exc))
         except Exception as exc:
             logger.exception("orchestration run %s failed", run.id)
             self._safe_fail(claim, type(exc).__name__, str(exc))
         finally:
+            if (
+                quality_reservation_id is not None
+                and quality_reservation_token is not None
+                and not quality_reservation_settled
+            ):
+                try:
+                    self.quality_budgets.release(
+                        quality_reservation_id,
+                        fencing_token=quality_reservation_token,
+                    )
+                except (ConflictError, NotFoundError):
+                    logger.warning(
+                        "could not release quality budget reservation for run %s",
+                        run.id,
+                        exc_info=True,
+                    )
             if wake_was_delivered:
                 try:
                     self._complete_delivered_run_wakes(run.task_id, run.id)
@@ -9262,17 +10166,65 @@ class OrchestrationService:
         self,
         *,
         statuses: Optional[Sequence[TaskStatus]] = None,
+        workflow_statuses: Optional[Sequence[str]] = None,
+        quality_statuses: Optional[Sequence[str]] = None,
+        artifact_statuses: Optional[Sequence[str]] = None,
+        budget_statuses: Optional[Sequence[str]] = None,
+        archetypes: Optional[Sequence[str]] = None,
+        repo: Optional[str] = None,
+        snapshot_ref: Optional[str] = None,
+        budget_modes: Optional[Sequence[str]] = None,
+        has_waiver: Optional[bool] = None,
+        repair_count: Optional[int] = None,
+        created_by: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return [
-            self._task_summary(task)
-            for task in self.store.list_tasks(
-                statuses=statuses,
-                limit=limit,
-                offset=offset,
-            )
-        ]
+        filters = {
+            "workflow_status": {str(item) for item in (workflow_statuses or ())},
+            "quality_status": {str(item) for item in (quality_statuses or ())},
+            "artifact_status": {str(item) for item in (artifact_statuses or ())},
+            "budget_status": {str(item) for item in (budget_statuses or ())},
+            "archetype": {str(item) for item in (archetypes or ())},
+            "budget_mode": {str(item) for item in (budget_modes or ())},
+        }
+        repo_filter = str(repo or "").strip().casefold()
+        ref_filter = str(snapshot_ref or "").strip()
+        creator_filter = str(created_by or "").strip().casefold()
+        values: list[dict[str, Any]] = []
+        for task in self.store.list_all_tasks(statuses=statuses):
+            summary = self._task_summary(task)
+            quality = self.quality.task_list_projection(task.id)
+            value = {**summary, **quality}
+            if any(
+                allowed and str(value.get(axis) or "") not in allowed
+                for axis, allowed in filters.items()
+                if axis != "budget_mode"
+            ):
+                continue
+            if filters["budget_mode"] and str(
+                (value.get("effective_budget") or {}).get("mode") or ""
+            ) not in filters["budget_mode"]:
+                continue
+            target = value.get("target") or {}
+            if repo_filter and repo_filter not in str(
+                target.get("repo_root") or target.get("repo") or ""
+            ).casefold():
+                continue
+            if ref_filter and str(target.get("snapshot_ref") or "") != ref_filter:
+                continue
+            if has_waiver is not None and bool(value.get("has_waiver")) is not has_waiver:
+                continue
+            if repair_count is not None and int(
+                (value.get("run_summary") or {}).get("repairs") or 0
+            ) != int(repair_count):
+                continue
+            if creator_filter and str(value.get("created_by") or "").casefold() != creator_filter:
+                continue
+            value["attention_reason"] = value.get("quality_reason_code")
+            values.append(value)
+        start = max(0, int(offset))
+        return values[start : start + max(1, min(int(limit), 10_000))]
 
     def get_blob(self, digest: str) -> tuple[bytes, str]:
         normalized = str(digest).strip().lower().removeprefix("sha256:")
@@ -9303,7 +10255,7 @@ class OrchestrationService:
         child_counts = self.store.count_task_children(
             tuple(item.id for item in tree_records)
         )
-        return self._task_detail(
+        detail = self._task_detail(
             task_id,
             all_tasks=tree_records,
             child_counts=child_counts,
@@ -9312,6 +10264,11 @@ class OrchestrationService:
             tree_truncated=tree_truncated,
             tree_row_limit=_DETAIL_TREE_ROW_LIMIT,
         )
+        # The detail header and dashboard intentionally share the same bounded V2
+        # projection so the four status axes, frozen target, score, gates and
+        # budget never disagree when an operator opens a row.
+        detail.update(self.quality.task_list_projection(task_id))
+        return detail
 
     def _task_detail(
         self,

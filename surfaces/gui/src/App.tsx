@@ -223,12 +223,12 @@ export function App() {
   const [gateCreate, setGateCreate] = useState(false);
   // Which Settings section the full-page Settings surface opens on (§ Settings-as-page).
   const [settingsTab, setSettingsTab] = useState<
-    "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing"
+    "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing" | "runtime_communication" | "task_quality"
   >("appearance");
   const [settingsAgentProfileId, setSettingsAgentProfileId] = useState("");
   const [settingsModelPolicyId, setSettingsModelPolicyId] = useState("");
   const openSettings = (
-    tab: "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing" = "appearance",
+    tab: "appearance" | "models" | "skills" | "voice" | "personas" | "agent_profiles" | "model_routing" | "runtime_communication" | "task_quality" = "appearance",
   ) => {
     setSettingsTab(tab);
     setSurface("settings");

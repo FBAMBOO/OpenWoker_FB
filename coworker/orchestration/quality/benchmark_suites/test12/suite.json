@@ -1,0 +1,70 @@
+{
+  "id": "test12",
+  "name": "Test12 Fabric/dbt repository analysis",
+  "stack": "fabric-dbt",
+  "version": 1,
+  "snapshot_artifact_id": "sha256:2b2360f32117cc5b234e63230e1ae6741a64be70f00000000000000000000000",
+  "prompt_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "baseline_candidate": "legacy",
+  "thresholds": {
+    "quality_score": 85,
+    "citation_resolution_ratio": 1.0,
+    "artifact_read_coverage_ratio": 1.0,
+    "duplicate_scan_ratio": 0.2,
+    "reported_tokens": 3000000,
+    "tool_calls": 120,
+    "elapsed_seconds": 1200,
+    "repair_success_ratio": 0.9
+  },
+  "oracle": {
+    "required_areas": ["entrypoints", "models", "macros", "tests", "seeds", "snapshots", "deployment"],
+    "inventory": {"models": 228, "macro_sql": 52, "sql_tests": 42, "seeds": 5, "snapshots": 2, "pipeline_yaml": 15}
+  },
+  "candidate_defaults": {
+    "rubric_scores": {"architecture_coverage": 28, "relationships": 18, "evidence": 18, "quantitative": 9, "risk_actionability": 8, "limitations": 5, "presentation": 5},
+    "covered_areas": ["entrypoints", "models", "macros", "tests", "seeds", "snapshots", "deployment"],
+    "citations_total": 65,
+    "citations_resolved": 65,
+    "priority_claims": 12,
+    "priority_claims_with_direct_evidence": 12,
+    "reviewer_read_bytes": 32768,
+    "artifact_bytes": 32768,
+    "snapshot_correct": true,
+    "baseline_error_count": 0,
+    "expensive_queries": 18,
+    "duplicate_non_cached_queries": 2,
+    "reported_tokens": 1800000,
+    "tool_calls": 88,
+    "elapsed_seconds": 720,
+    "repair_attempts": 1,
+    "injected_repair_cases": 10,
+    "repair_success_ratio": 0.9,
+    "primary_deliverable_present": true,
+    "primary_deliverable_mime": "text/markdown",
+    "workspace_unchanged": true,
+    "aggregation_separated": true,
+    "schema_field_loss": 0,
+    "hard_gates": {"QG001": "pass", "QG002": "pass", "QG003": "pass", "QG010": "pass", "QG011": "pass", "QG013": "pass", "QG016": "pass"},
+    "inventory": {"models": 228, "macro_sql": 52, "sql_tests": 42, "seeds": 5, "snapshots": 2, "pipeline_yaml": 15},
+    "provider": "offline",
+    "model": "fixture-v2"
+  },
+  "candidates": {
+    "v2": {},
+    "legacy": {
+      "rubric_scores": {"architecture_coverage": 18, "relationships": 8, "evidence": 8, "quantitative": 4, "risk_actionability": 5, "limitations": 3, "presentation": 4},
+      "covered_areas": ["entrypoints", "models", "tests"],
+      "citations_resolved": 41,
+      "priority_claims_with_direct_evidence": 5,
+      "reviewer_read_bytes": 12000,
+      "snapshot_correct": false,
+      "baseline_error_count": 1,
+      "duplicate_non_cached_queries": 8,
+      "primary_deliverable_present": false,
+      "aggregation_separated": false,
+      "schema_field_loss": 4,
+      "hard_gates": {"QG002": "fail", "QG003": "fail", "QG010": "fail", "QG013": "fail"},
+      "model": "fixture-legacy"
+    }
+  }
+}

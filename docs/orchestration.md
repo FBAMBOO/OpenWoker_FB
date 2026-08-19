@@ -60,6 +60,8 @@ The feature has one narrow integration seam at each existing OpenWorker layer.
 | `coworker/orchestration/migrations/0008_task_relations_and_wakes.sql` | Adds first-class task relations plus indexed, deduplicated, leased wake requests. |
 | `coworker/orchestration/migrations/0009_comments_and_work_products.sql` | Adds ordered immutable comments and immutable, verifiable Work Product records. |
 | `coworker/orchestration/migrations/0010_run_activity.sql` | Adds a fenced, append-only, incrementally pageable live activity ledger for each Agent run. |
+| `coworker/orchestration/migrations/0011_task_quality_contracts.sql`–`0017_budget_ledgers.sql` | Add canonical V2 contracts, immutable artifact versions/read receipts, authoritative evaluations/repairs/waivers, repository snapshots, typed evidence/inventory, frozen strategies, and fenced effective-budget ledgers. All seven migrations are additive and retain data during application rollback. |
+| `coworker/orchestration/quality/` | Task Quality V2 engine: contract compilation/linting, target resolution/snapshots, adaptive strategy and direct bindings, artifact/evidence ledgers, deterministic validators, semantic adjudication, bounded repair, budgets, offline benchmarks, observability, and the authenticated Claude MCP bridge. |
 | `coworker/orchestration/activity.py` | Bounds and redacts operator-visible activity while excluding private reasoning and raw tool results. |
 | `coworker/orchestration/handoff_models.py` | Task-centric handoff enums, immutable records, canonical hashes, validation, and structured result contracts. |
 | `coworker/orchestration/context.py` | Context policy, manifest budgeting, workspace-safe resolution, secret checks, staleness verification, and audited reads. |
@@ -85,10 +87,37 @@ The feature has one narrow integration seam at each existing OpenWorker layer.
 | `coworker/agent.py` | Exposes the optional tool-filter seam after built-ins, skills, MCP, and connector tools have been assembled. |
 | `coworker/server/manager.py` | Owns and starts/stops one orchestration service beside existing sessions and automations. |
 | `coworker/server/app.py` | Mounts the orchestration router without mixing its handlers into the existing API. |
-| `surfaces/gui/src/features/orchestration/` | Lazy task tabs plus a click-through Run inspector with live Agent activity, expandable step metadata, token totals, and retained transcripts. |
+| `surfaces/gui/src/features/orchestration/` | Lazy task tabs, the Task Quality V2 five-step creation wizard, primary deliverable viewer, evidence/quality/budget/repair panels, offline benchmark settings, and the click-through Run inspector. |
 
 `pyproject.toml` packages migration SQL with the Python distribution, so installed wheels
 can initialize the independent orchestration database.
+
+## Task Quality V2
+
+Task Quality V2 is an opt-in quality engine for new repository-analysis and focused-
+question tasks. It freezes four independent identities before execution: the published
+contract, repository snapshot, execution strategy, and effective budget ledger. The
+primary deliverable remains separate from the quality verdict; `completed` alone never
+means that quality passed.
+
+Use **Tasks → New → Task Quality V2** to follow Goal → Contract → Target → Strategy →
+Publish & Start. The wizard blocks start on semantic contract gaps or ambiguous targets,
+shows the exact ref/content hash and three assessment axes, and atomically commits the
+legacy Brief bridge, plan, budget, queue transition, and initial wake. Existing legacy
+task creation remains available and V2 data never fabricates a legacy primary artifact.
+
+Task detail exposes distinct Overview, Contract, Target, Deliverables, Evidence,
+Quality, Budget, and Audit views. The Overview and list row show the four V2 states:
+workflow, quality, artifact, and budget. The first-class report is the primary immutable
+artifact; evaluator prose appears only as a verdict. Artifact reads use exact hashes,
+ETags, bounded Range requests, and server-derived read receipts. HTML, SVG, scripts, and
+executables are download-only and are never rendered or executed inline.
+
+The complete API/operator procedure, quality gates, recovery actions, rollout policy,
+and benchmark release gate are documented in
+[`docs/task-quality-v2.md`](task-quality-v2.md). Implementation-to-requirement evidence
+is recorded in
+[`docs/specifications/task-quality-v2-acceptance-matrix.md`](specifications/task-quality-v2-acceptance-matrix.md).
 
 ## Task-Centric Handoff Protocol
 

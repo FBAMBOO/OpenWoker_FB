@@ -570,6 +570,7 @@ class WorkProductRecord:
     summary: str
     evidence_id: Optional[str]
     artifact_id: Optional[str]
+    artifact_version_id: Optional[str]
     uri: Optional[str]
     content_hash: Optional[str]
     metadata: Mapping[str, Any]

@@ -124,7 +124,9 @@ def test_0006_preserves_historical_gates_and_marks_them_published(tmp_path) -> N
             )
         connection.commit()
 
-        assert apply_migrations(connection, bundle) == (6, 7, 8, 9, 10)
+        assert apply_migrations(connection, bundle) == tuple(
+            migration.version for migration in bundle[5:]
+        )
         rows = connection.execute(
             """
             SELECT id, status, opened_at, published_at
@@ -220,11 +222,89 @@ def test_0006_store_upgrade_backfills_briefs_and_parent_relations_idempotently(
                 for row in diagnostic.execute(
                     "SELECT version FROM orch_schema_migrations ORDER BY version"
                 )
-            ) == tuple(range(1, 11))
+            ) == tuple(migration.version for migration in bundle)
         finally:
             diagnostic.close()
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("starting_version", [6, 10, 17])
+def test_v2_upgrade_from_supported_versions_and_double_open_is_idempotent(
+    tmp_path, starting_version: int
+) -> None:
+    bundle = load_migrations()
+    assert bundle[-1].version == 17
+    database = tmp_path / f"from-{starting_version:04d}.db"
+    connection = sqlite3.connect(database)
+    try:
+        assert apply_migrations(connection, bundle[:starting_version]) == tuple(
+            range(1, starting_version + 1)
+        )
+        now = "2026-08-19T00:00:00.000000Z"
+        connection.execute(
+            """
+            INSERT INTO orch_tasks(
+                id, idempotency_key, creation_hash, title, objective, domain,
+                risk_tier, status, current_stage, created_at, updated_at
+            ) VALUES (?, ?, 'legacy-hash', 'Legacy task', 'Keep legacy truth',
+                      'knowledge', 'low', 'draft', 'intake', ?, ?)
+            """,
+            (
+                f"legacy-from-{starting_version}",
+                f"legacy-from-{starting_version}",
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    for _open_number in range(2):
+        store = OrchestrationStore(database)
+        try:
+            diagnostic = store.connect()
+            try:
+                assert diagnostic.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+                assert diagnostic.execute("PRAGMA foreign_key_check").fetchall() == []
+                assert tuple(
+                    row[0]
+                    for row in diagnostic.execute(
+                        "SELECT version FROM orch_schema_migrations ORDER BY version"
+                    )
+                ) == tuple(range(1, 18))
+                for table in (
+                    "orch_quality_contracts",
+                    "orch_artifact_versions",
+                    "orch_quality_evaluations",
+                    "orch_repository_snapshots",
+                    "orch_evidence_refs",
+                    "orch_execution_strategies",
+                    "orch_budget_ledgers",
+                ):
+                    found = diagnostic.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,),
+                    ).fetchone()
+                    assert found is not None and found[0] == table
+                legacy = diagnostic.execute(
+                    """
+                    SELECT active_contract_id, active_snapshot_id, active_strategy_id,
+                           primary_artifact_id, active_budget_ledger_id
+                    FROM orch_tasks WHERE id=?
+                    """,
+                    (f"legacy-from-{starting_version}",),
+                ).fetchone()
+                assert tuple(legacy) == (None, None, None, None, None)
+                assert diagnostic.execute(
+                    "SELECT COUNT(*) FROM orch_task_briefs WHERE task_id=?",
+                    (f"legacy-from-{starting_version}",),
+                ).fetchone()[0] == 1
+            finally:
+                diagnostic.close()
+        finally:
+            store.close()
 
 
 def test_bundle_with_migration_hole_is_rejected_before_schema_changes(tmp_path) -> None:

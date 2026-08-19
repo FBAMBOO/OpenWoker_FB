@@ -6,9 +6,41 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .quality.models import (
+    Archetype,
+    ArtifactStatus,
+    BudgetMode,
+    BudgetStatus,
+    QualityStatus,
+    WorkflowStatus,
+)
+from .quality.state_machine import WorkflowEvent
+
 
 class HandoffModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class TaskQualityWorkflowTransitionPayload(HandoffModel):
+    from_status: WorkflowStatus
+    event: WorkflowEvent
+    to_statuses: list[WorkflowStatus]
+    uses_resume_status: bool
+    server_selects_target: bool
+
+
+class TaskQualitySchemaSnapshot(HandoffModel):
+    """Typed OpenAPI projection generated from the Python canonical source."""
+
+    schema_version: int = 2
+    workflow_statuses: list[WorkflowStatus]
+    quality_statuses: list[QualityStatus]
+    artifact_statuses: list[ArtifactStatus]
+    budget_statuses: list[BudgetStatus]
+    budget_modes: list[BudgetMode]
+    archetypes: list[Archetype]
+    workflow_events: list[WorkflowEvent]
+    workflow_transitions: list[TaskQualityWorkflowTransitionPayload]
 
 
 class TaskBriefPayload(HandoffModel):

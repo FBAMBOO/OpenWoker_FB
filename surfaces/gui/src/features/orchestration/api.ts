@@ -42,6 +42,20 @@ import type {
   TaskRunsPage,
   TaskStageState,
   TaskRelation,
+  TaskDraftAnalysisV2,
+  TaskQualityArchetype,
+  TaskQualityArtifactStatus,
+  TaskQualityBudgetMode,
+  TaskQualityBudgetStatus,
+  TaskQualityContract,
+  TaskQualityStatus,
+  TaskQualityWorkflowStatus,
+  TaskQualityBenchmarkComparison,
+  TaskQualityBenchmarkRun,
+  TaskQualityBenchmarkSuite,
+  RepositorySnapshotV2,
+  ExecutionStrategyV2,
+  QualityBundleV2,
   VersionProvenance,
   WorkStatus,
   ValidationReport,
@@ -54,8 +68,32 @@ export type ApiDownload = (path: string, filename?: string) => Promise<void>;
 
 export interface TaskListOptions {
   statuses?: Array<OrchestrationTaskSummary["status"]>;
+  workflowStatuses?: TaskQualityWorkflowStatus[];
+  qualityStatuses?: TaskQualityStatus[];
+  artifactStatuses?: TaskQualityArtifactStatus[];
+  budgetStatuses?: TaskQualityBudgetStatus[];
+  archetypes?: TaskQualityArchetype[];
+  repo?: string;
+  snapshotRef?: string;
+  budgetModes?: TaskQualityBudgetMode[];
+  hasWaiver?: boolean;
+  repairCount?: number;
+  createdBy?: string;
   limit?: number;
   offset?: number;
+}
+
+export interface CreateTaskQualityDraft {
+  title?: string;
+  objective: string;
+  domain: "code" | "knowledge";
+  workspace?: string;
+  read_only: boolean;
+  source_workspace_write: boolean;
+  task_artifact_write: true;
+  network: boolean;
+  quality_profile_id: "balanced" | "quality-first" | "custom" | string;
+  input?: Record<string, unknown>;
 }
 
 export interface DeadLetterRequeueCommand {
@@ -155,6 +193,9 @@ function normalizeAuditPage(value: unknown): AuditPage | undefined {
     offset: item.offset == null ? undefined : number(item.offset),
     limit: item.limit == null ? undefined : number(item.limit),
     next_offset: item.next_offset == null ? null : number(item.next_offset),
+    cursor: text(item.cursor) || null,
+    next_cursor: text(item.next_cursor) || null,
+    pagination: item.pagination === "cursor" ? "cursor" : item.pagination === "offset" ? "offset" : undefined,
     order: text(item.order) || undefined,
   };
 }
@@ -166,6 +207,7 @@ function normalizeHealth(value: unknown): OrchestrationHealth {
   const handoff = record(item.handoff);
   const handoffSettings = record(handoff.settings);
   const handoffMetrics = record(handoff.metrics);
+  const taskQuality = record(item.task_quality);
   return {
     ready: Boolean(item.ready),
     state: text(item.state, "unknown"),
@@ -205,6 +247,21 @@ function normalizeHealth(value: unknown): OrchestrationHealth {
         histograms: record(handoffMetrics.histograms),
       },
     } : undefined,
+    task_quality: Object.keys(taskQuality).length ? {
+      schema_version: number(taskQuality.schema_version, 1),
+      metrics: record(taskQuality.metrics),
+      series: record(taskQuality.series),
+      alerts: array(taskQuality.alerts).map((raw) => {
+        const alert = record(raw);
+        return {
+          code: text(alert.code),
+          severity: text(alert.severity),
+          observed: number(alert.observed),
+          message: text(alert.message),
+        };
+      }),
+      privacy: text(taskQuality.privacy, "content_free_metadata_only"),
+    } : undefined,
   };
 }
 
@@ -230,6 +287,11 @@ function normalizeHandoffSettings(value: unknown): HandoffRuntimeSettings {
 function normalizeTaskSummary(value: unknown): OrchestrationTaskSummary {
   const item = record(value);
   const gates = array(item.gates || item.attention || item.attention_gates);
+  const primary = record(item.primary_deliverable);
+  const verdict = record(item.quality_verdict);
+  const budget = record(item.effective_budget);
+  const target = record(item.target);
+  const runSummary = record(item.run_summary);
   return {
     id: text(item.id || item.task_id),
     title: text(item.title, "Untitled task"),
@@ -247,6 +309,29 @@ function normalizeTaskSummary(value: unknown): OrchestrationTaskSummary {
     parent_task_id: text(item.parent_task_id) || null,
     parent_run_id: text(item.parent_run_id) || null,
     terminal_outcome: text(item.terminal_outcome) as OrchestrationTaskSummary["terminal_outcome"] || undefined,
+    task_quality_v2: item.task_quality_v2 == null ? undefined : Boolean(item.task_quality_v2),
+    workflow_status: text(item.workflow_status) as OrchestrationTaskSummary["workflow_status"] || undefined,
+    workflow_resume_status: text(item.workflow_resume_status) as OrchestrationTaskSummary["workflow_resume_status"] || null,
+    quality_status: text(item.quality_status) as OrchestrationTaskSummary["quality_status"] || undefined,
+    artifact_status: text(item.artifact_status) as OrchestrationTaskSummary["artifact_status"] || undefined,
+    budget_status: text(item.budget_status) as OrchestrationTaskSummary["budget_status"] || undefined,
+    quality_reason_code: text(item.quality_reason_code) || null,
+    attention_reason: text(item.attention_reason || item.quality_reason_code) || null,
+    archetype: text(item.archetype) as OrchestrationTaskSummary["archetype"] || null,
+    primary_deliverable: Object.keys(primary).length ? primary as unknown as OrchestrationTaskSummary["primary_deliverable"] : null,
+    quality_verdict: Object.keys(verdict).length ? verdict as unknown as OrchestrationTaskSummary["quality_verdict"] : null,
+    quality_score: item.quality_score == null && verdict.total_score == null ? null : number(item.quality_score ?? verdict.total_score),
+    hard_gate_status: text(item.hard_gate_status) || undefined,
+    effective_budget: Object.keys(budget).length ? budget as unknown as OrchestrationTaskSummary["effective_budget"] : undefined,
+    budget_utilization_percent: item.budget_utilization_percent == null ? null : number(item.budget_utilization_percent),
+    target: Object.keys(target).length ? target as unknown as OrchestrationTaskSummary["target"] : null,
+    has_waiver: item.has_waiver == null ? undefined : Boolean(item.has_waiver),
+    run_summary: Object.keys(runSummary).length ? {
+      nodes: number(runSummary.nodes),
+      repairs: number(runSummary.repairs),
+    } : undefined,
+    created_by: text(item.created_by) || null,
+    started_at: text(item.started_at) || null,
   };
 }
 
@@ -639,6 +724,13 @@ function normalizeTaskDetail(value: unknown): OrchestrationTaskDetail {
       returned: number(record(envelope.runtime_page).returned),
       limit: number(record(envelope.runtime_page).limit),
     } : undefined,
+    quality_refs: Object.keys(record(envelope.quality_refs)).length
+      ? record(envelope.quality_refs) as OrchestrationTaskDetail["quality_refs"]
+      : undefined,
+    legacy_quality_projection: envelope.legacy_quality_projection == null
+      ? undefined
+      : Boolean(envelope.legacy_quality_projection),
+    quality_projection_warning: text(envelope.quality_projection_warning) || undefined,
   };
 }
 
@@ -1005,6 +1097,17 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
     async listTasks(options: TaskListOptions = {}): Promise<OrchestrationTaskSummary[]> {
       const query = new URLSearchParams();
       for (const status of options.statuses || []) query.append("status", status);
+      for (const status of options.workflowStatuses || []) query.append("workflow_status", status);
+      for (const status of options.qualityStatuses || []) query.append("quality_status", status);
+      for (const status of options.artifactStatuses || []) query.append("artifact_status", status);
+      for (const status of options.budgetStatuses || []) query.append("budget_status", status);
+      for (const value of options.archetypes || []) query.append("archetype", value);
+      for (const value of options.budgetModes || []) query.append("budget_mode", value);
+      if (options.repo) query.set("repo", options.repo);
+      if (options.snapshotRef) query.set("snapshot_ref", options.snapshotRef);
+      if (options.hasWaiver !== undefined) query.set("has_waiver", String(options.hasWaiver));
+      if (options.repairCount !== undefined) query.set("repair_count", String(options.repairCount));
+      if (options.createdBy) query.set("created_by", options.createdBy);
       if (options.limit !== undefined) query.set("limit", String(options.limit));
       if (options.offset !== undefined) query.set("offset", String(options.offset));
       const suffix = query.toString();
@@ -1013,11 +1116,165 @@ export function createOrchestrationApi(apiRequest: ApiRequest) {
       );
       return listFrom<unknown>(out, "tasks").map(normalizeTaskSummary);
     },
+    async createTaskQualityDraft(
+      spec: CreateTaskQualityDraft,
+      idempotencyKey = createClientIdempotencyKey("quality-draft-create"),
+    ): Promise<{ task_id: string; id: string; workflow_status: TaskQualityWorkflowStatus; prompt_hash: string; created_at: string }> {
+      return apiRequest(`${root}/task-drafts`, jsonRequest(
+        "POST",
+        spec,
+        { "Idempotency-Key": idempotencyKey },
+      ));
+    },
+    async analyzeTaskQualityDraft(
+      taskId: string,
+      payload: Record<string, unknown> = {},
+      idempotencyKey = createClientIdempotencyKey(`quality-analyze-${taskId}`),
+    ): Promise<TaskDraftAnalysisV2> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}:analyze`, jsonRequest(
+        "POST",
+        payload,
+        { "Idempotency-Key": idempotencyKey },
+      ));
+    },
+    getTaskQualityDraftAnalysis(taskId: string): Promise<TaskDraftAnalysisV2> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/analysis`);
+    },
+    updateTaskQualityContract(
+      taskId: string,
+      contract: TaskQualityContract,
+      etag: string,
+    ): Promise<TaskQualityContract> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/contract`, jsonRequest(
+        "PUT",
+        contract,
+        { "If-Match": etag },
+      ));
+    },
+    resolveTaskQualityTarget(
+      taskId: string,
+      payload: Record<string, unknown> = {},
+    ): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/target:resolve`, jsonRequest("POST", payload));
+    },
+    freezeTaskQualitySnapshot(
+      taskId: string,
+      payload: Record<string, unknown> = {},
+    ): Promise<RepositorySnapshotV2> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/snapshots`, jsonRequest("POST", payload));
+    },
+    publishTaskQualityContract(taskId: string, etag: string): Promise<TaskQualityContract> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/contract:publish`, jsonRequest(
+        "POST",
+        undefined,
+        { "If-Match": etag },
+      ));
+    },
+    generateTaskQualityStrategy(
+      taskId: string,
+      payload: Record<string, unknown> = {},
+    ): Promise<ExecutionStrategyV2> {
+      return apiRequest(`${root}/task-drafts/${encodeURIComponent(taskId)}/strategy:generate`, jsonRequest("POST", payload));
+    },
+    async startTaskQualityDraft(taskId: string): Promise<OrchestrationTaskDetail> {
+      return normalizeTaskDetail(await apiRequest(
+        `${root}/task-drafts/${encodeURIComponent(taskId)}:start`,
+        jsonRequest("POST"),
+      ));
+    },
     async getTask(id: string): Promise<OrchestrationTaskDetail> {
       const out = await apiRequest<OrchestrationTaskDetail | Record<string, unknown>>(
         `${root}/tasks/${encodeURIComponent(id)}`,
       );
       return normalizeTaskDetail(out);
+    },
+    getTaskQualityContract(taskId: string): Promise<TaskQualityContract> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/contract`);
+    },
+    getTaskQualitySnapshot(taskId: string): Promise<RepositorySnapshotV2> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/snapshot`);
+    },
+    getTaskQualityStrategy(taskId: string): Promise<ExecutionStrategyV2> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/strategy`);
+    },
+    getTaskQualityCoverage(taskId: string, offset = 0, limit = 200, cursor?: string): Promise<Record<string, unknown>> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (cursor) query.set("cursor", cursor); else query.set("offset", String(offset));
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/coverage?${query.toString()}`);
+    },
+    getTaskQualityClaims(taskId: string, offset = 0, limit = 200, cursor?: string): Promise<Record<string, unknown>> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (cursor) query.set("cursor", cursor); else query.set("offset", String(offset));
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/claims?${query.toString()}`);
+    },
+    getTaskQualityEvidence(taskId: string, offset = 0, limit = 200, cursor?: string): Promise<Record<string, unknown>> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (cursor) query.set("cursor", cursor); else query.set("offset", String(offset));
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/evidence?${query.toString()}`);
+    },
+    getTaskQuality(
+      taskId: string,
+      offset = 0,
+      limit = 200,
+      cursors: Partial<Record<"gate_cursor" | "finding_cursor" | "evaluation_cursor" | "waiver_cursor", string>> = {},
+    ): Promise<QualityBundleV2> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (Object.keys(cursors).length) {
+        Object.entries(cursors).forEach(([key, value]) => { if (value) query.set(key, value); });
+      } else query.set("offset", String(offset));
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/quality?${query.toString()}`);
+    },
+    getTaskDeliverables(taskId: string, offset = 0, limit = 200, cursor?: string): Promise<Record<string, unknown>> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (cursor) query.set("cursor", cursor); else query.set("offset", String(offset));
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/deliverables?${query.toString()}`);
+    },
+    getArtifactMetadata(artifactId: string): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/artifacts/${encodeURIComponent(artifactId)}`);
+    },
+    async getArtifactContentRange(artifactId: string, start: number, endInclusive: number): Promise<string> {
+      const out = await apiRequest<unknown>(
+        `${root}/artifacts/${encodeURIComponent(artifactId)}/content`,
+        { headers: { Range: `bytes=${start}-${endInclusive}` } },
+      );
+      return typeof out === "string" ? out : text(record(out).message);
+    },
+    async getArtifactDiff(artifactId: string, baseArtifactId: string): Promise<string> {
+      const out = await apiRequest<unknown>(`${root}/artifacts/${encodeURIComponent(artifactId)}/diff?base=${encodeURIComponent(baseArtifactId)}`);
+      return typeof out === "string" ? out : text(record(out).message);
+    },
+    requestTaskRepair(taskId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/repairs`, jsonRequest("POST", payload));
+    },
+    createTaskQualityWaiver(taskId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/tasks/${encodeURIComponent(taskId)}/waivers`, jsonRequest("POST", payload));
+    },
+    async resumeTaskQuality(taskId: string, payload: Record<string, unknown> = {}): Promise<OrchestrationTaskDetail> {
+      return normalizeTaskDetail(await apiRequest(
+        `${root}/tasks/${encodeURIComponent(taskId)}:resume`,
+        jsonRequest("POST", payload),
+      ));
+    },
+    listTaskQualityBenchmarkSuites(): Promise<TaskQualityBenchmarkSuite[]> {
+      return apiRequest(`${root}/benchmarks/suites`);
+    },
+    runTaskQualityBenchmark(suiteId: string, candidateId = "v2"): Promise<TaskQualityBenchmarkRun> {
+      return apiRequest(`${root}/benchmarks/runs`, jsonRequest("POST", {
+        suite_id: suiteId,
+        candidate_id: candidateId,
+      }));
+    },
+    getTaskQualityBenchmarkRun(runId: string): Promise<TaskQualityBenchmarkRun> {
+      return apiRequest(`${root}/benchmarks/runs/${encodeURIComponent(runId)}`);
+    },
+    getTaskQualityBenchmarkComparison(runId: string): Promise<TaskQualityBenchmarkComparison> {
+      return apiRequest(`${root}/benchmarks/runs/${encodeURIComponent(runId)}/comparison`);
+    },
+    promoteTaskQualityBenchmarkBaseline(
+      suiteId: string,
+      payload: { run_id: string; reason: string },
+    ): Promise<Record<string, unknown>> {
+      return apiRequest(`${root}/benchmarks/suites/${encodeURIComponent(suiteId)}:promote-baseline`, jsonRequest("POST", payload));
     },
     async listTaskBriefs(taskId: string): Promise<TaskBrief[]> {
       const out = await apiRequest<unknown[]>(`${root}/tasks/${encodeURIComponent(taskId)}/briefs`);

@@ -1,0 +1,11 @@
+{
+  "schema_id": "task_quality_characterization_v1",
+  "prompt_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "brief": {"criteria_count": 1, "read_only": true, "legacy_schema_warnings": 4},
+  "legacy_plan": ["planner", "explorer", "worker", "reviewer", "tester", "evaluator", "scorer"],
+  "legacy_usage": {"reported_tokens": 2400000, "tool_calls": 137, "elapsed_seconds": 1340, "duplicate_scan_ratio": 0.44, "budget_mode": "unlimited"},
+  "legacy_findings": ["wrong_or_unselected_ref", "artifact_truncated_for_reviewer", "verdict_overrode_primary_result"],
+  "v2_plan": ["inventory", "evidence_collectors", "synthesis", "deterministic_validation", "independent_review", "publish"],
+  "provider_transcript_included": false,
+  "absolute_paths_included": false
+}

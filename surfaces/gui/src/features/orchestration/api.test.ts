@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { createOrchestrationApi, type ApiRequest } from "./api";
 import {
   ORCHESTRATION_STAGES,
+  TASK_QUALITY_ARCHETYPES,
+  TASK_QUALITY_ARTIFACT_STATUSES,
+  TASK_QUALITY_BUDGET_MODES,
+  TASK_QUALITY_BUDGET_STATUSES,
+  TASK_QUALITY_STATUSES,
+  TASK_QUALITY_WORKFLOW_EVENTS,
+  TASK_QUALITY_WORKFLOW_STATUSES,
   type AgentProfileSpec,
   type CreateOrchestrationTask,
   type ModelRoutingPolicySpec,
@@ -765,5 +772,85 @@ describe("orchestration API contracts", () => {
       reasoning: "provider_summary_only",
       tool_output: "metadata_only",
     });
+  });
+
+  it("keeps canonical Task Quality enums aligned with the control plane", () => {
+    expect(TASK_QUALITY_WORKFLOW_STATUSES).toEqual([
+      "draft", "analyzing", "needs_target_selection", "ready", "running",
+      "validating", "reviewing", "repairing", "recovering",
+      "needs_reconciliation", "needs_attention", "completed", "failed",
+      "canceled", "archived",
+    ]);
+    expect(TASK_QUALITY_STATUSES).toEqual(["pending", "checking", "pass", "fail", "unknown", "waived"]);
+    expect(TASK_QUALITY_ARTIFACT_STATUSES).toEqual(["none", "uploading", "draft", "validating", "verified", "rejected", "superseded"]);
+    expect(TASK_QUALITY_BUDGET_STATUSES).toEqual(["unconfigured", "within_budget", "warning", "exhausted", "over_budget", "unlimited"]);
+    expect(TASK_QUALITY_BUDGET_MODES).toEqual(["hard", "soft", "unlimited"]);
+    expect(TASK_QUALITY_ARCHETYPES).toEqual(["repo_analysis", "code_change", "focused_question", "document_generation", "incident_triage", "custom"]);
+    expect(TASK_QUALITY_WORKFLOW_EVENTS).toEqual([
+      "analysis_requested", "cancel_requested", "analysis_ready", "target_ambiguous",
+      "analysis_failed", "target_selected", "start_requested", "candidate_created",
+      "runtime_failed", "crash_detected", "validation_requires_review",
+      "repairable_failure", "attention_required", "fatal_failure",
+      "quality_publishable", "repaired_candidate_created", "repair_exhausted",
+      "repair_failed", "recovery_succeeded", "recovery_uncertain",
+      "reconciled_resume", "reconciled_fail", "resume_requested",
+      "repair_requested", "archive_requested", "retry_requested",
+    ]);
+  });
+
+  it("keeps benchmark baseline actor identity server-derived", async () => {
+    let observed: RequestInit | undefined;
+    const request: ApiRequest = async <T,>(_path: string, init?: RequestInit) => {
+      observed = init;
+      return { promoted: true } as T;
+    };
+    await createOrchestrationApi(request).promoteTaskQualityBenchmarkBaseline(
+      "test12",
+      { run_id: "benchmark-1", reason: "approved release corpus" },
+    );
+    expect(JSON.parse(String(observed?.body))).toEqual({
+      run_id: "benchmark-1",
+      reason: "approved release corpus",
+    });
+    expect(String(observed?.body)).not.toContain("actor_");
+  });
+
+  it("uses canonical Task Quality workflow, filter, range, and recovery contracts", async () => {
+    const calls: RequestCall[] = [];
+    const request: ApiRequest = async <T,>(path: string, init?: RequestInit) => {
+      calls.push({ path, init });
+      if (path.includes("/tasks?") || path.endsWith("/tasks")) return [] as T;
+      if (path.endsWith("/task-drafts")) return { task_id: "quality-1", id: "quality-1", workflow_status: "draft", prompt_hash: "sha256:prompt" } as T;
+      if (path.includes(":analyze")) return { task_id: "quality-1", contract: {}, contract_etag: "sha256:contract", target_resolution: {} } as T;
+      if (path.includes("/content")) return { message: "chunk" } as T;
+      return { id: "quality-object", content_hash: "sha256:next" } as T;
+    };
+    const api = createOrchestrationApi(request);
+
+    await api.listTasks({
+      workflowStatuses: ["completed"], qualityStatuses: ["waived"], artifactStatuses: ["verified"],
+      budgetStatuses: ["unlimited"], archetypes: ["repo_analysis"], repo: "warehouse",
+      snapshotRef: "refs/remotes/origin/main", budgetModes: ["soft"], hasWaiver: true,
+      repairCount: 2, createdBy: "quality-owner", limit: 25, offset: 50,
+    });
+    await api.createTaskQualityDraft({ objective: "Analyze", domain: "code", workspace: "C:/repo", read_only: true, source_workspace_write: false, task_artifact_write: true, network: false, quality_profile_id: "quality-first" }, "draft-key");
+    await api.analyzeTaskQualityDraft("quality-1", {}, "analysis-key");
+    await api.publishTaskQualityContract("quality-1", "sha256:contract");
+    await api.getArtifactContentRange("artifact/1", 0, 1023);
+    await api.resumeTaskQuality("quality-1", { reason: "operator recovery" });
+
+    expect(calls[0].path).toContain("workflow_status=completed");
+    expect(calls[0].path).toContain("quality_status=waived");
+    expect(calls[0].path).toContain("artifact_status=verified");
+    expect(calls[0].path).toContain("budget_status=unlimited");
+    expect(calls[0].path).toContain("snapshot_ref=refs%2Fremotes%2Forigin%2Fmain");
+    expect(calls[0].path).toContain("has_waiver=true");
+    expect(calls[0].path).toContain("repair_count=2");
+    expect(calls[1].init?.headers).toMatchObject({ "Idempotency-Key": "draft-key" });
+    expect(calls[2].init?.headers).toMatchObject({ "Idempotency-Key": "analysis-key" });
+    expect(calls[3].init?.headers).toMatchObject({ "If-Match": "sha256:contract" });
+    expect(calls[4].init?.headers).toMatchObject({ Range: "bytes=0-1023" });
+    expect(await api.getArtifactContentRange("artifact/1", 0, 7)).toBe("chunk");
+    expect(calls[5].path).toBe("/v1/orchestration/tasks/quality-1:resume");
   });
 });
