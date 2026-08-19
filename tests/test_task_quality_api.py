@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import subprocess
+import sys
 import zipfile
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -22,10 +25,6 @@ from coworker.orchestration.quality.state_machine import (
 )
 from coworker.providers import AssistantTurn, ModelCapabilities, ProviderClient
 from coworker.server.manager import SessionManager
-from scripts.generate_task_quality_types import TARGET as GENERATED_TYPES
-from scripts.generate_task_quality_types import render as render_generated_types
-
-
 class _Provider(ProviderClient):
     def complete(self, **_kwargs):
         return AssistantTurn(text="done")
@@ -152,7 +151,21 @@ def test_python_openapi_and_generated_types_share_one_quality_schema(tmp_path) -
         }
         for schema_name, values in expected.items():
             assert schemas[schema_name]["enum"] == values
-        assert GENERATED_TYPES.read_text(encoding="utf-8") == render_generated_types()
+        repository_root = Path(__file__).resolve().parents[1]
+        generated_types_check = subprocess.run(
+            [
+                sys.executable,
+                str(repository_root / "scripts" / "generate_task_quality_types.py"),
+                "--check",
+            ],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert generated_types_check.returncode == 0, (
+            generated_types_check.stdout + generated_types_check.stderr
+        )
     finally:
         manager.orchestration.store.close()
 
