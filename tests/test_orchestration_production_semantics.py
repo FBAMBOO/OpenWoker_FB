@@ -1268,7 +1268,9 @@ async def test_second_cancel_cannot_abandon_process_cleanup_settlement(tmp_path)
         service.catalog.close()
 
 
-def test_lost_run_requires_formal_reconciliation_before_retry(tmp_path):
+def test_lost_run_requires_formal_reconciliation_before_retry(
+    tmp_path, monkeypatch
+):
     service = OrchestrationService(
         FakeManager(), tmp_path / "lost-cleanup-unknown", executor=object()
     )
@@ -1305,6 +1307,15 @@ def test_lost_run_requires_formal_reconciliation_before_retry(tmp_path):
         assert service._can_retry(node, lost, explicit=False) is False
         assert service._can_retry(node, lost, explicit=True) is True
 
+        def unexpected_candidate_subject(*_args, **_kwargs):
+            raise AssertionError(
+                "execution failure reconciliation must not traverse the candidate"
+            )
+
+        monkeypatch.setattr(
+            service, "_candidate_subject", unexpected_candidate_subject
+        )
+
         gate = None
         for _ in range(4):
             service._advance_task(task_id)
@@ -1331,6 +1342,55 @@ def test_lost_run_requires_formal_reconciliation_before_retry(tmp_path):
         assert len(
             [run for run in service.store.list_runs(task_id) if run.node_id == lost.node_id]
         ) == 1
+        assert service._repair_evaluator_adjudicated_gates() == 0
+        asyncio.run(service._dispatch_ready_wakes())
+        assignment = next(
+            wake
+            for wake in service.store.list_wakes(task_id=task_id)
+            if wake.reason.value == "assignment"
+        )
+        assert assignment.status.value == "completed"
+    finally:
+        service.store.close()
+        service.catalog.close()
+
+
+@pytest.mark.asyncio
+async def test_assignment_wake_binds_when_run_is_already_running(tmp_path):
+    service = OrchestrationService(
+        FakeManager(), tmp_path / "assignment-running-race", executor=object()
+    )
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Bind assignment intent to the live execution",
+                "domain": "knowledge",
+                "acceptance_criteria": ["the wake is delivered once"],
+                "complexity_factors": low_complexity(),
+                "auto_start": False,
+            }
+        )["id"]
+        service.submit_task(task_id)
+        service._advance_task(task_id)
+        claim = service.store.claim_next_run("worker-already-running")
+        assert claim is not None
+        running = service.store.start_run(
+            claim.run.id,
+            claim.lease.token,
+            claim.lease.fencing_token,
+        )
+
+        await service._dispatch_ready_wakes()
+
+        assignment = next(
+            wake
+            for wake in service.store.list_wakes(task_id=task_id)
+            if wake.reason.value == "assignment"
+        )
+        assert assignment.status.value == "delivered"
+        assert assignment.target_run_id == running.id
+        assert assignment.attempts == 1
+        assert service._wake_deferral_seconds(650) == 60
     finally:
         service.store.close()
         service.catalog.close()

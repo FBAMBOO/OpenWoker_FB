@@ -39,6 +39,45 @@ def init_git_repo(root):
     git(root, "commit", "-m", "baseline")
 
 
+@pytest.mark.parametrize(
+    "limits, contents",
+    [
+        ({"max_snapshot_files": 1, "max_snapshot_bytes": 1_000}, ["a", "b"]),
+        ({"max_snapshot_files": 10, "max_snapshot_bytes": 3}, ["four"]),
+    ],
+)
+def test_snapshot_preflight_rejects_oversized_workspace_before_copy(
+    tmp_path, limits, contents
+):
+    source = tmp_path / "oversized-source"
+    source.mkdir()
+    for index, content in enumerate(contents):
+        write(source / f"file-{index}.txt", content)
+    manager = WorkspaceManager(tmp_path / "workspaces", **limits)
+
+    with pytest.raises(WorkspaceError, match="safe writable snapshot limit"):
+        manager.prepare(source, snapshot_id="oversized")
+
+    assert not (manager.base_dir / "snapshots" / "oversized").exists()
+
+
+def test_clean_git_worktree_bypasses_filesystem_snapshot_limit(tmp_path):
+    source = tmp_path / "clean-repo"
+    init_git_repo(source)
+    manager = WorkspaceManager(
+        tmp_path / "workspaces",
+        max_snapshot_files=1,
+        max_snapshot_bytes=1,
+    )
+
+    snapshot = manager.prepare(source, snapshot_id="clean-fast-path")
+
+    assert snapshot.kind is WorkspaceKind.GIT_WORKTREE
+    assert (snapshot.candidate / "tracked.txt").read_text(encoding="utf-8") == (
+        "baseline\n"
+    )
+
+
 def test_non_git_snapshot_evidence_delivery_and_journal(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

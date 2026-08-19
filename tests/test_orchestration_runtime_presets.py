@@ -74,6 +74,29 @@ def _request(**overrides):
     }
 
 
+@pytest.mark.parametrize(
+    ("objective", "constraints"),
+    [
+        ("Inspect the repository and do not modify files.", []),
+        ("Inspect the repository safely.", ["不要修改任何文件。"]),
+    ],
+)
+def test_read_only_prompt_requires_explicit_permission(
+    service, objective, constraints
+):
+    with pytest.raises(
+        ValueError,
+        match="require read-only source access.*set read_only=true",
+    ):
+        service.create_task(
+            _request(
+                idempotency_key=f"read-only-conflict-{len(constraints)}",
+                objective=objective,
+                constraints=constraints,
+            )
+        )
+
+
 def test_builtin_codex_led_preset_is_versioned_and_exact():
     preset = PRODUCTION_CODEX_LED_MIXED_V1
     snapshot = preset.to_dict()
