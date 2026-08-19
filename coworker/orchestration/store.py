@@ -8397,16 +8397,22 @@ class OrchestrationStore:
         now: Optional[datetime] = None,
     ) -> None:
         chosen_now = now or _now()
+        renewed_until = _stamp(chosen_now + timedelta(seconds=lease_seconds))
         with self._write(enforce_scheduler_fence=False) as connection:
             changed = connection.execute(
                 """
                 UPDATE orch_scheduler_leader
-                SET expires_at = ?, heartbeat_at = ?
+                SET expires_at = CASE
+                        WHEN expires_at > ? THEN expires_at
+                        ELSE ?
+                    END,
+                    heartbeat_at = ?
                 WHERE singleton = 1 AND owner = ? AND token = ? AND epoch = ?
                   AND expires_at > ?
                 """,
                 (
-                    _stamp(chosen_now + timedelta(seconds=lease_seconds)),
+                    renewed_until,
+                    renewed_until,
                     _stamp(chosen_now),
                     owner,
                     token,

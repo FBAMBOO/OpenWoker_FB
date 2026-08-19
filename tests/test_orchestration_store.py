@@ -1489,6 +1489,37 @@ def test_scheduler_leader_lease_prevents_two_active_services(tmp_path):
     assert first.release_scheduler_leader("third", third_token, third_epoch)
 
 
+def test_short_heartbeat_cannot_shorten_an_existing_leader_lease(tmp_path):
+    database = tmp_path / "scheduler-monotonic-renewal.db"
+    leader = OrchestrationStore(database)
+    contender = OrchestrationStore(database)
+    now = datetime.now(timezone.utc)
+
+    token, epoch = leader.acquire_scheduler_leader(
+        "leader", lease_seconds=60, now=now
+    )
+    leader.heartbeat_scheduler_leader(
+        "leader",
+        token,
+        epoch,
+        lease_seconds=15,
+        now=now + timedelta(seconds=10),
+    )
+
+    with pytest.raises(LeaseConflict, match="already owned"):
+        contender.acquire_scheduler_leader(
+            "contender", lease_seconds=10, now=now + timedelta(seconds=30)
+        )
+
+    contender_token, contender_epoch = contender.acquire_scheduler_leader(
+        "contender", lease_seconds=10, now=now + timedelta(seconds=61)
+    )
+    assert contender_epoch == epoch + 1
+    assert contender.release_scheduler_leader(
+        "contender", contender_token, contender_epoch
+    )
+
+
 def test_scheduler_epoch_fences_every_bound_domain_write(tmp_path):
     database = tmp_path / "scheduler-write-fence.db"
     old = OrchestrationStore(database)
