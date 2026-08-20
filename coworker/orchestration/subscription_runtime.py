@@ -118,6 +118,7 @@ _OUTPUT_LIMIT = 8 * 1024 * 1024
 _STDERR_LIMIT = 256 * 1024
 _PROBE_TIMEOUT = 10.0
 _PROBE_TTL_SECONDS = 30.0
+_CLAUDE_STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 _READ_ONLY_DYNAMIC_TOOL_NAMES = frozenset(
     {"list_files", "read_file", "read_file_lines", "grep"}
 )
@@ -4631,7 +4632,10 @@ class ClaudeCodeSubscriptionRuntime(_BaseSubscriptionRuntime):
         resolved_model = ""
         usage_tokens = 0
         tool_ids: set[str] = set()
+        structured_output_tool_ids: set[str] = set()
         tool_names: dict[str, str] = {}
+        stream_usage_tokens = 0
+        stream_turn_tokens = 0
         terminal_status = "failed"
         error_kind: Optional[str] = None
         error_message: Optional[str] = None
@@ -4746,6 +4750,35 @@ class ClaudeCodeSubscriptionRuntime(_BaseSubscriptionRuntime):
                     capabilities = event.get("capabilities")
                     if isinstance(capabilities, Mapping) and capabilities.get("agents"):
                         raise RuntimeError("Claude Code enabled uncontrolled built-in agents")
+                elif event_type == "stream_event":
+                    stream_event = event.get("event")
+                    if isinstance(stream_event, Mapping):
+                        stream_event_type = str(stream_event.get("type") or "")
+                        if stream_event_type == "message_start":
+                            stream_turn_tokens = 0
+                        elif stream_event_type == "message_delta":
+                            stream_usage = dict(stream_event.get("usage") or {})
+                            observed_turn_tokens = int(
+                                stream_usage.get(
+                                    "input_tokens",
+                                    stream_usage.get("inputTokens", 0),
+                                )
+                                or 0
+                            ) + int(
+                                stream_usage.get(
+                                    "output_tokens",
+                                    stream_usage.get("outputTokens", 0),
+                                )
+                                or 0
+                            )
+                            if observed_turn_tokens > stream_turn_tokens:
+                                stream_usage_tokens += (
+                                    observed_turn_tokens - stream_turn_tokens
+                                )
+                                stream_turn_tokens = observed_turn_tokens
+                                usage_tokens = max(
+                                    usage_tokens, stream_usage_tokens
+                                )
                 elif event_type == "assistant":
                     message = dict(event.get("message") or {})
                     message_model = str(message.get("model") or "")
@@ -4758,8 +4791,34 @@ class ClaudeCodeSubscriptionRuntime(_BaseSubscriptionRuntime):
                         if block_type == "text":
                             assistant_texts.append(str(block.get("text") or ""))
                         elif block_type == "tool_use":
-                            tool_id = str(block.get("id") or f"tool-{len(tool_ids)}")
+                            tool_id = str(
+                                block.get("id")
+                                or "tool-"
+                                + str(len(tool_ids) + len(structured_output_tool_ids))
+                            )
                             tool_name = str(block.get("name") or "tool")
+                            if tool_name == _CLAUDE_STRUCTURED_OUTPUT_TOOL:
+                                # ``--json-schema`` is implemented by Claude Code as a
+                                # synthetic, side-effect-free tool call. It is part of
+                                # the output protocol, not a role capability, so it must
+                                # neither bypass the external-tool allowlist nor count
+                                # against the role's tool usage. The terminal result is
+                                # still authoritative; retaining the latest valid input
+                                # only supports CLI versions that omit the duplicate
+                                # ``result.structured_output`` field.
+                                if not isinstance(block.get("input"), Mapping):
+                                    raise RuntimeError(
+                                        "Claude Code emitted malformed StructuredOutput"
+                                    )
+                                structured_output_tool_ids.add(tool_id)
+                                candidate = _structured(block.get("input"))
+                                structured_output = (
+                                    candidate
+                                    if candidate is not None
+                                    and _validate_structured(candidate) is None
+                                    else None
+                                )
+                                continue
                             if tool_name not in authorized_tool_names:
                                 raise PermissionError(
                                     f"Claude Code used unauthorized tool {tool_name!r}"
@@ -4785,6 +4844,10 @@ class ClaudeCodeSubscriptionRuntime(_BaseSubscriptionRuntime):
                         if not tool_id:
                             continue
                         failed = bool(block.get("is_error", False))
+                        if tool_id in structured_output_tool_ids:
+                            if failed:
+                                structured_output = None
+                            continue
                         self._activity(
                             context,
                             event_key=f"{activity_source}:tool:{tool_id}:completed",
