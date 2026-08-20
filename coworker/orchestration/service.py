@@ -100,6 +100,7 @@ from .quality.budgets import (
 )
 from .quality.benchmark import TaskQualityBenchmarkService
 from .quality.contract_compiler import ContractCompiler
+from .quality.contract_rules import READ_ONLY_RULE
 from .quality.contracts import ContractRepository
 from .quality.evidence import EvidenceLedger
 from .quality.facade import TaskQualityFacade
@@ -494,7 +495,11 @@ class OrchestrationService:
         self._leader_token: Optional[str] = None
         self._leader_epoch: Optional[int] = None
         self._leader_lost = False
-        self._leader_lease_seconds = 15
+        # Keep failover bounded while tolerating transient Windows filesystem and
+        # antivirus stalls. Workspace preparation runs off-loop, but a saturated
+        # local disk can still delay the heartbeat long enough to fence a healthy
+        # scheduler when the lease is only a few seconds long.
+        self._leader_lease_seconds = 60
         self._last_leader_heartbeat: Optional[datetime] = None
         self._last_outbox_success: Optional[datetime] = None
         self._last_outbox_error: Optional[str] = None
@@ -1043,16 +1048,61 @@ class OrchestrationService:
                         ),
                         None,
                     )
+                if selected is None:
+                    # A task-level assignment can race the worker claim: by the
+                    # time the wake dispatcher observes it, the only eligible run
+                    # may already be claimed or running. All are valid live binding
+                    # targets in the durable store.
+                    selected = next(
+                        (
+                            item
+                            for item in candidates
+                            if item.status
+                            in {
+                                RunStatus.CLAIMED,
+                                RunStatus.RUNNING,
+                                RunStatus.WAITING_GATE,
+                            }
+                        ),
+                        None,
+                    )
                 if selected is not None:
                     self.wakes.bind_to_run(
                         wake.id, selected.id, owner=self.worker_id
                     )
                     self._observe_wake_delivery(wake)
                     continue
+                # Refresh after _advance_task: a completed DAG may have moved from
+                # execution to evaluation during this dispatch attempt. Assignment
+                # intent is then already satisfied even though no live run remains.
+                task = self.store.get_task(task.id)
+                if (
+                    task.status in _TERMINAL_TASKS
+                    or task.status is TaskStatus.CANCELING
+                ):
+                    self.store.cancel_claimed_wake(
+                        wake.id,
+                        reason=f"target task is {task.status.value}",
+                        command_id=_command("wake-cancel-terminal", wake.id),
+                    )
+                    continue
+                if (
+                    wake.reason in {WakeReason.ASSIGNMENT, WakeReason.TASK_ASSIGNED}
+                    and task.current_stage
+                    in {
+                        OrchestrationStage.INTER_STEP_EVALUATION,
+                        OrchestrationStage.FINAL_ACCEPTANCE,
+                        OrchestrationStage.ARCHIVE,
+                    }
+                ):
+                    self.wakes.mark_delivered(wake.id)
+                    self.wakes.mark_completed(wake.id)
+                    self._observe_wake_delivery(wake)
+                    continue
                 self.wakes.defer_wake(
                     wake.id,
                     not_before=datetime.now(timezone.utc)
-                    + timedelta(seconds=max(1.0, self.poll_seconds * 4)),
+                    + timedelta(seconds=self._wake_deferral_seconds(wake.attempts)),
                 )
             except Exception as exc:
                 logger.exception("could not deliver orchestration wake %s", wake.id)
@@ -1064,6 +1114,17 @@ class OrchestrationService:
                     self.handoff_metrics.increment(
                         "orchestration_wake_dead_letter_total"
                     )
+
+    def _wake_deferral_seconds(self, attempts: int) -> float:
+        """Back off routine no-run races without dead-lettering valid intent."""
+
+        base = max(
+            1.0,
+            float(self.wakes.backoff_seconds),
+            float(self.poll_seconds) * 4,
+        )
+        exponent = min(6, max(0, int(attempts) - 1))
+        return min(60.0, base * (2**exponent))
 
     def _observe_wake_delivery(self, wake: Any) -> None:
         self.handoff_metrics.increment("orchestration_wake_delivered_total")
@@ -3042,6 +3103,13 @@ class OrchestrationService:
             if brief_draft
             else tuple(str(v).strip() for v in request.get("constraints", ()) if str(v).strip())
         )
+        if not read_only and READ_ONLY_RULE.search(
+            "\n".join((objective, *constraints))
+        ):
+            raise ValueError(
+                "objective or constraints require read-only source access; "
+                "set read_only=true or remove the conflicting read-only instruction"
+            )
         profile_id = str(request.get("profile_id") or "worker")
         model_policy_id = str(request.get("model_policy_id") or "quality-first")
         primary_profile = self.catalog.resolve_profile(profile_id)
@@ -3935,6 +4003,19 @@ class OrchestrationService:
                 for run in self.store.list_runs(task.id)
                 if run.plan_id == graph.plan.id
             )
+            if any(
+                run.status in _FAILED_RUNS
+                or self._workspace_commit_status(run) == "failed"
+                for run in latest.values()
+            ) or any(
+                self._terminal_outcome(child)
+                in {TaskStatus.FAILED, TaskStatus.CANCELED}
+                for child in self._plan_descendants(task.id, graph.plan.id)
+            ):
+                # An execution reconciliation gate cannot be auto-settled by a
+                # verifier verdict. More importantly, its retained candidate may
+                # be enormous; startup recovery must not hash it pointlessly.
+                continue
             subject = self._candidate_subject(task, graph, latest)
             verification = self._verification_reports(
                 task.id,
@@ -4874,13 +4955,22 @@ class OrchestrationService:
                     if self._terminal_outcome(child)
                     in {TaskStatus.FAILED, TaskStatus.CANCELED}
                 ]
-                subject = self._candidate_subject(task, graph, latest_by_key)
-                verification = self._verification_reports(
-                    task.id,
-                    graph,
-                    latest_by_key,
-                    expected_subject=subject,
+                execution_failed = bool(
+                    failed or workspace_failures or failed_children
                 )
+                if execution_failed:
+                    # Execution-level failure is already sufficient to require a
+                    # reconciliation gate. Avoid traversing or hashing a potentially
+                    # enormous candidate snapshot that cannot change that decision.
+                    verification = []
+                else:
+                    subject = self._candidate_subject(task, graph, latest_by_key)
+                    verification = self._verification_reports(
+                        task.id,
+                        graph,
+                        latest_by_key,
+                        expected_subject=subject,
+                    )
                 adjudication = self._verification_adjudication(verification)
                 authoritative_verification = adjudication["authoritative"]
                 adverse_verdicts = [

@@ -578,6 +578,60 @@ describe("OrchestrationSurface", () => {
     });
   });
 
+  it("requires the explicit read-only toggle when the task forbids modification", async () => {
+    const calls: RequestCall[] = [];
+    const created = {
+      id: "task-read-only-consistency",
+      title: "Inspect safely",
+      objective: "Inspect the repository and do not modify files.",
+      status: "queued",
+      stage: "intake",
+      updated_at: "2026-08-04T01:00:00Z",
+      stages: [], attention: [], nodes: [], edges: [], runs: [], evidence: [], activity: [],
+    };
+    const apiRequest: ApiRequest = async <T,>(path: string, init?: RequestInit) => {
+      const method = (init?.method || "GET").toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ path, method, body });
+      if (path.startsWith("/v1/orchestration/tasks?") && method === "GET") return [] as T;
+      if (path === "/v1/orchestration/agent-profiles") return [
+        { id: "worker", name: "Worker", role: "worker", builtin: true, archived: false, current_version: 1, has_draft: false },
+      ] as T;
+      if (path === "/v1/orchestration/model-policies") return [
+        { id: "quality-first", name: "Quality first", builtin: true, archived: false, current_version: 1, has_draft: false },
+      ] as T;
+      if (path === "/v1/orchestration/model-catalog" || path === "/v1/orchestration/runtime-presets") return [] as T;
+      if (path === "/v1/orchestration/tasks" && method === "POST") return created as T;
+      if (path === "/v1/orchestration/tasks/task-read-only-consistency") return created as T;
+      throw new Error(`Unexpected request: ${method} ${path}`);
+    };
+
+    render(<OrchestrationSurface apiRequest={apiRequest} apiDownload={noDownload} currentWorkspace="C:/work/read-only-consistency" />);
+    await screen.findByText("No active orchestration tasks.");
+    fireEvent.click(screen.getByRole("button", { name: /New/ }));
+    await waitFor(() => expect((screen.getByLabelText("Primary agent profile") as HTMLSelectElement).disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: "Inspect the repository and do not modify files." },
+    });
+
+    expect(screen.getByText(/Read-only instruction conflicts with workspace permission/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create and start" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.submit(screen.getByTestId("create-orchestration-task"));
+    expect(calls.some((call) => call.path === "/v1/orchestration/tasks" && call.method === "POST")).toBe(false);
+
+    fireEvent.click(screen.getByLabelText("Read-only task"));
+    expect(screen.queryByText(/Read-only instruction conflicts with workspace permission/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Create and start" }));
+
+    await waitFor(() => {
+      const submitted = calls.find((call) => call.path === "/v1/orchestration/tasks" && call.method === "POST");
+      expect(submitted?.body).toMatchObject({
+        objective: "Inspect the repository and do not modify files.",
+        read_only: true,
+      });
+    });
+  });
+
   it("blocks a non-Worker writable code primary and allows it only behind explicit read-only", async () => {
     const calls: RequestCall[] = [];
     const created = {

@@ -31,6 +31,8 @@ _SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _SNAPSHOT_METADATA = "snapshot.json"
 _SNAPSHOT_OWNER = ".snapshot-owner.json"
 _SNAPSHOT_QUARANTINE = "snapshot-quarantine"
+_DEFAULT_MAX_SNAPSHOT_FILES = 50_000
+_DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024**3
 
 
 class WorkspaceError(RuntimeError):
@@ -367,6 +369,8 @@ class WorkspaceManager:
         base_dir: Path | str,
         *,
         journal_path: Optional[Path | str] = None,
+        max_snapshot_files: int = _DEFAULT_MAX_SNAPSHOT_FILES,
+        max_snapshot_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
     ) -> None:
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -375,6 +379,8 @@ class WorkspaceManager:
             if journal_path
             else self.base_dir / "delivery-journal.jsonl"
         )
+        self.max_snapshot_files = max(1, int(max_snapshot_files))
+        self.max_snapshot_bytes = max(1, int(max_snapshot_bytes))
         self._lock = threading.RLock()
         self._journal_tail_truncated = False
 
@@ -418,6 +424,8 @@ class WorkspaceManager:
                 snapshot_id=identifier,
                 source_root=source_root,
             )
+            if not git or dirty:
+                self._assert_snapshot_within_limits(source_root)
             workspace_root.mkdir(parents=True)
             owns_workspace_root = True
             self._atomic_write_json(
@@ -1295,6 +1303,40 @@ class WorkspaceManager:
             symlinks=True,
             ignore=lambda _path, names: {".git"} if ".git" in names else set(),
         )
+
+    def _assert_snapshot_within_limits(self, source: Path) -> None:
+        """Reject oversized copies before creating any snapshot directories."""
+
+        file_count = 0
+        byte_count = 0
+        pending = [source]
+        try:
+            while pending:
+                current = pending.pop()
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if entry.name == ".git":
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        file_count += 1
+                        byte_count += entry.stat(follow_symlinks=False).st_size
+                        if (
+                            file_count > self.max_snapshot_files
+                            or byte_count > self.max_snapshot_bytes
+                        ):
+                            raise WorkspaceError(
+                                "workspace exceeds the safe writable snapshot limit "
+                                f"({self.max_snapshot_files:,} files or "
+                                f"{self.max_snapshot_bytes / 1024**3:.1f} GiB); "
+                                "use read_only=true, select the actual Git repository "
+                                "root, or reduce the workspace scope"
+                            )
+        except OSError as exc:
+            raise WorkspaceError(
+                f"workspace changed or became unreadable during snapshot preflight: {exc}"
+            ) from exc
 
     @staticmethod
     def _remove_path(path: Path) -> None:

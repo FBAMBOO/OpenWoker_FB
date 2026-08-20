@@ -95,6 +95,8 @@ const ERROR_KIND_DISPLAY_LIMIT = 120;
 const ERROR_MESSAGE_DISPLAY_LIMIT = 1_600;
 const RECONCILIATION_RUN_DISPLAY_LIMIT = 8;
 const PRIMARY_ROLE_CONFLICT_MESSAGE = "Writable code tasks require a Worker primary profile. Turn on Read-only task or select a Worker profile.";
+const READ_ONLY_CONFLICT_MESSAGE = "Objective or constraints require read-only source access. Turn on Read-only task or remove the conflicting instruction.";
+const READ_ONLY_INTENT_PATTERN = /\bread[- ]?only\b|do not modify|don't modify|只读|不要修改|不得修改/i;
 const WRITABLE_DELIVERABLE_DEFAULT = "implementation_patch:Completed outcome";
 const READ_ONLY_DELIVERABLE_DEFAULT = "artifact:Read-only analysis report";
 
@@ -1205,6 +1207,8 @@ function CreateTaskForm({
   const profileFieldLabel = runtimePresetId ? "Task root profile" : "Primary agent profile";
   const writableCodeRoleConflict = !runtimePresetId && domain === "code" && !readOnly
     && Boolean(selectedProfileRole && selectedProfileRole !== "worker");
+  const readOnlyInstructionConflict = !readOnly
+    && READ_ONLY_INTENT_PATTERN.test(`${objective}\n${constraints}`);
   const presetRoleGroups = useMemo(() => {
     if (!selectedPreset) return [];
     if (selectedPreset.id === DEFAULT_RUNTIME_PRESET_ID) return [...DEFAULT_PRESET_ROLE_GROUPS];
@@ -1233,7 +1237,7 @@ function CreateTaskForm({
   const submit = async (event: FormEvent | null, publishAndStart = true) => {
     event?.preventDefault();
     if (!objective.trim()) return;
-    if (writableCodeRoleConflict) return;
+    if (writableCodeRoleConflict || readOnlyInstructionConflict) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -1501,7 +1505,7 @@ function CreateTaskForm({
             <span>
               <span className="block text-[11.5px] font-medium text-ink">Read-only task</span>
               <span id="read-only-task-help" className="mt-0.5 block text-[10px] leading-relaxed text-muted">
-                Hard permission boundary: agents may inspect and analyze, but cannot modify or publish workspace files. This is explicit and is never inferred from the Objective.
+                Hard permission boundary: agents may inspect and analyze, but cannot modify or publish workspace files. The explicit toggle must agree with the Objective and constraints.
               </span>
             </span>
           </label>
@@ -1509,6 +1513,11 @@ function CreateTaskForm({
         {writableCodeRoleConflict && (
           <div id="primary-role-conflict" className="sm:col-span-2 rounded-lg border border-warnInk/30 bg-warn/10 px-3 py-2 text-[10.5px] leading-relaxed text-warnInk" role="alert">
             <span className="font-semibold">Primary profile cannot start writable code work.</span> {PRIMARY_ROLE_CONFLICT_MESSAGE}
+          </div>
+        )}
+        {readOnlyInstructionConflict && (
+          <div className="sm:col-span-2 rounded-lg border border-warnInk/30 bg-warn/10 px-3 py-2 text-[10.5px] leading-relaxed text-warnInk" role="alert">
+            <span className="font-semibold">Read-only instruction conflicts with workspace permission.</span> {READ_ONLY_CONFLICT_MESSAGE}
           </div>
         )}
         <label>
@@ -1556,10 +1565,10 @@ function CreateTaskForm({
       </div>
       <div className="mt-5 flex justify-end gap-2">
         <button type="button" className={BUTTON} disabled={submitting} onClick={onCancel}>Cancel</button>
-        <button type="button" className={BUTTON} disabled={submitting || !objective.trim() || writableCodeRoleConflict} onClick={() => void submit(null, false)}>
+        <button type="button" className={BUTTON} disabled={submitting || !objective.trim() || writableCodeRoleConflict || readOnlyInstructionConflict} onClick={() => void submit(null, false)}>
           {submitting ? "Saving…" : "Save draft"}
         </button>
-        <button type="submit" className={PRIMARY_BUTTON} disabled={submitting || !objective.trim() || presetUnavailable || writableCodeRoleConflict}>
+        <button type="submit" className={PRIMARY_BUTTON} disabled={submitting || !objective.trim() || presetUnavailable || writableCodeRoleConflict || readOnlyInstructionConflict}>
           {submitting ? "Creating…" : "Create and start"}
         </button>
       </div>
