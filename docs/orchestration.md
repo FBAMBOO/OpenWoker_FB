@@ -368,6 +368,9 @@ work units per task tree, and three attempts per work unit. The desktop product 
 service with `runtime_budget_mode=unlimited`: model calls, tool calls, reported tokens,
 profile iterations, and run wall time are recorded but do not terminate a run. Historical
 task budget values remain durable audit data and are ignored while this mode is active.
+Every runtime usage segment records its node key, role, profile id/version, run id, and
+the four observed counters; task and run APIs continue to expose those counters while
+the corresponding finite `budget` field is hidden.
 Finite-budget behavior remains available to tests and embedders through
 `OrchestrationService(..., enforce_runtime_budgets=True)`.
 

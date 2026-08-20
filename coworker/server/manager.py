@@ -191,10 +191,11 @@ class SessionManager:
         self.orchestration = OrchestrationService(
             self,
             base / "orchestration",
-            # Production defaults to enforced limits. Task Quality V2 replaces the
-            # former equal-DAG split with a versioned strategy ledger; an explicitly
-            # selected unlimited profile remains possible and visible as such.
-            enforce_runtime_budgets=True,
+            # Temporarily run the desktop product in observe-only mode: model, tool,
+            # token, and wall-time usage remain durable, but those counters do not
+            # terminate an Agent run. Embedders can still opt into finite ceilings by
+            # constructing OrchestrationService(enforce_runtime_budgets=True).
+            enforce_runtime_budgets=False,
         )
         # Seed the PDF-fallback module global from prefs so engines see the user's
         # choice from the first turn (set_pdf_settings keeps it in sync after).

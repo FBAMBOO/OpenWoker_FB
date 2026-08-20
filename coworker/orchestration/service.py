@@ -1655,7 +1655,9 @@ class OrchestrationService:
             for item in (
                 evidence
                 if evidence is not None
-                else self.store.list_evidence(run.task_id)
+                else self.store.list_runtime_usage_evidence(
+                    run.task_id, (run.id,)
+                )
             )
             if item.run_id == run.id and item.payload.get("runtime_usage_segment")
         ]
@@ -1690,12 +1692,51 @@ class OrchestrationService:
             wall_seconds=int(usage.get("wall_seconds", 0) or 0),
         )
 
+    def _observed_usage_for_run(
+        self, run: RunRecord, evidence: Optional[Sequence[Any]] = None
+    ) -> RuntimeBudget:
+        """Return actual provider usage, independent of any finite ledger cap."""
+
+        segments = [
+            item
+            for item in (
+                evidence
+                if evidence is not None
+                else self.store.list_runtime_usage_evidence(
+                    run.task_id, (run.id,)
+                )
+            )
+            if item.run_id == run.id and item.payload.get("runtime_usage_segment")
+        ]
+        if segments:
+            total = RuntimeBudget()
+            for item in segments:
+                usage = dict(item.payload.get("usage") or {})
+                total += RuntimeBudget(
+                    model_calls=int(usage.get("model_calls", 0) or 0),
+                    tool_calls=int(usage.get("tool_calls", 0) or 0),
+                    tokens=int(usage.get("tokens", 0) or 0),
+                    wall_seconds=int(usage.get("wall_seconds", 0) or 0),
+                )
+            return total
+        output = dict(run.output or {})
+        usage = output.get("usage")
+        if not isinstance(usage, Mapping):
+            return RuntimeBudget()
+        return RuntimeBudget(
+            model_calls=int(usage.get("model_calls", 0) or 0),
+            tool_calls=int(usage.get("tool_calls", 0) or 0),
+            tokens=int(usage.get("tokens", 0) or 0),
+            wall_seconds=int(usage.get("wall_seconds", 0) or 0),
+        )
+
     def _record_usage_segment(
         self,
         task: TaskRecord,
         graph: PlanGraph,
         node: NodeRecord,
         run: RunRecord,
+        profile: AgentProfile,
         usage: Mapping[str, Any],
         *,
         segment_key: str,
@@ -1712,6 +1753,10 @@ class OrchestrationService:
             "title": "Runtime usage segment",
             "runtime_usage_segment": True,
             "segment_key": segment_key,
+            "node_key": node.key,
+            "profile_id": profile.profile_id,
+            "profile_version": profile.version,
+            "role": profile.role.value,
             # Preserve actual observed usage even when cleanup itself crossed a
             # limit. Runtime reconstruction uses the separately bounded accounted
             # value so audit truth cannot make the in-memory budget ledger invalid.
@@ -8006,6 +8051,7 @@ class OrchestrationService:
                         graph,
                         node,
                         run,
+                        profile,
                         outcome.usage,
                         segment_key=segment_key,
                         accounted_usage=accounted,
@@ -8055,6 +8101,7 @@ class OrchestrationService:
                     graph,
                     node,
                     run,
+                    profile,
                     outcome.usage,
                     segment_key=segment_key,
                     accounted_usage=accounted,
@@ -8066,6 +8113,7 @@ class OrchestrationService:
                 graph,
                 node,
                 run,
+                profile,
                 outcome.usage,
                 segment_key=segment_key,
             )
@@ -10462,8 +10510,19 @@ class OrchestrationService:
         total_children = int(child_counts.get(task.id, 0))
         children_omitted = total_children > len(direct_children)
         depth_limit_reached = child_depth <= 0 and children_omitted
+        usage_by_run: dict[str, list[Any]] = {}
+        for item in self.store.list_runtime_usage_evidence(
+            task.id, tuple(run.id for run in runs)
+        ):
+            if item.run_id is not None:
+                usage_by_run.setdefault(item.run_id, []).append(item)
         run_payloads = [
-            self._run_payload(run, parent_run_id=parent_run_id) for run in runs
+            self._run_payload(
+                run,
+                parent_run_id=parent_run_id,
+                usage_evidence=usage_by_run.get(run.id, ()),
+            )
+            for run in runs
         ]
         run_payloads_by_id = {item["id"]: item for item in run_payloads}
         try:
@@ -10697,10 +10756,21 @@ class OrchestrationService:
         )
         runs = page[-limit:]
         parent_run_id = (task.input.get("_runtime") or {}).get("parent_run_id")
+        usage_by_run: dict[str, list[Any]] = {}
+        for item in self.store.list_runtime_usage_evidence(
+            task.id, tuple(run.id for run in runs)
+        ):
+            if item.run_id is not None:
+                usage_by_run.setdefault(item.run_id, []).append(item)
         return {
             "task_id": task_id,
             "runs": [
-                self._run_payload(run, parent_run_id=parent_run_id) for run in runs
+                self._run_payload(
+                    run,
+                    parent_run_id=parent_run_id,
+                    usage_evidence=usage_by_run.get(run.id, ()),
+                )
+                for run in runs
             ],
             "offset": offset,
             "limit": limit,
@@ -11059,48 +11129,75 @@ class OrchestrationService:
         }[status]
 
     def _run_payload(
-        self, run: RunRecord, *, parent_run_id: Any = _UNSET
+        self,
+        run: RunRecord,
+        *,
+        parent_run_id: Any = _UNSET,
+        usage_evidence: Optional[Sequence[Any]] = None,
     ) -> dict[str, Any]:
         output = dict(run.output or {})
+        output_profile = (
+            dict(output.get("profile") or {})
+            if isinstance(output.get("profile"), Mapping)
+            else {}
+        )
         route = dict(output.get("routing") or {})
         error_message = str(run.error_message or "")[:_RUN_ERROR_MESSAGE_LIMIT]
         task = self.store.get_task(run.task_id)
         if parent_run_id is _UNSET:
             parent_run_id = (task.input.get("_runtime") or {}).get("parent_run_id")
         attempt_budget: Optional[RuntimeBudget] = None
+        profile_id = str(output_profile.get("profile_id") or "")
+        profile_version = output_profile.get("version")
+        role = str(output_profile.get("role") or "")
         try:
             graph = self.store.get_plan(run.plan_id)
             node = next(item for item in graph.nodes if item.id == run.node_id)
-            allocation = self._run_budget(task, graph, node)
-            spent = RuntimeBudget()
-            prior_runs = sorted(
-                (
-                    item
-                    for item in self.store.list_runs(task.id)
-                    if item.plan_id == run.plan_id
-                    and item.node_id == run.node_id
-                    and (item.created_at, item.attempt, item.id)
-                    < (run.created_at, run.attempt, run.id)
-                    and item.status is not RunStatus.QUEUED
-                ),
-                key=lambda item: (item.created_at, item.attempt, item.id),
+            profile_snapshot = dict(node.metadata.get("profile_snapshot") or {})
+            profile_spec = (
+                dict(profile_snapshot.get("spec") or {})
+                if isinstance(profile_snapshot.get("spec"), Mapping)
+                else {}
             )
-            for prior in prior_runs:
-                available = allocation - spent
-                spent += self._bounded_budget(
-                    self._usage_for_run(prior), available
+            profile_id = profile_id or str(
+                profile_snapshot.get("profile_id") or node.agent
+            )
+            profile_version = profile_version or profile_snapshot.get("version")
+            role = role or str(profile_spec.get("role") or "")
+            if self.enforce_runtime_budgets:
+                allocation = self._run_budget(task, graph, node)
+                spent = RuntimeBudget()
+                prior_runs = sorted(
+                    (
+                        item
+                        for item in self.store.list_runs(task.id)
+                        if item.plan_id == run.plan_id
+                        and item.node_id == run.node_id
+                        and (item.created_at, item.attempt, item.id)
+                        < (run.created_at, run.attempt, run.id)
+                        and item.status is not RunStatus.QUEUED
+                    ),
+                    key=lambda item: (item.created_at, item.attempt, item.id),
                 )
-            attempt_budget = allocation - spent
+                for prior in prior_runs:
+                    available = allocation - spent
+                    spent += self._bounded_budget(
+                        self._usage_for_run(prior), available
+                    )
+                attempt_budget = allocation - spent
         except (BudgetExceededError, NotFoundError, StopIteration):
             # Legacy/corrupt rows remain inspectable even when their original
             # attempt allocation cannot be reconstructed.
             attempt_budget = None
+        observed_usage = self._observed_usage_for_run(run, usage_evidence)
         return {
             "id": run.id,
             "node_id": run.node_id,
             "node_key": run.node_key,
             "title": run.node_key,
-            "agent_name": (output.get("profile") or {}).get("profile_id"),
+            "agent_name": profile_id or None,
+            "profile_version": profile_version,
+            "role": role or None,
             "status": self._work_status(run.status),
             "model_id": route.get("selected_model"),
             "routing_reason": route.get("reason"),
@@ -11112,6 +11209,7 @@ class OrchestrationService:
             "error_kind": run.error_kind,
             "error_message": error_message,
             "parent_run_id": parent_run_id,
+            "usage": observed_usage.as_dict(),
             "budget": (
                 attempt_budget.as_dict()
                 if self.enforce_runtime_budgets and attempt_budget is not None

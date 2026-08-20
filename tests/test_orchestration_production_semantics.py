@@ -2506,6 +2506,125 @@ def test_unlimited_mode_reopens_historical_budget_failure_without_old_cap(tmp_pa
         service.store.close()
 
 
+@pytest.mark.asyncio
+async def test_unlimited_mode_records_observed_usage_for_each_executed_role(
+    tmp_path,
+):
+    usage_by_role = {
+        "explorer": {
+            "model_calls": 2,
+            "tool_calls": 25,
+            "tokens": 250_000,
+            "wall_seconds": 90,
+        },
+        "planner": {
+            "model_calls": 3,
+            "tool_calls": 8,
+            "tokens": 175_000,
+            "wall_seconds": 45,
+        },
+    }
+
+    class RoleUsageExecutor:
+        async def execute(self, context):
+            role = context.profile.role.value
+            return ExecutionOutcome(
+                status="succeeded",
+                session_id=context.claim.run.session_id or f"{role}-session",
+                summary=f"{role} completed",
+                output={
+                    "summary": f"{role} completed",
+                    "profile": {
+                        "profile_id": context.profile.profile_id,
+                        "version": context.profile.version,
+                        "role": role,
+                    },
+                    "routing": context.routing.audit_record(),
+                },
+                usage=usage_by_role[role],
+            )
+
+    service = OrchestrationService(
+        FakeManager(),
+        tmp_path / "unlimited-role-usage",
+        executor=RoleUsageExecutor(),
+        enforce_runtime_budgets=False,
+        poll_seconds=0.03,
+    )
+    await service.start()
+    try:
+        task_id = service.create_task(
+            {
+                "objective": "Observe role usage without terminating execution",
+                "domain": "knowledge",
+                "read_only": True,
+                "acceptance_criteria": ["usage remains attributable by role"],
+                "complexity_factors": low_complexity(),
+                "budget": {
+                    "model_calls": 1,
+                    "tool_calls": 1,
+                    "tokens": 1,
+                    "wall_seconds": 1,
+                },
+                "plan": {
+                    "nodes": [
+                        {"key": "explore", "kind": "agent", "agent": "explorer"},
+                        {"key": "plan", "kind": "agent", "agent": "planner"},
+                    ],
+                    "edges": [{"from": "explore", "to": "plan"}],
+                },
+            }
+        )["id"]
+
+        runs = await wait_until(
+            lambda: (
+                current
+                if len(current := service.store.list_runs(task_id)) == 2
+                and all(item.status is RunStatus.SUCCEEDED for item in current)
+                else None
+            )
+        )
+        assert all(run.error_kind is None for run in runs)
+
+        usage_segments = {
+            str(item.payload["role"]): item.payload
+            for item in service.store.list_evidence(task_id)
+            if item.payload.get("runtime_usage_segment")
+        }
+        assert set(usage_segments) == {"explorer", "planner"}
+        for role, expected in usage_by_role.items():
+            segment = usage_segments[role]
+            assert segment["profile_id"] == role
+            assert segment["profile_version"] == 1
+            assert segment["node_key"] == ("explore" if role == "explorer" else "plan")
+            assert segment["usage"] == expected
+
+        run_payloads = {
+            item["role"]: item
+            for item in service.task_runs_page(task_id)["runs"]
+        }
+        assert set(run_payloads) == {"explorer", "planner"}
+        for role, expected in usage_by_role.items():
+            assert run_payloads[role]["agent_name"] == role
+            assert run_payloads[role]["profile_version"] == 1
+            assert run_payloads[role]["usage"] == expected
+            assert run_payloads[role]["budget"] is None
+
+        detail = service.task_detail(task_id)
+        assert detail["runtime_budget_mode"] == "unlimited"
+        runtime_by_profile = {
+            item["profile_id"]: item
+            for item in detail["runtime"]
+            if item["kind"] == "agent"
+        }
+        for role, expected in usage_by_role.items():
+            assert runtime_by_profile[role]["usage"] == expected
+            assert runtime_by_profile[role]["budget"] is None
+            assert runtime_by_profile[role]["budget_mode"] == "unlimited"
+    finally:
+        await service.stop()
+
+
 def test_clarification_accepts_only_whitelisted_nonempty_submission(tmp_path):
     service = OrchestrationService(FakeManager(), tmp_path / "data", executor=object())
     try:

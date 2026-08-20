@@ -2707,6 +2707,12 @@ function RunDetailsModal({
   const outputTokens = Number(latestUsage?.detail.output_tokens || 0);
   const tokenLimit = Number(run?.budget?.tokens || 0);
   const hasTokenLimit = Boolean(run?.budget && tokenLimit > 0);
+  const observedUsage = run?.usage;
+  const hasObservedUsage = Boolean(observedUsage && Object.values(observedUsage).some((value) => Number(value) > 0));
+  const usageOwner = [
+    run?.role || run?.agent_name || "Agent",
+    run?.profile_version == null ? "" : `profile v${run.profile_version}`,
+  ].filter(Boolean).join(" · ");
   const completedTools = timeline.filter((item) => item.kind === "tool" && item.status === "completed").length;
   const activeSteps = timeline.filter((item) => item.status === "running" || item.status === "pending").length;
   return (
@@ -2744,6 +2750,20 @@ function RunDetailsModal({
               </div>
             )}
             {run && <RunDiagnostic run={run} />}
+            {hasObservedUsage && observedUsage && (
+              <section className={`${CARD} mt-2 p-2.5`} aria-label="Recorded role usage">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[9.5px] font-semibold uppercase tracking-wide text-faint">Recorded usage</div>
+                  <div className="text-[9.5px] text-muted">{usageOwner}</div>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <div><div className="text-[9px] uppercase text-faint">Model calls</div><div className="text-[11px] font-semibold text-ink">{observedUsage.model_calls.toLocaleString()} calls</div></div>
+                  <div><div className="text-[9px] uppercase text-faint">Tool calls</div><div className="text-[11px] font-semibold text-ink">{observedUsage.tool_calls.toLocaleString()} calls</div></div>
+                  <div><div className="text-[9px] uppercase text-faint">Tokens</div><div className="text-[11px] font-semibold text-ink">{observedUsage.tokens.toLocaleString()} tokens</div></div>
+                  <div><div className="text-[9px] uppercase text-faint">Wall time</div><div className="text-[11px] font-semibold text-ink">{observedUsage.wall_seconds.toLocaleString()}s</div></div>
+                </div>
+              </section>
+            )}
           </section>
 
           <section className="mt-4 border-t border-line pt-4" aria-label="Live Agent activity">

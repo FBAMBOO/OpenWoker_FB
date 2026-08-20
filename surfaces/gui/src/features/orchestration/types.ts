@@ -559,6 +559,8 @@ export interface AgentRun {
   parent_run_id?: string | null;
   title: string;
   agent_name?: string;
+  profile_version?: number;
+  role?: string;
   status: WorkStatus;
   model_id?: string;
   routing_reason?: string;
@@ -568,6 +570,12 @@ export interface AgentRun {
   summary?: string;
   error_kind?: string;
   error_message?: string;
+  usage?: {
+    model_calls: number;
+    tool_calls: number;
+    tokens: number;
+    wall_seconds: number;
+  };
   budget?: {
     model_calls: number;
     tool_calls: number;
