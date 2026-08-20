@@ -152,7 +152,7 @@ CI p95 历史比较属于具体 CI 环境的持续发布门禁；本地验收保
 
 | ID | 结果 | 自动化证据 / 实现证据 |
 |---|---|---|
-| AC-B-001 | PASS | Manager 生产构造显式 `enforce_runtime_budgets=True`；V2 strategy 默认 hard profile。 |
+| AC-B-001 | TEMPORARY OVERRIDE | Manager 桌面生产构造暂时使用 `enforce_runtime_budgets=False`，通用 Agent runtime 只观测并记录角色级用量；V2 strategy 的版本化 hard ledger 仍独立生效。 |
 | AC-B-002 | PASS | 8 并发 reservation 中仅 5×20 可进入 100 root ledger，无 oversell。 |
 | AC-B-003 | PASS | provider usage overrun 原子记账并转 `exhausted + needs_attention + budget_exhausted`。 |
 | AC-B-004 | PASS | Codex N+1 dynamic tool request 在 callback dispatch 前拒绝；无第二个 response。 |

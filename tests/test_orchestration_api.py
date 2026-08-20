@@ -207,7 +207,7 @@ def test_orchestration_api_exposes_tasks_and_versioned_profiles(tmp_path):
         assert len(capabilities.json()["stages"]) == 8
         assert capabilities.json()["features"]["durable_resume"] is True
         assert capabilities.json()["features"]["versioned_task_briefs"] is True
-        assert capabilities.json()["limits"]["runtime_budget_mode"] == "enforced"
+        assert capabilities.json()["limits"]["runtime_budget_mode"] == "unlimited"
         assert capabilities.json()["health"]["ready"] is True
         assert client.get("/v1/orchestration/health").status_code == 200
 

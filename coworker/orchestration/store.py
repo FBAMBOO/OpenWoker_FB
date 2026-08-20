@@ -7770,6 +7770,41 @@ class OrchestrationStore:
                 ).fetchall()
         return tuple(self._evidence_from_row(row) for row in rows)
 
+    def list_runtime_usage_evidence(
+        self, task_id: str, run_ids: Sequence[str]
+    ) -> tuple[EvidenceRecord, ...]:
+        """Read usage segments for a bounded run set without scanning task evidence."""
+
+        chosen = tuple(
+            dict.fromkeys(str(run_id) for run_id in run_ids if str(run_id))
+        )
+        if not chosen:
+            return ()
+        if len(chosen) > 500:
+            raise ValueError("runtime usage evidence query is limited to 500 runs")
+        rows = []
+        with self._read() as connection:
+            self._require_task(connection, task_id)
+            for index in range(0, len(chosen), 400):
+                chunk = chosen[index : index + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT * FROM orch_evidence
+                        WHERE task_id=?
+                          AND run_id IN ({placeholders})
+                          AND json_extract(
+                              payload_json, '$.runtime_usage_segment'
+                          ) = 1
+                        ORDER BY created_at, rowid
+                        """,
+                        (task_id, *chunk),
+                    ).fetchall()
+                )
+        rows.sort(key=lambda row: (row["created_at"], row["id"]))
+        return tuple(self._evidence_from_row(row) for row in rows)
+
     def find_evidence_blob(self, digest: str) -> Optional[EvidenceRecord]:
         """Resolve a content-addressed blob reference with one indexed query."""
 

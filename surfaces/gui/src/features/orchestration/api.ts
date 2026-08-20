@@ -147,6 +147,7 @@ function normalizeRun(value: unknown, node?: JsonRecord): AgentRun {
   const item = record(value);
   const output = record(item.output);
   const budget = record(item.budget);
+  const usage = record(item.usage || output.usage);
   const errorMessage = text(item.error_message || item.error || output.error_message || output.error) || undefined;
   return {
     id: text(item.id || item.run_id),
@@ -154,6 +155,8 @@ function normalizeRun(value: unknown, node?: JsonRecord): AgentRun {
     parent_run_id: text(item.parent_run_id) || null,
     title: text(item.title || node?.title || item.node_key || node?.key, "Agent run"),
     agent_name: text(item.agent_name || item.agent || node?.agent) || undefined,
+    profile_version: item.profile_version == null ? undefined : number(item.profile_version),
+    role: text(item.role) || undefined,
     status: normalizedStatus(item.status),
     model_id: text(item.model_id || item.model || node?.model) || undefined,
     routing_reason: text(item.routing_reason || record(item.routing_decision).reason) || undefined,
@@ -164,6 +167,12 @@ function normalizeRun(value: unknown, node?: JsonRecord): AgentRun {
     error_kind: text(item.error_kind || output.error_kind) || undefined,
     error_message: errorMessage,
     session_id: text(item.session_id) || null,
+    usage: Object.keys(usage).length ? {
+      model_calls: number(usage.model_calls),
+      tool_calls: number(usage.tool_calls),
+      tokens: number(usage.tokens),
+      wall_seconds: number(usage.wall_seconds),
+    } : undefined,
     budget: Object.keys(budget).length ? {
       model_calls: number(budget.model_calls),
       tool_calls: number(budget.tool_calls),

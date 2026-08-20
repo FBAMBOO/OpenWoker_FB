@@ -185,6 +185,10 @@ describe("orchestration API contracts", () => {
           session_id: "session-1",
           node_id: "prepare",
           status: "succeeded",
+          agent_name: "worker",
+          profile_version: 2,
+          role: "worker",
+          usage: { model_calls: 2, tool_calls: 17, tokens: 120000, wall_seconds: 75 },
           model: "openai:gpt-high",
           routing_decision: { reason: "Highest eligible quality" },
           output: { summary: "Prepared release assets" },
@@ -270,6 +274,10 @@ describe("orchestration API contracts", () => {
       model_id: "openai:gpt-high",
       routing_reason: "Highest eligible quality",
       session_id: "session-1",
+      agent_name: "worker",
+      profile_version: 2,
+      role: "worker",
+      usage: { model_calls: 2, tool_calls: 17, tokens: 120000, wall_seconds: 75 },
     });
     expect(detail.attention?.[0]).toMatchObject({
       id: "gate-1",

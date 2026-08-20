@@ -46,6 +46,10 @@ describe("OrchestrationSurface", () => {
           title: "Test run",
           status: "running",
           model: "anthropic:balanced",
+          agent_name: "tester",
+          role: "tester",
+          profile_version: 3,
+          usage: { model_calls: 2, tool_calls: 17, tokens: 1_250, wall_seconds: 75 },
           budget: { model_calls: 2, tool_calls: 14, tokens: 2_000, wall_seconds: 900 },
         },
       ],
@@ -232,6 +236,10 @@ describe("OrchestrationSurface", () => {
     expect(within(runDialog).getByText("session-child")).toBeTruthy();
     expect(within(runDialog).getByText("anthropic:balanced")).toBeTruthy();
     expect(within(runDialog).getByText("tester")).toBeTruthy();
+    expect(within(runDialog).getByRole("region", { name: "Recorded role usage" })).toBeTruthy();
+    expect(within(runDialog).getByText("tester · profile v3")).toBeTruthy();
+    expect(within(runDialog).getByText("17 calls")).toBeTruthy();
+    expect(within(runDialog).getByText("1,250 tokens")).toBeTruthy();
     expect(within(runDialog).getByRole("region", { name: "Retained transcript" })).toBeTruthy();
     expect(within(runDialog).getByRole("region", { name: "Live Agent activity" })).toBeTruthy();
     expect((await within(runDialog).findAllByText("Inspecting test results.")).length).toBeGreaterThan(0);
