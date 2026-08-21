@@ -1818,6 +1818,35 @@ async def test_claude_stream_jsonl_is_parsed_without_invoking_a_real_cli(
             },
         },
         {
+            "type": "assistant",
+            "session_id": expected_session,
+            "message": {
+                "model": "claude-opus-5",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "structured-output-1",
+                        "name": "StructuredOutput",
+                        "caller": {"type": "direct"},
+                        "input": _WIRE_STRUCTURED_RESULT,
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "session_id": expected_session,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "structured-output-1",
+                        "content": "Structured output provided successfully",
+                    }
+                ]
+            },
+        },
+        {
             "type": "result",
             "subtype": "success",
             "is_error": False,
@@ -1852,6 +1881,12 @@ async def test_claude_stream_jsonl_is_parsed_without_invoking_a_real_cli(
     assert outcome.output["work_product_refs"] == [products[0].id]
     assert outcome.usage["tokens"] == 50
     assert outcome.usage["tool_calls"] == 1
+    activity = harness.store.list_run_activity(
+        harness.context.task.id, harness.context.claim.run.id
+    )
+    assert not any(
+        item.detail.get("tool") == "StructuredOutput" for item in activity
+    )
     assert process.stdin.getvalue().startswith(
         harness.context.profile.instructions
     )
@@ -1890,6 +1925,145 @@ async def test_claude_stream_jsonl_is_parsed_without_invoking_a_real_cli(
     assert recovered.status == "succeeded"
     assert recovered.output["structured_result"] == _STRUCTURED_RESULT
     assert len(harness.store.list_work_products(harness.context.task.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_rejects_unknown_tool_but_retains_stream_usage(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude = _runtime(ClaudeCodeSubscriptionRuntime, CLAUDE_OPUS_5_HIGH, harness)
+    monkeypatch.setattr(
+        claude,
+        "probe",
+        lambda: _healthy(
+            CLAUDE_OPUS_5_HIGH,
+            "claude-code-subscription",
+            "2.1.235",
+        ),
+    )
+    expected_session = str(
+        runtime_module.uuid.uuid5(
+            runtime_module.uuid.NAMESPACE_URL,
+            f"openworker:{harness.context.claim.run.id}:{CLAUDE_OPUS_5_HIGH}",
+        )
+    )
+    process = _FakeClaudeProcess(
+        [
+            {
+                "type": "system",
+                "subtype": "init",
+                "session_id": expected_session,
+                "model": "claude-opus-5",
+                "capabilities": {"agents": False},
+            },
+            {
+                "type": "stream_event",
+                "session_id": expected_session,
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {"input_tokens": 2, "output_tokens": 1}
+                    },
+                },
+            },
+            {
+                "type": "stream_event",
+                "session_id": expected_session,
+                "event": {
+                    "type": "message_delta",
+                    "usage": {"input_tokens": 41, "output_tokens": 9},
+                },
+            },
+            {
+                "type": "assistant",
+                "session_id": expected_session,
+                "message": {
+                    "model": "claude-opus-5",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "unknown-tool-1",
+                            "name": "UnknownSideEffect",
+                            "input": {},
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        claude, "_spawn", lambda *_args, **_kwargs: _FakeActive(process)
+    )
+
+    outcome = await claude.execute(harness.context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "claude_code_protocol_error"
+    assert outcome.error_message == (
+        "Claude Code used unauthorized tool 'UnknownSideEffect'"
+    )
+    assert outcome.usage["tokens"] == 50
+    assert outcome.usage["tool_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_claude_rejects_malformed_structured_output_tool_payload(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude = _runtime(ClaudeCodeSubscriptionRuntime, CLAUDE_OPUS_5_HIGH, harness)
+    monkeypatch.setattr(
+        claude,
+        "probe",
+        lambda: _healthy(
+            CLAUDE_OPUS_5_HIGH,
+            "claude-code-subscription",
+            "2.1.235",
+        ),
+    )
+    expected_session = str(
+        runtime_module.uuid.uuid5(
+            runtime_module.uuid.NAMESPACE_URL,
+            f"openworker:{harness.context.claim.run.id}:{CLAUDE_OPUS_5_HIGH}",
+        )
+    )
+    process = _FakeClaudeProcess(
+        [
+            {
+                "type": "system",
+                "subtype": "init",
+                "session_id": expected_session,
+                "model": "claude-opus-5",
+                "capabilities": {"agents": False},
+            },
+            {
+                "type": "assistant",
+                "session_id": expected_session,
+                "message": {
+                    "model": "claude-opus-5",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "structured-output-1",
+                            "name": "StructuredOutput",
+                            "caller": {"type": "direct"},
+                            "input": "not-an-object",
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        claude, "_spawn", lambda *_args, **_kwargs: _FakeActive(process)
+    )
+
+    outcome = await claude.execute(harness.context)
+
+    assert outcome.status == "failed"
+    assert outcome.error_kind == "claude_code_protocol_error"
+    assert outcome.error_message == (
+        "Claude Code emitted malformed StructuredOutput"
+    )
 
 
 @pytest.mark.asyncio

@@ -49,14 +49,29 @@ REPLY = "Acknowledged - investigating the deploy now."
 
 class E2EProvider(ProviderClient):
     """Returns queued turns and records the messages handed to it on each call, so the test can
-    assert exactly what the provider saw (framed text, never a `source` sidecar)."""
+    assert exactly what the chat turn saw (framed text, never a `source` sidecar).
+
+    Auto-title uses the session's provider in a fire-and-forget task after the turn is
+    marked idle. Keep those requests separate so their scheduling cannot look like a
+    muted connector woke the chat session or consume one of its scripted turns.
+    """
 
     def __init__(self, turns):
         self._turns = list(turns)
         self.calls: list[list[dict]] = []
+        self.title_calls: list[list[dict]] = []
 
     def complete(self, *, model, messages, tools=None, **settings):
-        self.calls.append([dict(m) for m in messages])
+        recorded = [dict(m) for m in messages]
+        if recorded and recorded[0] == {
+            "role": "system",
+            "content": SessionManager._AUTOTITLE_PROMPT,
+        }:
+            self.title_calls.append(recorded)
+            return AssistantTurn(
+                text="Production Deploy Incident", finish_reason="stop"
+            )
+        self.calls.append(recorded)
         return self._turns.pop(0)
 
     def capabilities(self, model):
@@ -258,6 +273,10 @@ async def test_ui_refresh_cross_cutting_e2e(fake_slack, tmp_path, monkeypatch):
         assert replies, f"reply never posted back: {fake_slack.outbound()}"
         assert await _wait_until(lambda: not mgr.is_running(SID))
         assert mgr.inbox.get(item_id).state == "resolved"
+        # mark_idle schedules auto-title after clearing the chat-running flag. Wait for
+        # that independent provider call before taking the muted-delivery baseline.
+        assert await _wait_until(lambda: SID not in mgr._autotitle_inflight)
+        assert len(provider.title_calls) == 1
 
         # -- Step 4: mute Slack for the session -> a further post does NOT wake it, still buffered -
         msgcount_before = len(mgr.session_messages(SID))
